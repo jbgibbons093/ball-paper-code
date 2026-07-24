@@ -1,0 +1,43 @@
+# This repository holds source code only. No data of any kind belongs here.
+#
+# The analyses read protected health information (PHI) from local paths that are
+# deliberately absent from this repository. Never commit those inputs or any
+# output derived from them.
+
+# Data inputs and any derived artifacts
+empirical/
+raw/
+data/
+derived/
+derived_phi/
+
+# Run outputs, logs, and figures
+outputs/
+runs/
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.csv.gz
+*.parquet
+*.pkl
+*.pt
+*.ckpt
+*.npy
+*.npz
+*.log
+
+# Manuscript and presentation artifacts
+*.docx
+*.pptx
+*.pdf
+
+# Credentials
+.openai_key
+*.key
+.env
+
+# Python build noise
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/

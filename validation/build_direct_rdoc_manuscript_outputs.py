@@ -29,23 +29,28 @@ METHOD_LABELS = {
     "ball_direct_causal": "Direct causal transformer",
     "ball_direct_transformer": "BALL direct transformer",
     "gp_causal_filter": "Causal Gaussian-process filter",
-    "ode_rnn_causal": "Causal ODE-RNN",
+    "exponential_decay_gru": "Exponential-decay GRU",
     "s0_direct_lgssm": "LGSSM",
     "markov_direct_transition": "Markov pattern-mixture model",
+    "ball_direct_causal_compute_matched": "Compute-matched direct causal transformer",
+    "ball_inherited_dynamics_only": "Inherited dynamics and questionnaires",
+    "ball_teacher_matching_only": "Teacher matching only",
+    "ball_full_decomposition": "Full BALL decomposition arm",
+    "ball_student_transition_only": "BALL with RDoC restricted to the transition",
 }
 PRIMARY_BALL_METHOD = "ball_student_causal"
 TEACHER_METHOD = "ball_teacher_smoother"
 LEGACY_BALL_METHOD = "ball_direct_transformer"
 BALL_TRANSITION_LABEL = "BALL shared generative transition"
-NOT_SEPARATELY_ESTIMATED = "Not separately estimated"
-NO_EXPLICIT_COEFFICIENT = "No explicit transition coefficient"
+NOT_SEPARATELY_ESTIMATED = "Reported in shared BALL row"
+NO_EXPLICIT_COEFFICIENT = "—"
 NOT_APPLICABLE = "—"
 METHOD_ORDER = [
     PRIMARY_BALL_METHOD,
     TEACHER_METHOD,
     "ball_direct_causal",
     "gp_causal_filter",
-    "ode_rnn_causal",
+    "exponential_decay_gru",
     "s0_direct_lgssm",
     "markov_direct_transition",
 ]
@@ -62,7 +67,7 @@ COLORS = {
     "ball_direct_causal": "#1b9e77",
     "ball_direct_transformer": "#2f6db3",
     "gp_causal_filter": "#7b3294",
-    "ode_rnn_causal": "#e6ab02",
+    "exponential_decay_gru": "#e6ab02",
     "s0_direct_lgssm": "#8f8f8f",
     "markov_direct_transition": "#d07c2c",
 }
@@ -90,7 +95,7 @@ def fmt(mean: float, se: float | None = None, digits: int = 3) -> str:
 
 
 def fmt_panel_range(mean: float, low: float, high: float, digits: int = 3) -> str:
-    """Describe prespecified heterogeneous panels without treating them as draws."""
+    """Describe heterogeneous simulation conditions without treating them as draws."""
     if not all(np.isfinite(v) for v in (mean, low, high)):
         return "n/a"
     return f"{mean:.{digits}f} [{low:.{digits}f}, {high:.{digits}f}]"
@@ -137,14 +142,14 @@ def manuscript_summary_table(
                 NOT_SEPARATELY_ESTIMATED
                 if method in {PRIMARY_BALL_METHOD, TEACHER_METHOD}
                 else NO_EXPLICIT_COEFFICIENT
-                if method in {"gp_causal_filter", "ode_rnn_causal"}
+                if method in {"gp_causal_filter", "exponential_decay_gru"}
                 else fmt_panel_range(item.beta_cosine_mean, item.beta_cosine_min, item.beta_cosine_max)
             ),
             "beta_topk_f1": (
                 NOT_SEPARATELY_ESTIMATED
                 if method in {PRIMARY_BALL_METHOD, TEACHER_METHOD}
                 else NO_EXPLICIT_COEFFICIENT
-                if method in {"gp_causal_filter", "ode_rnn_causal"}
+                if method in {"gp_causal_filter", "exponential_decay_gru"}
                 else fmt_panel_range(item.beta_topk_f1_mean, item.beta_topk_f1_min, item.beta_topk_f1_max)
             ),
         }
@@ -230,18 +235,24 @@ def write_sensitivity_tables(adaptive: pd.DataFrame, irt: pd.DataFrame, out: Pat
 
 def write_supp_table1(agg: pd.DataFrame, out: Path) -> None:
     rows = []
+    shared_transition_trajectory_rows = {
+        PRIMARY_BALL_METHOD,
+        TEACHER_METHOD,
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+    }
     for row in agg.itertuples(index=False):
         coefficient_owner = row.method not in {
-            PRIMARY_BALL_METHOD,
-            TEACHER_METHOD,
+            *shared_transition_trajectory_rows,
             "gp_causal_filter",
-            "ode_rnn_causal",
+            "exponential_decay_gru",
         }
         coefficient_value = (
             NOT_SEPARATELY_ESTIMATED
-            if row.method in {PRIMARY_BALL_METHOD, TEACHER_METHOD}
+            if row.method in shared_transition_trajectory_rows
             else NO_EXPLICIT_COEFFICIENT
-            if row.method in {"gp_causal_filter", "ode_rnn_causal"}
+            if row.method in {"gp_causal_filter", "exponential_decay_gru"}
             else None
         )
         rows.append(
@@ -296,13 +307,50 @@ def write_distillation_ablation(per_run: pd.DataFrame, out: Path) -> None:
             row[f"{metric}_ball_wins"] = int(np.sum(values < 0))
         rows.append(row)
 
-    add_row("overall", "All prespecified panels", paired)
+    add_row("overall", "All ten simulation conditions", paired)
     for share, frame in paired.groupby("share", sort=True):
         add_row("direct_drift_share", f"{float(share):.2f}", frame)
     for cell, frame in paired.groupby("cell", sort=True):
         add_row("stress_regime", CELL_LABELS.get(cell, cell), frame)
 
     pd.DataFrame(rows).to_csv(out / "supp_table1b_distillation_ablation.csv", index=False)
+
+    decomposition_methods = [
+        PRIMARY_BALL_METHOD,
+        "ball_direct_causal",
+        "ball_direct_causal_compute_matched",
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+        "ball_student_transition_only",
+    ]
+    decomposition = per_run[per_run["method"].isin(decomposition_methods)].copy()
+    if set(decomposition["method"]) != set(decomposition_methods):
+        raise ValueError("The simulation distillation and transition-identification arms are incomplete")
+    decomposition_rows = []
+    for (scope, level, method), frame in pd.concat(
+        [
+            decomposition.assign(scope="overall", level="All ten simulation conditions"),
+            decomposition.assign(scope="direct_drift_share", level=decomposition["share"].map(lambda value: f"{float(value):.2f}")),
+            decomposition.assign(scope="stress_regime", level=decomposition["cell"].map(lambda value: CELL_LABELS.get(value, value))),
+        ],
+        ignore_index=True,
+    ).groupby(["scope", "level", "method"], sort=True):
+        decomposition_rows.append(
+            {
+                "scope": scope,
+                "level": level,
+                "training_arm": METHOD_LABELS.get(method, method),
+                "matched_runs": int(len(frame)),
+                "latent_rmse_mean": float(frame["latent_rmse"].mean()),
+                "latent_rmse_mcse": float(frame["latent_rmse"].std(ddof=1) / np.sqrt(len(frame))),
+                "questionnaire_rmse_mean": float(frame["val_anchor_rmse"].mean()),
+                "questionnaire_rmse_mcse": float(frame["val_anchor_rmse"].std(ddof=1) / np.sqrt(len(frame))),
+            }
+        )
+    pd.DataFrame(decomposition_rows).to_csv(
+        out / "supp_table1c_distillation_decomposition.csv", index=False
+    )
 
 
 def figure1(out: Path) -> None:
@@ -341,7 +389,7 @@ def figure1(out: Path) -> None:
     ax.set_title("C. Shared benchmark", loc="left", fontsize=14)
     box(ax, (0.04, 0.72), "BALL teacher and\ncausal student", "#cfe2f3", h=0.14)
     box(ax, (0.04, 0.52), "Direct causal\ntransformer", "#d9ead3", h=0.14)
-    box(ax, (0.04, 0.32), "Gaussian process and\ncausal ODE-RNN", "#eadcf2", h=0.14)
+    box(ax, (0.04, 0.32), "Gaussian process and\nexponential-decay GRU", "#eadcf2", h=0.14)
     box(ax, (0.04, 0.12), "LGSSM and Markov\nmodels", "#eeeeee", h=0.14)
     box(ax, (0.58, 0.36), "Common inputs and\nevaluation targets", "#fce5cd", w=0.36)
     for y in [0.79, 0.59, 0.39, 0.19]:
@@ -371,7 +419,7 @@ def figure2(agg: pd.DataFrame, delta: pd.DataFrame, out: Path) -> None:
         TEACHER_METHOD: "BALL\nteacher",
         "ball_direct_causal": "Direct causal\ntransformer",
         "gp_causal_filter": "Causal GP\nfilter",
-        "ode_rnn_causal": "Causal\nODE-RNN",
+        "exponential_decay_gru": "Exponential-decay\nGRU",
         "s0_direct_lgssm": "LGSSM",
         "markov_direct_transition": "Markov\nmixture",
     }
@@ -444,7 +492,7 @@ def figure3(delta: pd.DataFrame, out: Path) -> None:
     latent_panels = [
         ("ball_minus_direct_latent_rmse_mean", "A. BALL minus direct causal transformer"),
         ("ball_minus_gp_causal_latent_rmse_mean", "B. BALL minus causal Gaussian-process filter"),
-        ("ball_minus_ode_rnn_latent_rmse_mean", "C. BALL minus causal ODE-RNN"),
+        ("ball_minus_ode_rnn_latent_rmse_mean", "C. BALL minus exponential-decay GRU"),
         ("ball_minus_s0_latent_rmse_mean", "D. BALL minus LGSSM"),
         ("ball_minus_markov_latent_rmse_mean", "E. BALL minus Markov transition model"),
     ]
@@ -562,6 +610,8 @@ def empirical_outputs(
         "empirical_workload_classification.csv",
         "empirical_rdoc_transition.csv",
         "empirical_rdoc_transition_coefficients.csv",
+        "empirical_rdoc_transition_full_record_sensitivity.csv",
+        "empirical_hyperparameter_selection.csv",
         "empirical_pairwise_bootstrap.csv",
         "empirical_recovery_by_context.csv",
         "empirical_uncertainty_workload.csv",
@@ -591,14 +641,75 @@ def empirical_outputs(
     context = pd.read_csv(result_path("empirical_recovery_by_context.csv"))
     uncertainty_workload = pd.read_csv(result_path("empirical_uncertainty_workload.csv"))
     input_contract = pd.read_csv(result_path("empirical_input_contract.csv"))
+    input_contract = input_contract.rename(columns={"target_embargo": "recall_window_rule"})
+    if "prediction_target" in input_contract.columns:
+        input_contract["prediction_target"] = (
+            "withheld questionnaire total after the fixed instrument-range conversion"
+        )
+    if "recall_window_rule" in input_contract.columns:
+        input_contract["recall_window_rule"] = (
+            "retained and withheld questionnaires summarize distinct calendar days"
+        )
     leakage_audit = pd.read_csv(result_path("empirical_leakage_audit.csv"))
     cohort_characteristics = pd.read_csv(result_path("empirical_cohort_characteristics.csv"))
+    analytic_sessions = ROOT / "empirical" / "data" / "rtms_paper_analytic_sessions.csv"
+    if analytic_sessions.is_file() and {"item", "value", "unit"}.issubset(
+        cohort_characteristics.columns
+    ):
+        available_columns = set(pd.read_csv(analytic_sessions, nrows=0).columns)
+        patient_column = "PatientFID"
+        category_columns = [
+            column
+            for column in ("protocol_category", "protocol", "is_bilateral", "bilateral_str", "intensity_level")
+            if column in available_columns
+        ]
+        if patient_column in available_columns and category_columns:
+            treatment = pd.read_csv(
+                analytic_sessions,
+                usecols=[patient_column, *category_columns],
+            )
+            selected_categories = []
+            for label, candidates in (
+                ("Protocol", ("protocol_category", "protocol")),
+                ("Laterality", ("is_bilateral", "bilateral_str")),
+                ("Intensity", ("intensity_level",)),
+            ):
+                column = next((name for name in candidates if name in treatment.columns), None)
+                if column is not None:
+                    selected_categories.append((label, column))
+            existing_items = set(cohort_characteristics["item"].astype(str))
+            added_rows = []
+            for label, column in selected_categories:
+                for category, group in treatment.groupby(column, dropna=False, sort=True):
+                    category_label = "unrecorded" if pd.isna(category) else str(category)
+                    session_item = f"{label} {category_label} sessions"
+                    patient_item = f"{label} {category_label} patients"
+                    if session_item not in existing_items:
+                        added_rows.append((session_item, int(len(group)), "sessions"))
+                    if patient_item not in existing_items:
+                        added_rows.append(
+                            (patient_item, int(group[patient_column].nunique()), "patients")
+                        )
+            if added_rows:
+                cohort_characteristics = pd.concat(
+                    [
+                        cohort_characteristics,
+                        pd.DataFrame(added_rows, columns=["item", "value", "unit"]),
+                    ],
+                    ignore_index=True,
+                )
     fit_timing = pd.read_csv(result_path("empirical_fit_timing.csv"))
     manifest = json.loads((static_empirical / "build_manifest.json").read_text(encoding="utf-8"))
     proxy_manifest = json.loads((static_empirical / "rdoc_proxy_manifest.json").read_text(encoding="utf-8"))
     transition = pd.read_csv(result_path("empirical_rdoc_transition.csv"))
     transition_coefficients = pd.read_csv(
         result_path("empirical_rdoc_transition_coefficients.csv")
+    )
+    transition_full_record = pd.read_csv(
+        result_path("empirical_rdoc_transition_full_record_sensitivity.csv")
+    )
+    hyperparameter_selection = pd.read_csv(
+        result_path("empirical_hyperparameter_selection.csv")
     )
     fit_manifest_path = emp / "fit_run_manifest.json"
     if not fit_manifest_path.exists():
@@ -622,6 +733,8 @@ def empirical_outputs(
         "workload classification": workload,
         "RDoC transition": transition,
         "RDoC transition coefficients": transition_coefficients,
+        "RDoC full-record mean sensitivity": transition_full_record,
+        "hyperparameter selection": hyperparameter_selection,
         "pairwise comparisons": pairwise,
         "context recovery": context,
         "uncertainty workload": uncertainty_workload,
@@ -643,15 +756,20 @@ def empirical_outputs(
         ball_key: "BALL causal student",
         "ball_teacher": "BALL teacher smoother",
         "ball_direct_causal": "Direct causal transformer",
-        "ball_no_dense_ehr": "BALL without diagnosis and comorbidity features",
-        "ball_anchor_only": "Anchor-only BALL",
+        "ball_no_dense_ehr": "BALL using session number and treatment context",
+        "ball_anchor_only": "BALL using questionnaires and calendar gaps",
         "gp_causal_filter": "Causal Gaussian-process filter",
-        "ode_rnn_causal": "Causal ODE-RNN",
+        "exponential_decay_gru": "Exponential-decay GRU",
         "s0_direct_lgssm": "LGSSM",
         "markov_direct_transition": "Markov pattern-mixture model",
         "interpolation": "Interpolation",
         "locf": "Last observation carried forward",
         "causal_anchor_mean": "Prior-anchor mean",
+        "ball_inherited_dynamics_only": "BALL inherited dynamics only",
+        "ball_teacher_matching_only": "BALL teacher matching only",
+        "ball_full_decomposition": "BALL full decomposition arm",
+        "ball_direct_compute_matched": "Compute-matched direct causal transformer",
+        "ball_session_balanced": "BALL with session-balanced questionnaire weight",
     }
     required_methods = {
         ball_key,
@@ -660,12 +778,17 @@ def empirical_outputs(
         "ball_no_dense_ehr",
         "ball_anchor_only",
         "gp_causal_filter",
-        "ode_rnn_causal",
+        "exponential_decay_gru",
         "s0_direct_lgssm",
         "markov_direct_transition",
         "interpolation",
         "locf",
         "causal_anchor_mean",
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+        "ball_direct_compute_matched",
+        "ball_session_balanced",
     }
     observed_methods = set(overall["method"])
     if observed_methods != required_methods:
@@ -679,18 +802,23 @@ def empirical_outputs(
     if "forward_2025" not in set(generalization["validation"].astype(str)):
         raise ValueError("The forward-2025 generalization sensitivity is absent")
     method_roles = {
-        ball_key: "Prospective primary estimator",
-        "ball_direct_causal": "Prospective no-teacher ablation",
-        "ball_no_dense_ehr": "Prospective structured-feature ablation",
-        "ball_anchor_only": "Prospective anchor-only ablation",
+        ball_key: "Prospective estimator trained by teacher-student distillation",
+        "ball_direct_causal": "Prospective estimator trained with the causal variational objective",
+        "ball_no_dense_ehr": "Prospective estimator using session number and treatment context",
+        "ball_anchor_only": "Prospective estimator using questionnaires and calendar gaps",
         "gp_causal_filter": "Prospective nonlinear probabilistic benchmark",
-        "ode_rnn_causal": "Prospective elapsed-time neural benchmark",
-        "locf": "Prospective anchor baseline",
-        "causal_anchor_mean": "Prospective anchor baseline",
-        "ball_teacher": "Retrospective full-record reference",
+        "exponential_decay_gru": "Prospective recurrent benchmark with learned elapsed-time decay",
+        "locf": "Prospective questionnaire-history reference",
+        "causal_anchor_mean": "Prospective questionnaire-history reference",
+        "ball_teacher": "Retrospective estimator using the complete record",
         "s0_direct_lgssm": "Retrospective state-space reference",
         "markov_direct_transition": "Retrospective Markov reference",
-        "interpolation": "Future-informed retrospective reference",
+        "interpolation": "Retrospective interpolation using questionnaires on both sides",
+        "ball_inherited_dynamics_only": "Prospective decomposition arm using inherited dynamics and questionnaires",
+        "ball_teacher_matching_only": "Prospective decomposition arm using teacher distributions",
+        "ball_full_decomposition": "Prospective decomposition arm using teacher distributions and questionnaires",
+        "ball_direct_compute_matched": "Prospective direct model trained for the full teacher-plus-student update budget",
+        "ball_session_balanced": "Prospective BALL sensitivity with total questionnaire weight balanced by session",
     }
     comparison_columns = {
         "ball_direct_causal": ("ball_minus_direct_causal_rmse", "direct_causal_ci_lo", "direct_causal_ci_hi"),
@@ -703,7 +831,8 @@ def empirical_outputs(
     }
     rows = []
     for cadence in sorted(overall["cadence"].unique()):
-        c = calib.loc[calib["cadence"] == cadence].iloc[0]
+        cadence_calibration = calib.loc[calib["cadence"] == cadence]
+        c = cadence_calibration.mean(numeric_only=True)
         b = boot.loc[boot["cadence"] == cadence].iloc[0]
         for method, label in method_labels.items():
             val = overall.loc[(overall["cadence"] == cadence) & (overall["method"] == method), "rmse"]
@@ -737,7 +866,10 @@ def empirical_outputs(
                     "BALL_minus_method_rmse_95_ci": comparison,
                     "patient_balanced_coverage": f"{float(c.coverage):.3f}" if method == ball_key else "",
                     "measurement_coverage": f"{float(c.measurement_coverage):.3f}" if method == ball_key and "measurement_coverage" in c.index else "",
-                    "mean_interval_width": f"{float(c.mean_width):.3f}" if method == ball_key else "",
+                    "mean_clipped_width_fraction_of_legal_range": (
+                        f"{float(c.mean_width_fraction_of_legal_range):.3f}"
+                        if method == ball_key else ""
+                    ),
                 }
             )
     pd.DataFrame(rows).to_csv(out / "supp_table3a_empirical_recovery.csv", index=False)
@@ -802,7 +934,7 @@ def empirical_outputs(
             "ball_no_dense_ehr",
             "ball_anchor_only",
             "gp_causal_filter",
-            "ode_rnn_causal",
+            "exponential_decay_gru",
             "locf",
             "causal_anchor_mean",
         ]
@@ -877,6 +1009,14 @@ def empirical_outputs(
     coefficient_table.to_csv(
         out / "supp_table5b_empirical_rdoc_coefficients.csv", index=False
     )
+    transition_full_record.to_csv(
+        out / "supp_table5c_empirical_rdoc_full_record_mean_sensitivity.csv",
+        index=False,
+    )
+    hyperparameter_selection.to_csv(
+        out / "supp_table17_empirical_hyperparameter_selection.csv",
+        index=False,
+    )
 
     cohort_out = cohort_characteristics.rename(
         columns={"characteristic": "item"}
@@ -900,7 +1040,11 @@ def empirical_outputs(
             {"item": "Mean within-patient RDoC proxy standard deviation", "value": proxy_manifest["within_patient_proxy_sd_mean"], "unit": "score"},
             {"item": "Mean between-patient RDoC proxy standard deviation", "value": proxy_manifest["between_patient_proxy_sd_mean"], "unit": "score"},
             {"item": "Calendar window", "value": "January 2023 to June 2025", "unit": "calendar"},
-            {"item": "Empirical validation target", "value": "Withheld questionnaire totals after recall-window embargo", "unit": "definition"},
+            {
+                "item": "Empirical validation target",
+                "value": "Withheld questionnaire totals whose recall periods summarize distinct calendar days from retained questionnaires",
+                "unit": "definition",
+            },
         ]
     )
     pd.concat([cohort_out, additional_cohort_rows], ignore_index=True).to_csv(
@@ -1016,7 +1160,7 @@ def empirical_outputs(
     x = np.arange(len(cadences))
     width = 0.16
     empirical_methods = [m for m in [ball_key, "ball_direct_causal", "gp_causal_filter",
-                                     "ode_rnn_causal", "locf", "causal_anchor_mean"]
+                                     "exponential_decay_gru", "locf", "causal_anchor_mean"]
                          if m in set(overall["method"])]
     width = min(0.8 / max(len(empirical_methods), 1), 0.16)
     offset0 = -0.5 * width * (len(empirical_methods) - 1)
@@ -1044,7 +1188,7 @@ def empirical_outputs(
             fmt=marker,
             label=label,
         )
-    for comparator, marker in (("gp_causal_filter", "v-"), ("ode_rnn_causal", "P-")):
+    for comparator, marker in (("gp_causal_filter", "v-"), ("exponential_decay_gru", "P-")):
         subset = pairwise.loc[pairwise["comparator"].astype(str) == comparator].sort_values("cadence")
         if subset.empty:
             continue
@@ -1064,16 +1208,20 @@ def empirical_outputs(
     axes[0, 1].set_xlabel("Cadence, days")
     axes[0, 1].legend(frameon=False, fontsize=8)
 
-    axes[1, 0].plot(calib["cadence"], calib["coverage"], "o-", color="#2f6db3")
+    calibration_by_cadence = calib.groupby("cadence", as_index=False).agg(
+        coverage=("coverage", "mean"),
+        width_fraction=("mean_width_fraction_of_legal_range", "mean"),
+    )
+    axes[1, 0].plot(calibration_by_cadence["cadence"], calibration_by_cadence["coverage"], "o-", color="#2f6db3")
     axes[1, 0].axhline(0.95, color="black", linestyle="--", linewidth=1)
     axes[1, 0].set_ylim(0.90, 1.00)
     axes[1, 0].set_title("C. Observable-measurement coverage", loc="left")
     axes[1, 0].set_ylabel("Coverage")
     axes[1, 0].set_xlabel("Cadence, days")
 
-    axes[1, 1].plot(calib["cadence"], calib["mean_width"], "s-", color="#d07c2c")
+    axes[1, 1].plot(calibration_by_cadence["cadence"], calibration_by_cadence["width_fraction"], "s-", color="#d07c2c")
     axes[1, 1].set_title("D. Observable-measurement interval width", loc="left")
-    axes[1, 1].set_ylabel("Width, standardized units")
+    axes[1, 1].set_ylabel("Clipped width / legal score range")
     axes[1, 1].set_xlabel("Cadence, days")
 
     if has_conditional:
@@ -1098,7 +1246,7 @@ def empirical_outputs(
                 )
                 axes[1, 2].scatter(
                     np.full(len(group), index + jitter),
-                    group["mean_width"],
+                    group["mean_width_fraction_of_legal_range"],
                     s=np.clip(group["n_patients"].to_numpy(dtype=float), 12, 90),
                     alpha=0.62,
                     color=palette.get(int(cadence), "#666666"),
@@ -1108,7 +1256,7 @@ def empirical_outputs(
         axes[0, 2].set_ylabel("Patient-balanced coverage")
         axes[0, 2].legend(frameon=False, fontsize=8)
         axes[1, 2].set_title("F. Conditional interval width", loc="left")
-        axes[1, 2].set_ylabel("Mean width, standardized units")
+        axes[1, 2].set_ylabel("Clipped width / legal score range")
         for ax in (axes[0, 2], axes[1, 2]):
             ax.set_xticks(np.arange(len(stratum_types)), [value.replace("_", " ") for value in stratum_types], rotation=35, ha="right")
 
@@ -1122,7 +1270,7 @@ def empirical_outputs(
             ball_key,
             "ball_direct_causal",
             "gp_causal_filter",
-            "ode_rnn_causal",
+            "exponential_decay_gru",
             "locf",
             "causal_anchor_mean",
         )
@@ -1179,7 +1327,7 @@ def empirical_outputs(
         axes = axes.ravel()
         context_methods = [
             method
-            for method in (ball_key, "ball_direct_causal", "gp_causal_filter", "ode_rnn_causal", "locf")
+            for method in (ball_key, "ball_direct_causal", "gp_causal_filter", "exponential_decay_gru", "locf")
             if method in set(context["method"])
         ]
         for ax, stratum_type in zip(axes, context_types, strict=False):
@@ -1221,11 +1369,11 @@ def empirical_outputs(
         for cadence in sorted(uncertainty_workload["cadence"].astype(int).unique()):
             panel = uncertainty_workload[
                 uncertainty_workload["cadence"].astype(int) == int(cadence)
-            ].sort_values("interval_width_threshold")
+            ].sort_values("interval_width_fraction_threshold")
             label = f"{cadence} days"
-            axes[0].plot(panel["interval_width_threshold"], panel["additional_measurement_fraction"], "o-", label=label)
-            axes[1].plot(panel["interval_width_threshold"], panel["rmse_when_prediction_retained"], "o-", label=label)
-            axes[2].plot(panel["interval_width_threshold"], panel["coverage_when_prediction_retained"], "o-", label=label)
+            axes[0].plot(panel["interval_width_fraction_threshold"], panel["additional_measurement_fraction"], "o-", label=label)
+            axes[1].plot(panel["interval_width_fraction_threshold"], panel["rmse_when_prediction_retained_development_sd_units"], "o-", label=label)
+            axes[2].plot(panel["interval_width_fraction_threshold"], panel["coverage_when_prediction_retained"], "o-", label=label)
         axes[0].set_title("A. Additional measurements", loc="left")
         axes[0].set_ylabel("Fraction of held-out visits")
         axes[1].set_title("B. Error among retained estimates", loc="left")
@@ -1234,7 +1382,7 @@ def empirical_outputs(
         axes[2].set_ylabel("Patient-balanced coverage")
         axes[2].axhline(0.95, color="black", linestyle="--", linewidth=0.9)
         for ax in axes:
-            ax.set_xlabel("Maximum interval width, standardized units")
+            ax.set_xlabel("Maximum clipped width / legal score range")
         axes[0].legend(frameon=False)
         fig.tight_layout()
         fig.savefig(out / "supp_figure_uncertainty_guided_measurement.png", dpi=300, bbox_inches="tight")
@@ -1284,7 +1432,7 @@ def empirical_outputs(
                 ax.set_yticks(y, panel["domain_name"] if column_index == 0 else [])
                 ax.invert_yaxis()
                 ax.set_title(f"{channel.capitalize()}, {cadence} days", loc="left")
-                ax.set_xlabel("Transition coefficient")
+                ax.set_xlabel("Ridge coefficient for subsequent estimated change")
         fig.tight_layout()
         fig.savefig(out / "supp_figure_empirical_rdoc_coefficients.png", dpi=300, bbox_inches="tight")
         plt.close(fig)
@@ -1329,7 +1477,7 @@ def uncertainty_outputs(calibration: Path, out: Path) -> None:
     labels = {
         "student raw": "BALL ensemble plus Laplace",
         "student anchor conformal": "BALL conformalized ensemble plus Laplace",
-        "student oracle": "BALL latent-oracle conformal, simulation only",
+        "student oracle": "Conformal interval calibrated to simulated latent states",
         "Markov model-based": "Markov model-based interval",
     }
     rows = []
@@ -1466,13 +1614,18 @@ def main() -> None:
         "ball_student_causal",
         "ball_direct_causal",
         "gp_causal_filter",
-        "ode_rnn_causal",
+        "exponential_decay_gru",
         "s0_direct_lgssm",
         "markov_direct_transition",
+        "ball_direct_causal_compute_matched",
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+        "ball_student_transition_only",
     }
-    if len(primary_per_run) != 700 or set(primary_counts) != expected_primary_methods:
+    if len(primary_per_run) != 1100 or set(primary_counts) != expected_primary_methods:
         raise ValueError(
-            f"Expected 700 rows from seven primary methods; found {len(primary_per_run)} rows and "
+            f"Expected 1,100 rows from eleven primary methods; found {len(primary_per_run)} rows and "
             f"methods {sorted(primary_counts)}"
         )
     bad_counts = {method: count for method, count in primary_counts.items() if int(count) != 100}
@@ -1499,7 +1652,7 @@ def main() -> None:
     aggregate_counts = agg.groupby("method").size().to_dict()
     if set(aggregate_counts) != expected_primary_methods or any(int(count) != 10 for count in aggregate_counts.values()):
         raise ValueError(
-            "Primary aggregate must contain ten matched scenario panels for each of seven methods; "
+            "Primary aggregate must contain ten matched scenario panels for each of eleven methods; "
             f"found {aggregate_counts}"
         )
     if len(delta) != 10:
@@ -1541,6 +1694,7 @@ def main() -> None:
             "table1_primary_comparison_numeric.csv",
             "supp_table1_direct_rdoc_cells.csv",
             "supp_table1b_distillation_ablation.csv",
+            "supp_table1c_distillation_decomposition.csv",
             "supp_table2a_empirical_cohort.csv",
             "supp_table2b_empirical_comorbidity_features.csv",
             "supp_table2c_empirical_feature_dictionary.csv",
@@ -1555,6 +1709,7 @@ def main() -> None:
             "supp_table4_negative_controls.csv",
             "supp_table5_empirical_rdoc_transition.csv",
             "supp_table5b_empirical_rdoc_coefficients.csv",
+            "supp_table5c_empirical_rdoc_full_record_mean_sensitivity.csv",
             "supp_table6_adaptive_lasso_sensitivity.csv",
             "supp_table6_adaptive_lasso_sensitivity_numeric.csv",
             "supp_table7_irt_sensitivity.csv",
@@ -1563,6 +1718,7 @@ def main() -> None:
             "supp_table14_empirical_leakage_audit.csv",
             "supp_table15_uncertainty_guided_measurement.csv",
             "supp_table16_compute_time.csv",
+            "supp_table17_empirical_hyperparameter_selection.csv",
             "supp_figure_empirical_by_instrument.png",
             "supp_figure_empirical_context.png",
             "supp_figure_uncertainty_guided_measurement.png",

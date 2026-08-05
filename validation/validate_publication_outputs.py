@@ -42,30 +42,35 @@ def validate_benchmark(path: Path) -> dict:
         "ball_teacher_smoother",
         "ball_direct_causal",
         "gp_causal_filter",
-        "ode_rnn_causal",
+        "exponential_decay_gru",
         "s0_direct_lgssm",
         "markov_direct_transition",
+        "ball_direct_causal_compute_matched",
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+        "ball_student_transition_only",
     }
     key = ["cell", "share", "seed", "method"]
     require(set(per_run["method"]) == methods, f"Unexpected benchmark methods: {sorted(set(per_run['method']))}")
-    require(len(per_run) == 700, f"Expected 700 benchmark rows, found {len(per_run)}")
+    require(len(per_run) == 1100, f"Expected 1,100 benchmark rows, found {len(per_run)}")
     require(not per_run.duplicated(key).any(), "Duplicate benchmark replicate keys")
     counts = per_run.groupby(["cell", "share", "method"]).size()
-    require(len(counts) == 70 and counts.eq(10).all(), "Benchmark cells are not complete at ten seeds each")
+    require(len(counts) == 110 and counts.eq(10).all(), "Benchmark cells are not complete at ten seeds each")
     for metric in ("latent_rmse", "val_anchor_rmse"):
         values = pd.to_numeric(per_run[metric], errors="coerce").to_numpy(dtype=float)
         require(np.isfinite(values).all(), f"Nonfinite benchmark {metric}")
     for metric in ("beta_cosine", "beta_topk_f1"):
         explicit = per_run[
             ~per_run["method"].isin(
-                {"gp_causal_filter", "ode_rnn_causal"}
+                {"gp_causal_filter", "exponential_decay_gru"}
             )
         ]
         values = pd.to_numeric(explicit[metric], errors="coerce").to_numpy(dtype=float)
         require(np.isfinite(values).all(), f"Nonfinite explicit-transition {metric}")
     aggregate = pd.read_csv(path / "aggregate.csv")
     paired = pd.read_csv(path / "paired_delta_aggregate.csv")
-    require(len(aggregate) == 70, f"Expected 70 aggregate rows, found {len(aggregate)}")
+    require(len(aggregate) == 110, f"Expected 110 aggregate rows, found {len(aggregate)}")
     require(len(paired) == 10, f"Expected 10 paired-delta rows, found {len(paired)}")
     for column in (
         "ball_minus_direct_latent_rmse_mean",
@@ -192,8 +197,9 @@ def validate_benchmark(path: Path) -> dict:
     )
     contract = manifest.get("input_contract", {})
     require(
-        set(contract.get("causal_estimators", []))
-        == {"ball_student_causal", "ball_direct_causal", "gp_causal_filter", "ode_rnn_causal"}
+        {"ball_student_causal", "ball_direct_causal", "gp_causal_filter", "exponential_decay_gru"}.issubset(
+            set(contract.get("causal_estimators", []))
+        )
         and set(contract.get("retrospective_smoothers", []))
         == {"ball_teacher_smoother", "s0_direct_lgssm", "markov_direct_transition"},
         "Primary simulation information sets are not declared by inferential timing",
@@ -361,7 +367,7 @@ def validate_sensitivity(
         if metric in {"beta_cosine", "beta_topk_f1"}:
             metric_rows = metric_rows[
                 ~metric_rows["method"].isin(
-                    {"gp_causal_filter", "ode_rnn_causal"}
+                    {"gp_causal_filter", "exponential_decay_gru"}
                 )
             ]
         values = pd.to_numeric(metric_rows[metric], errors="coerce").to_numpy(dtype=float)
@@ -385,6 +391,9 @@ def validate_empirical(path: Path) -> dict:
     calibration = pd.read_csv(path / f"empirical_calibration{suffix}.csv")
     bootstrap = pd.read_csv(path / f"empirical_bootstrap_diff{suffix}.csv")
     transition = pd.read_csv(path / f"empirical_rdoc_transition{suffix}.csv")
+    transition_sensitivity = pd.read_csv(
+        path / f"empirical_rdoc_transition_full_record_sensitivity{suffix}.csv"
+    )
     by_instrument = pd.read_csv(path / "empirical_recovery_by_instrument_complete.csv")
     by_subgroup = pd.read_csv(path / "empirical_recovery_by_subgroup_complete.csv")
     conditional = pd.read_csv(path / "empirical_calibration_conditional_complete.csv")
@@ -400,6 +409,10 @@ def validate_empirical(path: Path) -> dict:
     timing = pd.read_csv(path / "empirical_fit_timing_complete.csv")
     ball_transitions = pd.read_csv(path / "empirical_ball_transition_rows_complete.csv")
     rdoc_transition_rows = pd.read_csv(path / "empirical_rdoc_transition_rows_complete.csv")
+    measurement_calibration = json.loads(
+        (path / "measurement_calibration.json").read_text(encoding="utf-8")
+    )
+    hyperparameters = pd.read_csv(path / "empirical_hyperparameter_selection_complete.csv")
     manifest = json.loads((path / "fit_run_manifest.json").read_text(encoding="utf-8"))
     require(manifest.get("status") == "complete", "Empirical fit manifest is not complete")
     require(manifest.get("completed_cadences") == [14, 21, 28], "Empirical cadences are incomplete")
@@ -490,29 +503,50 @@ def validate_empirical(path: Path) -> dict:
         "ball_no_dense_ehr",
         "ball_anchor_only",
         "gp_causal_filter",
-        "ode_rnn_causal",
+        "exponential_decay_gru",
         "s0_direct_lgssm",
         "markov_direct_transition",
         "interpolation",
         "locf",
         "causal_anchor_mean",
+        "ball_inherited_dynamics_only",
+        "ball_teacher_matching_only",
+        "ball_full_decomposition",
+        "ball_direct_compute_matched",
+        "ball_session_balanced",
     }
     require(
         set(overall["method"]) == required_methods,
         f"Unexpected empirical method set: {sorted(set(overall['method']))}",
     )
     require(np.isfinite(pd.to_numeric(overall["rmse"], errors="coerce")).all(), "Nonfinite empirical RMSE")
-    require(set(calibration["cadence"]) == {14, 21, 28}, "Calibration cadences are incomplete")
+    require(
+        set(calibration["cadence"]) == {14, 21, 28}
+        and set(calibration["instrument"].astype(str)) == {"PHQ9", "BDI", "GAD7"},
+        "Instrument-specific calibration rows are incomplete",
+    )
     require(calibration["coverage"].between(0, 1).all(), "Out-of-range empirical coverage")
-    require(calibration["mean_width"].gt(0).all(), "Nonpositive empirical interval width")
+    require(calibration["mean_width_native_clipped"].gt(0).all(), "Nonpositive empirical interval width")
+    require(calibration["mean_width_fraction_of_legal_range"].between(0, 1).all(), "Support-clipped interval width is invalid")
     require(
         set(calibration["score_unit"].astype(str))
-        == {"equal-patient-weight absolute residual divided by BALL predictive SD"}
+        == {"patient-balanced absolute residual divided by BALL predictive standard deviation"}
         and set(calibration["coverage_target"].astype(str))
         == {"patient-balanced marginal observable-measurement coverage"},
         "Empirical calibration is not the patient-balanced cluster-weighted procedure",
     )
     require(set(transition["cadence"]) == {14, 21, 28} and len(transition) == 6, "Empirical RDoC transition summary is incomplete")
+    require(
+        set(transition["patient_mean_mode"].astype(str)) == {"expanding_strictly_earlier"}
+        and not transition["current_profile_in_reference_mean"].astype(bool).any(),
+        "Primary RDoC analysis does not use the strictly earlier expanding patient mean",
+    )
+    require(
+        len(transition_sensitivity) == 6
+        and set(transition_sensitivity["patient_mean_mode"].astype(str)) == {"full_record_retrospective"},
+        "Retrospective full-record RDoC sensitivity is incomplete",
+    )
+    require(rdoc_transition_rows["id"].nunique() <= 345, "RDoC analysis exceeds the held-out-clinic population")
     require("stratum_type" in by_subgroup and "clinic" in set(by_subgroup["stratum_type"]), "Empirical subgroup output lacks clinic strata")
     require("stratum_type" in conditional and "clinic" in set(conditional["stratum_type"]), "Conditional calibration lacks clinic strata")
     require(len(by_instrument) > 0 and len(bootstrap) == 3 and len(generalization) > 0, "Empirical sensitivity outputs are incomplete")
@@ -520,7 +554,7 @@ def validate_empirical(path: Path) -> dict:
         set(input_contract["method"].astype(str)) == required_methods,
         "Empirical input contract does not cover every fitted method",
     )
-    expected_pairwise_counts = {14: 11, 21: 10, 28: 10}
+    expected_pairwise_counts = {14: 16, 21: 10, 28: 10}
     pairwise_counts = pairwise.groupby(pairwise["cadence"].astype(int)).size().to_dict()
     require(
         pairwise_counts == expected_pairwise_counts,
@@ -533,9 +567,9 @@ def validate_empirical(path: Path) -> dict:
     )
     require(
         set(uncertainty_workload["cadence"].astype(int)) == {14, 21, 28}
-        and set(uncertainty_workload["interval_width_threshold"].astype(float))
-        == {0.5, 0.75, 1.0, 1.5}
-        and len(uncertainty_workload) == 12,
+        and set(uncertainty_workload["interval_width_fraction_threshold"].astype(float))
+        == {0.1, 0.2, 0.3, 0.4, 0.5}
+        and len(uncertainty_workload) == 15,
         "Uncertainty-guided measurement analysis is incomplete",
     )
     require(
@@ -641,6 +675,19 @@ def validate_empirical(path: Path) -> dict:
         and set(workload["accuracy_ci_replicates"].astype(int)) == {2000},
         "Workload classification uncertainty is not the prespecified patient-clustered bootstrap",
     )
+    require(
+        set(measurement_calibration["instruments"]) == {"PHQ9", "BDI", "GAD7"}
+        and measurement_calibration["instruments"]["PHQ9"]["intercept"] == 0.0
+        and measurement_calibration["instruments"]["PHQ9"]["loading"] == 1.0
+        and measurement_calibration["instruments"]["GAD7"]["intercept"] == 0.0
+        and measurement_calibration["instruments"]["GAD7"]["loading"] == 1.0,
+        "Frozen development measurement calibration violates its identification constraints",
+    )
+    require(
+        set(hyperparameters["daily_persistence"].dropna().astype(float)).issuperset({0.1, 0.3, 0.6, 0.9})
+        and set(hyperparameters["questionnaire_weight"].dropna().astype(float)).issuperset({10.0, 20.0, 40.0, 80.0}),
+        "Development-only core hyperparameter selection is incomplete",
+    )
 
     expected_features = [
         "treatment_session_number",
@@ -669,6 +716,16 @@ def validate_empirical(path: Path) -> dict:
         require(cadence_manifest.get("n_heldout_clinic_patients") == 344, f"{cadence}d held-out count changed")
         require(cadence_manifest.get("empirical_feature_names") == expected_features, f"{cadence}d feature schema changed")
         require(cadence_manifest.get("uses_rdoc_proxy") is False, f"{cadence}d primary tensor uses RDoC")
+        require(
+            cadence_manifest.get("anchor_representation")
+            == "one event per patient, session, and questionnaire instrument"
+            and cadence_manifest.get("questionnaire_event_collisions") == 0,
+            f"{cadence}d questionnaire event contract failed",
+        )
+        require(
+            set(cadence_manifest.get("anchor_instrument_names", [])) == {"PHQ9", "BDI", "GAD7"},
+            f"{cadence}d instrument-specific anchor tensor is incomplete",
+        )
         require(cadence_manifest.get("same_session_narrative_inputs") is False, f"{cadence}d primary tensor uses narrative")
         require(cadence_manifest.get("target_fields_in_structured_feature_allowlist") is False, f"{cadence}d target field entered allowlist")
         require(cadence_manifest.get("action_vocabulary_scope") == "development partition only", f"{cadence}d action vocabulary scope changed")
@@ -715,11 +772,16 @@ def main() -> None:
             args.adaptive.resolve(),
             kind="adaptive Lasso",
             group_keys=["cell", "share", "method"],
-            expected_groups=50,
+            expected_groups=90,
             expected_methods={
                 "ball_student_causal",
                 "ball_teacher_smoother",
                 "ball_direct_causal",
+                "ball_direct_causal_compute_matched",
+                "ball_inherited_dynamics_only",
+                "ball_teacher_matching_only",
+                "ball_full_decomposition",
+                "ball_student_transition_only",
                 "s0_direct_lgssm",
                 "markov_direct_transition",
             },
@@ -729,13 +791,18 @@ def main() -> None:
             args.irt.resolve(),
             kind="IRT",
             group_keys=["cell", "share", "method"],
-            expected_groups=70,
+            expected_groups=110,
             expected_methods={
                 "ball_student_causal",
                 "ball_teacher_smoother",
                 "ball_direct_causal",
+                "ball_direct_causal_compute_matched",
+                "ball_inherited_dynamics_only",
+                "ball_teacher_matching_only",
+                "ball_full_decomposition",
+                "ball_student_transition_only",
                 "gp_causal_filter",
-                "ode_rnn_causal",
+                "exponential_decay_gru",
                 "s0_direct_lgssm",
                 "markov_direct_transition",
             },

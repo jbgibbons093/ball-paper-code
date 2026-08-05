@@ -82,6 +82,22 @@ $gaussianArgs = @(
 )
 Invoke-SimulationStep -Name 'Gaussian benchmark' -OutputDirectory $gaussianOut -Arguments $gaussianArgs -SourceFiles $commonSources
 
+$parameterOut = Join-Path $outputRoot 'focused_parameter_sensitivities_publication_20260805_v1'
+$parameterArgs = @(
+    '-u', 'validation\run_focused_parameter_sensitivities.py',
+    '--out', $parameterOut,
+    '--seeds'
+) + $seeds + @(
+    '--n', '150', '--t', '84', '--ensemble-size', '5',
+    '--teacher-epochs', '300', '--student-epochs', '300', '--device', 'cuda'
+)
+Invoke-SimulationStep -Name 'Focused parameter sensitivities' -OutputDirectory $parameterOut -Arguments $parameterArgs -SourceFiles @(
+    'BALL.py',
+    'validation\direct_rdoc_benchmark.py',
+    'validation\direct_rdoc_fair_comparator.py',
+    'validation\run_focused_parameter_sensitivities.py'
+)
+
 $calibrationOut = Join-Path $taskRoot 'simulations\paper\outputs\publication_calibration_20260805_v3'
 $calibrationArgs = @(
     '-u', 'BALL.py', 'paper-fig3',

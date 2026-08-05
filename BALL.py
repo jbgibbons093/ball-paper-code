@@ -52,6 +52,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+import dataclasses as _dataclasses
 import hashlib
 import os
 import shutil
@@ -130,6 +131,16 @@ class SimulationConfig:
     y2: AnchorSpec = field(
         default_factory=lambda: AnchorSpec("Y2", 7, 7, 0.75, 0.85, 0.20)
     )
+    # Optional event-level questionnaire measurement specification.  Empty
+    # tuples retain the two-instrument simulation defaults declared by y1/y2.
+    # Empirical fits populate three instruments (PHQ-9, BDI-II and GAD-7), so
+    # same-session questionnaires remain distinct observations even when two
+    # instruments measure the same latent channel.
+    anchor_instrument_names: tuple[str, ...] = ()
+    anchor_instrument_channels: tuple[int, ...] = ()
+    anchor_instrument_intercepts: tuple[float, ...] = ()
+    anchor_instrument_loadings: tuple[float, ...] = ()
+    anchor_instrument_obs_sd: tuple[float, ...] = ()
     rho_cross: float = 0.30
     rho_serial_y1: float = 0.20
     rho_serial_y2: float = 0.20
@@ -4233,6 +4244,11 @@ class SSMConfig:
     # 24 independent observations); without this the dense likelihood swamps the
     # anchors and the optimizer drifts a channel's sign into a flipped basin.
     anchor_weight: float = 40.0
+    # Primary fits sum the evidence from every observed questionnaire.  The
+    # paired-session sensitivity divides the questionnaire contribution at a
+    # patient-session by the number of instruments administered there so that
+    # every observed session has total measurement weight one.
+    anchor_session_balance: bool = False
     ensemble_size: int = 5              # deep ensemble K (spec Sec. 5)
     delta_phi: float = 1.0              # delta AR coefficient; 1.0 = spec random walk, <1 = mean-reverting
     # Decomposition-pressure ablation knobs (validation step B). All default to the
@@ -4251,6 +4267,8 @@ class SSMConfig:
     rdoc_drift_adaptive_eps: float = 1e-3     # stabilizer eps in the pilot weight formula
     rdoc_drift_weights: tuple = ()            # FIXED per-coordinate weights from the pilot fit (empty = unit L1)
     reanchor_weight: float = 1.0        # eta in the student objective
+    teacher_matching_weight: float = 1.0
+    encoder_use_rdoc: bool = True       # False keeps RDoC in the transition prior while removing it from q(Z|O)
     # Adaptive-Lasso alpha rate for the neural ELBO. This is not numerically
     # interchangeable with the structural posterior's xi because the VI loss
     # sums the Laplace prior across every time point and latent dimension.
@@ -4278,12 +4296,13 @@ class SSMBatch:
     encoder_action: torch.Tensor # (B, T) treatment known at the time of estimation
     dt: torch.Tensor             # (B, T) elapsed days to the next modeled position
     valid: torch.Tensor          # (B, T) true only for recorded, non-padding positions
-    anchor_value: torch.Tensor   # (B, T, 2)
-    anchor_obs: torch.Tensor     # (B, T, 2)
-    anchor_total: torch.Tensor   # (B, T, 2) raw integer graded-response total (IRT); 0 if Gaussian
-    anchor_items: torch.Tensor   # (B, T, 2, J) integer per-item graded responses (IRT); 0 if Gaussian
-    win_start: torch.Tensor      # (B, T, 2) long
-    win_end: torch.Tensor        # (B, T, 2) long
+    anchor_value: torch.Tensor   # (B, T, M) one slot per questionnaire instrument
+    anchor_obs: torch.Tensor     # (B, T, M)
+    anchor_total: torch.Tensor   # (B, T, M) raw integer graded-response total (IRT); 0 if Gaussian
+    anchor_items: torch.Tensor   # (B, T, M, J) integer per-item graded responses (IRT); 0 if Gaussian
+    anchor_channel: torch.Tensor # (B, T, M) latent channel index for each instrument
+    win_start: torch.Tensor      # (B, T, M) long
+    win_end: torch.Tensor        # (B, T, M) long
     z_truth: torch.Tensor        # (B, T, 2) z_d, z_p (eval only)
 
 
@@ -4310,6 +4329,44 @@ def _raw_elapsed_days(values: pd.Series) -> np.ndarray:
     return elapsed.to_numpy(dtype=np.float32)
 
 
+def _anchor_measurement_spec(data: SimulationData) -> dict[str, tuple]:
+    """Return the frozen event-level questionnaire measurement contract."""
+
+    names = tuple(getattr(data.config, "anchor_instrument_names", ()) or ())
+    if not names:
+        names = (str(data.config.y1.name), str(data.config.y2.name))
+        channels = (0, 1)
+        intercepts = (0.0, 0.0)
+        loadings = (float(data.config.y1.loading), float(data.config.y2.loading))
+        obs_sd = (
+            marginal_anchor_sd(data.config.y1, data.config.rho_serial_y1),
+            marginal_anchor_sd(data.config.y2, data.config.rho_serial_y2),
+        )
+    else:
+        channels = tuple(int(v) for v in data.config.anchor_instrument_channels)
+        intercepts = tuple(float(v) for v in data.config.anchor_instrument_intercepts)
+        loadings = tuple(float(v) for v in data.config.anchor_instrument_loadings)
+        obs_sd = tuple(float(v) for v in data.config.anchor_instrument_obs_sd)
+    lengths = {len(names), len(channels), len(intercepts), len(loadings), len(obs_sd)}
+    if len(lengths) != 1 or not names:
+        raise ValueError("Questionnaire measurement arrays must have the same positive length.")
+    if len(set(names)) != len(names):
+        raise ValueError("Questionnaire instrument names must be unique.")
+    if any(channel not in {0, 1} for channel in channels):
+        raise ValueError("Questionnaire channels must be 0 for depression or 1 for anxiety.")
+    if any((not np.isfinite(value)) or value <= 0 for value in obs_sd):
+        raise ValueError("Questionnaire observation standard deviations must be positive and finite.")
+    if any((not np.isfinite(value)) or abs(value) < 1e-8 for value in loadings):
+        raise ValueError("Questionnaire loadings must be finite and nonzero.")
+    return {
+        "names": names,
+        "channels": channels,
+        "intercepts": intercepts,
+        "loadings": loadings,
+        "obs_sd": obs_sd,
+    }
+
+
 def build_ssm_batch(
     data: SimulationData,
     split: str | None,
@@ -4317,6 +4374,7 @@ def build_ssm_batch(
     max_individuals: int,
     feature_stats: tuple[np.ndarray, np.ndarray] | None = None,
     causal_impute: bool = False,
+    include_rdoc_in_encoder: bool = True,
 ) -> tuple[SSMBatch, tuple[np.ndarray, np.ndarray]]:
     q = data.config.q
     p = data.config.p_daily
@@ -4342,14 +4400,23 @@ def build_ssm_batch(
     action = np.zeros((B, T), dtype=np.int64)
     encoder_action = np.zeros((B, T), dtype=np.int64)
     z_truth = np.zeros((B, T, 2), dtype=np.float32)
-    anchor_value = np.zeros((B, T, 2), dtype=np.float32)
-    anchor_obs = np.zeros((B, T, 2), dtype=np.float32)
-    anchor_total = np.zeros((B, T, 2), dtype=np.float32)
+    measurement = _anchor_measurement_spec(data)
+    instrument_names = measurement["names"]
+    instrument_index = {name: index for index, name in enumerate(instrument_names)}
+    instrument_channels = np.asarray(measurement["channels"], dtype=np.int64)
+    n_instruments = len(instrument_names)
+    anchor_value = np.zeros((B, T, n_instruments), dtype=np.float32)
+    anchor_obs = np.zeros((B, T, n_instruments), dtype=np.float32)
+    anchor_total = np.zeros((B, T, n_instruments), dtype=np.float32)
     use_irt = str(getattr(data.config, "anchor_observation", "gaussian")).lower() == "irt"
     n_items = int(getattr(data.config, "irt_n_items", 9))
-    anchor_items = np.zeros((B, T, 2, n_items), dtype=np.float32)
-    win_start = np.zeros((B, T, 2), dtype=np.int64)
-    win_end = np.zeros((B, T, 2), dtype=np.int64)
+    anchor_items = np.zeros((B, T, n_instruments, n_items), dtype=np.float32)
+    anchor_channel = np.broadcast_to(
+        instrument_channels.reshape(1, 1, n_instruments),
+        (B, T, n_instruments),
+    ).copy()
+    win_start = np.zeros((B, T, n_instruments), dtype=np.int64)
+    win_end = np.zeros((B, T, n_instruments), dtype=np.int64)
 
     b_cols = [f"B{d}" for d in range(q)]
     x_cols = [f"X{j}" for j in range(p)]
@@ -4387,33 +4454,42 @@ def build_ssm_batch(
             for arow in ai.itertuples(index=False):
                 if not bool(arow.observed):
                     continue
-                ch = 0 if arow.anchor == "Y1" else 1
+                instrument = str(getattr(arow, "instrument", arow.anchor))
+                if instrument not in instrument_index:
+                    raise ValueError(f"Questionnaire instrument lacks a frozen measurement specification: {instrument}")
+                instrument_position = instrument_index[instrument]
                 k = t_index.get(int(arow.t))
                 if k is None:
                     continue
+                if anchor_obs[row, k, instrument_position] > 0.5:
+                    raise ValueError(
+                        "Duplicate questionnaire event for patient, modeled session and instrument: "
+                        f"id={pid}, t={int(arow.t)}, instrument={instrument}"
+                    )
                 if use_irt:
                     items = getattr(arow, "irt_items", None)
                     total = getattr(arow, "irt_total", float("nan"))
                     if items is None or not np.isfinite(total):
                         continue
-                    anchor_items[row, k, ch, :] = np.asarray(items, dtype=np.float32)
-                    anchor_total[row, k, ch] = float(total)
-                    anchor_value[row, k, ch] = float(total)   # finite encoder feature; likelihood uses items
+                    anchor_items[row, k, instrument_position, :] = np.asarray(items, dtype=np.float32)
+                    anchor_total[row, k, instrument_position] = float(total)
+                    anchor_value[row, k, instrument_position] = float(total)   # finite encoder feature; likelihood uses items
                 else:
                     if not np.isfinite(arow.value):
                         continue
-                    anchor_value[row, k, ch] = float(arow.value)
+                    anchor_value[row, k, instrument_position] = float(arow.value)
                     total = getattr(arow, "irt_total", float("nan"))
                     if total is not None and np.isfinite(total):
-                        anchor_total[row, k, ch] = float(total)
-                anchor_obs[row, k, ch] = 1.0
-                win_start[row, k, ch] = max(0, t_index.get(int(arow.window_start), 0))
-                win_end[row, k, ch] = t_index.get(int(arow.window_end), k)
+                        anchor_total[row, k, instrument_position] = float(total)
+                anchor_obs[row, k, instrument_position] = 1.0
+                win_start[row, k, instrument_position] = max(0, t_index.get(int(arow.window_start), 0))
+                win_end[row, k, instrument_position] = t_index.get(int(arow.window_end), k)
 
     # Encoder features: standardized [EHR | EHR availability masks | RDoC |
     # anchor value*obs | obs flags] +
     # the action is added as a learned embedding inside the encoder.
-    raw = np.concatenate([ehr, x_input, rdoc, anchor_value * anchor_obs, anchor_obs], axis=-1)
+    encoder_rdoc = rdoc if include_rdoc_in_encoder else np.zeros_like(rdoc)
+    raw = np.concatenate([ehr, x_input, encoder_rdoc, anchor_value * anchor_obs, anchor_obs], axis=-1)
     no_encoder_scaling = data.metadata.get("encoder_feature_scaling") == "none"
     if no_encoder_scaling:
         feature_stats = (
@@ -4456,6 +4532,7 @@ def build_ssm_batch(
         anchor_obs=to(anchor_obs),
         anchor_total=to(anchor_total),
         anchor_items=to(anchor_items),
+        anchor_channel=to(anchor_channel),
         win_start=to(win_start),
         win_end=to(win_end),
         z_truth=to(z_truth),
@@ -4486,13 +4563,16 @@ def _gap_transition_factors(
 
 class GenerativeModel(nn.Module):
     def __init__(self, q: int, ehr_dim: int, config: SSMConfig, n_actions: int,
-                 obs_sd: tuple[float, float] = (0.95, 0.85),
-                 loadings: tuple[float, float] = (1.0, 0.75),
+                 obs_sd: tuple[float, ...] = (0.95, 0.85),
+                 loadings: tuple[float, ...] = (1.0, 0.75),
+                 intercepts: tuple[float, ...] = (0.0, 0.0),
+                 anchor_channels: tuple[int, ...] = (0, 1),
                  anchor_observation: str = "gaussian",
                  irt_n_items: int = 9, irt_n_categories: int = 4,
                  irt_loc: float = 0.0, irt_scale: float = 1.0,
                  irt_item_disc=(), irt_item_thresholds=()) -> None:
         super().__init__()
+        self.config = config
         self.q = q
         self.anchor_observation = str(anchor_observation).lower()
         self.irt_n_items = int(irt_n_items)
@@ -4559,10 +4639,14 @@ class GenerativeModel(nn.Module):
         # Observation noise is a known property of the instrument (PHQ/PCL), so it
         # is fixed rather than learned (a learnable obs sd collapses by inflating
         # to explain the anchors away as noise).
+        if not (len(obs_sd) == len(loadings) == len(intercepts) == len(anchor_channels)):
+            raise ValueError("The questionnaire measurement specification has inconsistent lengths.")
         self.register_buffer("log_sigma_obs", torch.log(torch.tensor(obs_sd, dtype=torch.float32)))
         # Anchor loadings beta_k (Y1, Y2): the anchor measures beta_k * windowed
         # mean of the latent, so the likelihood compares against beta_k * zbar.
         self.register_buffer("anchor_loadings", torch.tensor(loadings, dtype=torch.float32))
+        self.register_buffer("anchor_intercepts", torch.tensor(intercepts, dtype=torch.float32))
+        self.register_buffer("anchor_channels", torch.tensor(anchor_channels, dtype=torch.long))
         # Graded-response IRT observation (calibrated-instrument sensitivity). The
         # per-item discriminations and ordered thresholds and the affine trait map are
         # FIXED buffers from the frozen calibration (validation/irt_calibration.json),
@@ -4668,28 +4752,40 @@ class GenerativeModel(nn.Module):
         (see _irt_channel_log_lik), with the latent mapped to the calibrated trait scale.
         """
 
-        sig2 = (self.log_sigma_obs.exp() ** 2)   # (2,)
+        sig2 = (self.log_sigma_obs.exp() ** 2)   # (M,)
         z = [z_d, z_p]
         B, T = z_d.shape
         device = z_d.device
         arange = torch.arange(T, device=device).view(1, 1, T)
-        total = torch.zeros(B, device=device)
-        for ch in range(2):
-            obs = batch.anchor_obs[:, :, ch] > 0.5         # (B,T)
+        event_lp = torch.zeros(
+            (B, T, batch.anchor_obs.shape[-1]), device=device, dtype=z_d.dtype
+        )
+        for instrument in range(batch.anchor_obs.shape[-1]):
+            channel = int(self.anchor_channels[instrument].item())
+            observed_channels = batch.anchor_channel[:, :, instrument]
+            if torch.any(observed_channels != channel):
+                raise ValueError("Questionnaire event channel disagrees with the frozen measurement specification.")
+            obs = batch.anchor_obs[:, :, instrument] > 0.5         # (B,T)
             if not torch.any(obs):
                 continue
-            starts = batch.win_start[:, :, ch].unsqueeze(-1)   # (B,T,1)
-            ends = batch.win_end[:, :, ch].unsqueeze(-1)
+            starts = batch.win_start[:, :, instrument].unsqueeze(-1)   # (B,T,1)
+            ends = batch.win_end[:, :, instrument].unsqueeze(-1)
             win = ((arange >= starts) & (arange <= ends)).float()   # (B,T,T)
             win = win / win.sum(-1, keepdim=True).clamp(min=1.0)
-            zbar = torch.einsum("bts,bs->bt", win, z[ch])          # (B,T) windowed mean
+            zbar = torch.einsum("bts,bs->bt", win, z[channel])          # (B,T) windowed mean
             if self.anchor_observation == "irt":
-                lp = self._irt_channel_log_lik(zbar, batch.anchor_items[:, :, ch, :])
+                lp = self._irt_channel_log_lik(zbar, batch.anchor_items[:, :, instrument, :])
             else:
-                resid2 = (batch.anchor_value[:, :, ch] - self.anchor_loadings[ch] * zbar) ** 2
-                lp = -0.5 * (LOG_2PI + torch.log(sig2[ch]) + resid2 / sig2[ch])
-            total = total + (lp * obs.float()).sum(1)
-        return total
+                mean = self.anchor_intercepts[instrument] + self.anchor_loadings[instrument] * zbar
+                resid2 = (batch.anchor_value[:, :, instrument] - mean) ** 2
+                lp = -0.5 * (
+                    LOG_2PI + torch.log(sig2[instrument]) + resid2 / sig2[instrument]
+                )
+            event_lp[:, :, instrument] = lp * obs.float()
+        if self.config.anchor_session_balance:
+            event_count = batch.anchor_obs.sum(-1).clamp(min=1.0)
+            return (event_lp.sum(-1) / event_count).sum(1)
+        return event_lp.sum((1, 2))
 
     def _irt_channel_log_lik(self, zbar: torch.Tensor, items_obs: torch.Tensor) -> torch.Tensor:
         """Exact per-item graded-response log-likelihood for one anchor channel.
@@ -4854,7 +4950,7 @@ import dataclasses as _dataclasses
 
 _B_FIELDS = [
     "rdoc", "ehr", "x_raw", "x_obs", "enc_features", "action", "encoder_action", "dt", "valid",
-    "anchor_value", "anchor_obs", "anchor_total", "anchor_items", "win_start", "win_end", "z_truth",
+    "anchor_value", "anchor_obs", "anchor_total", "anchor_items", "anchor_channel", "win_start", "win_end", "z_truth",
 ]
 
 
@@ -4868,15 +4964,13 @@ def _subbatch(batch: SSMBatch, idx: torch.Tensor) -> SSMBatch:
 def _make_models(data: SimulationData, train_batch: SSMBatch, config: SSMConfig,
                  device: torch.device, causal: bool):
     q = data.config.q
+    measurement = _anchor_measurement_spec(data)
     gen = GenerativeModel(
         q, data.config.p_daily, config, n_actions=data.config.n_treatment_types + 1,
-        # Marginal anchor error SD: the DGP anchor errors are AR(1), so the
-        # instrument's marginal noise is error_sd / sqrt(1 - rho^2).
-        obs_sd=(
-            marginal_anchor_sd(data.config.y1, data.config.rho_serial_y1),
-            marginal_anchor_sd(data.config.y2, data.config.rho_serial_y2),
-        ),
-        loadings=(data.config.y1.loading, data.config.y2.loading),
+        obs_sd=measurement["obs_sd"],
+        loadings=measurement["loadings"],
+        intercepts=measurement["intercepts"],
+        anchor_channels=measurement["channels"],
         anchor_observation=getattr(data.config, "anchor_observation", "gaussian"),
         irt_n_items=getattr(data.config, "irt_n_items", 9),
         irt_n_categories=getattr(data.config, "irt_n_categories", 4),
@@ -5066,7 +5160,10 @@ def _train_student_distilled(data: SimulationData, teacher_train_batch: SSMBatch
             a, dd, dp = _split_u(mu_s, q)
             slow = _slow_from_alpha(a, sb.rdoc, config)
             anchor_ll = teacher_gen.anchor_log_lik(slow + dd, slow + dp, sb)
-            loss = (kl - config.reanchor_weight * anchor_ll).mean()
+            loss = (
+                config.teacher_matching_weight * kl
+                - config.reanchor_weight * anchor_ll
+            ).mean()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(trainable_params, config.grad_clip_norm)
             opt.step()
@@ -5087,6 +5184,96 @@ def _train_student_distilled(data: SimulationData, teacher_train_batch: SSMBatch
                 "kl_weight": float("nan"),
             }
         )
+    return student, history
+
+
+def _train_student_with_frozen_dynamics(
+    data: SimulationData,
+    student_train_batch: SSMBatch,
+    config: SSMConfig,
+    device: torch.device,
+    teacher_gen: GenerativeModel,
+    seed: int,
+):
+    """Train a causal encoder against anchors with teacher-fitted dynamics frozen."""
+
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+    q = data.config.q
+    student_action_embed = nn.Embedding(
+        teacher_gen.action_embed.num_embeddings,
+        teacher_gen.action_embed.embedding_dim,
+    ).to(device)
+    student_action_embed.load_state_dict(teacher_gen.action_embed.state_dict())
+    student = InferenceTransformer(
+        student_train_batch.enc_features.shape[-1],
+        q,
+        len(student_train_batch.t_values),
+        config,
+        student_action_embed,
+        causal=True,
+    ).to(device)
+    for parameter in teacher_gen.parameters():
+        parameter.requires_grad_(False)
+    trainable_parameters = [parameter for parameter in student.parameters() if parameter.requires_grad]
+    optimizer = torch.optim.Adam(trainable_parameters, lr=config.learning_rate)
+    patient_count = student_train_batch.z_truth.shape[0]
+    history: list[dict[str, float | int | str]] = []
+    for epoch in range(config.student_epochs):
+        kl_weight = min(1.0, epoch / max(config.kl_warmup_epochs, 1))
+        permutation = torch.randperm(patient_count, device=device)
+        epoch_loss = epoch_anchor = epoch_daily = epoch_kl = 0.0
+        epoch_count = 0
+        for start in range(0, patient_count, config.batch_size):
+            index = permutation[start : start + config.batch_size]
+            batch = _subbatch(student_train_batch, index)
+            optimizer.zero_grad()
+            mean, log_variance = student(batch)
+            standard_deviation = (0.5 * log_variance).exp()
+            noise = torch.randn_like(standard_deviation)
+            sample = mean + standard_deviation * noise
+            alpha, delta_d, delta_p = _split_u(sample, q)
+            slow = _slow_from_alpha(alpha, batch.rdoc, config)
+            anchor_log_likelihood = teacher_gen.anchor_log_lik(
+                slow + delta_d, slow + delta_p, batch
+            )
+            daily_log_likelihood = teacher_gen.daily_log_lik(
+                slow, delta_d, delta_p, batch
+            )
+            log_prior = teacher_gen.log_prior(alpha, delta_d, delta_p, batch)
+            log_q_position = (
+                -0.5 * (LOG_2PI + log_variance + noise ** 2)
+            ).sum(-1)
+            log_q = (
+                log_q_position * batch.valid.to(log_q_position.dtype)
+            ).sum(1)
+            kl = log_q - log_prior
+            loss = -(
+                config.anchor_weight * anchor_log_likelihood
+                + daily_log_likelihood
+                - kl_weight * kl
+            ).mean()
+            loss = loss + _decomposition_pressure(slow, delta_d, delta_p, config)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable_parameters, config.grad_clip_norm)
+            optimizer.step()
+            batch_count = int(len(index))
+            epoch_count += batch_count
+            epoch_loss += float(loss.detach().cpu()) * batch_count
+            epoch_anchor += float(anchor_log_likelihood.mean().detach().cpu()) * batch_count
+            epoch_daily += float(daily_log_likelihood.mean().detach().cpu()) * batch_count
+            epoch_kl += float(kl.mean().detach().cpu()) * batch_count
+        denominator = max(epoch_count, 1)
+        history.append({
+            "phase": "causal_encoder_frozen_teacher_dynamics",
+            "epoch": epoch + 1,
+            "loss": epoch_loss / denominator,
+            "anchor_ll": epoch_anchor / denominator,
+            "daily_ll": epoch_daily / denominator,
+            "kl": epoch_kl / denominator,
+            "kl_weight": float(kl_weight),
+        })
     return student, history
 
 
@@ -5280,11 +5467,29 @@ def fit_ball_ssm(
     device = torch.device(device)
     q = data.config.q
 
-    train_batch, stats = build_ssm_batch(data, "train", device, config.max_individuals)
-    eval_batch, _ = build_ssm_batch(data, prediction_split, device, config.max_individuals, feature_stats=stats)
+    train_batch, stats = build_ssm_batch(
+        data,
+        "train",
+        device,
+        config.max_individuals,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
+    )
+    eval_batch, _ = build_ssm_batch(
+        data,
+        prediction_split,
+        device,
+        config.max_individuals,
+        feature_stats=stats,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
+    )
     if causal:
         student_train_batch, student_stats = build_ssm_batch(
-            data, "train", device, config.max_individuals, causal_impute=True
+            data,
+            "train",
+            device,
+            config.max_individuals,
+            causal_impute=True,
+            include_rdoc_in_encoder=config.encoder_use_rdoc,
         )
         student_eval_batch, _ = build_ssm_batch(
             data,
@@ -5293,6 +5498,7 @@ def fit_ball_ssm(
             config.max_individuals,
             feature_stats=student_stats,
             causal_impute=True,
+            include_rdoc_in_encoder=config.encoder_use_rdoc,
         )
     else:
         student_train_batch = train_batch
@@ -5388,6 +5594,7 @@ def fit_ball_ssm(
         "alpha_lasso_xi": float(config.alpha_lasso_xi),
         "use_alpha_slow": bool(config.use_alpha_slow),
         "rdoc_drift_head": bool(config.rdoc_drift_head),
+        "encoder_use_rdoc": bool(config.encoder_use_rdoc),
         "rdoc_drift_l1": float(config.rdoc_drift_l1),
         "rdoc_drift_adaptive": bool(config.rdoc_drift_adaptive),
         "rdoc_drift_adaptive_gamma": float(config.rdoc_drift_adaptive_gamma) if config.rdoc_drift_adaptive else None,
@@ -5437,7 +5644,8 @@ def fit_ball_ssm(
             "ensemble_size": int(config.ensemble_size),
             "alpha_lasso_xi": float(config.alpha_lasso_xi),
             "use_alpha_slow": bool(config.use_alpha_slow),
-            "rdoc_drift_head": bool(config.rdoc_drift_head),
+        "rdoc_drift_head": bool(config.rdoc_drift_head),
+            "encoder_use_rdoc": bool(config.encoder_use_rdoc),
             "rdoc_drift_l1": float(config.rdoc_drift_l1),
             "rdoc_drift_adaptive": bool(config.rdoc_drift_adaptive),
             "rdoc_drift_adaptive_gamma": float(config.rdoc_drift_adaptive_gamma) if config.rdoc_drift_adaptive else None,
@@ -5461,6 +5669,151 @@ def fit_ball_ssm(
     return student_result
 
 
+def fit_ball_ssm_distillation_decomposition(
+    data: SimulationData,
+    config: SSMConfig | None = None,
+    device: str | torch.device | None = None,
+    prediction_split: str | None = "test",
+) -> dict[str, MethodResult]:
+    """Fit three causal students against the same fitted teacher ensemble.
+
+    The inherited-dynamics arm uses the teacher-fitted generative and
+    measurement models with a causal variational objective and questionnaire
+    likelihood. The teacher-matching arm uses the teacher-distribution target
+    alone. Full BALL combines teacher matching with questionnaire re-anchoring.
+    """
+
+    config = config or SSMConfig()
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device)
+    q = data.config.q
+    teacher_train_batch, teacher_stats = build_ssm_batch(
+        data,
+        "train",
+        device,
+        config.max_individuals,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
+    )
+    student_train_batch, student_stats = build_ssm_batch(
+        data,
+        "train",
+        device,
+        config.max_individuals,
+        causal_impute=True,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
+    )
+    student_evaluation_batch, _ = build_ssm_batch(
+        data,
+        prediction_split,
+        device,
+        config.max_individuals,
+        feature_stats=student_stats,
+        causal_impute=True,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
+    )
+    arms = {
+        "inherited_dynamics_only": [],
+        "teacher_matching_only": [],
+        "full_ball": [],
+    }
+    histories: dict[str, list[dict]] = {name: [] for name in arms}
+    for member in range(max(1, config.ensemble_size)):
+        teacher_seed = config.seed + 1000 * member
+        teacher_gen, teacher_net, _ = _train_one_ssm(
+            data,
+            teacher_train_batch,
+            config,
+            device,
+            causal=False,
+            seed=teacher_seed,
+        )
+        inherited_net, inherited_history = _train_student_with_frozen_dynamics(
+            data,
+            student_train_batch,
+            config,
+            device,
+            teacher_gen,
+            seed=teacher_seed + 500,
+        )
+        matching_config = _dataclasses.replace(
+            config,
+            teacher_matching_weight=1.0,
+            reanchor_weight=0.0,
+        )
+        matching_net, matching_history = _train_student_distilled(
+            data,
+            teacher_train_batch,
+            student_train_batch,
+            matching_config,
+            device,
+            teacher_gen,
+            teacher_net,
+            seed=teacher_seed + 600,
+        )
+        full_config = _dataclasses.replace(
+            config,
+            teacher_matching_weight=1.0,
+            reanchor_weight=config.reanchor_weight,
+        )
+        full_net, full_history = _train_student_distilled(
+            data,
+            teacher_train_batch,
+            student_train_batch,
+            full_config,
+            device,
+            teacher_gen,
+            teacher_net,
+            seed=teacher_seed + 700,
+        )
+        for arm_name, network, arm_config, history in (
+            ("inherited_dynamics_only", inherited_net, config, inherited_history),
+            ("teacher_matching_only", matching_net, matching_config, matching_history),
+            ("full_ball", full_net, full_config, full_history),
+        ):
+            arms[arm_name].append(
+                _member_predict(
+                    teacher_gen,
+                    network,
+                    student_evaluation_batch,
+                    q,
+                    laplace_train_batch=student_train_batch,
+                    config=arm_config,
+                )
+            )
+            histories[arm_name].extend(
+                [{**row, "member": member} for row in history]
+            )
+        del teacher_gen, teacher_net, inherited_net, matching_net, full_net
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    results: dict[str, MethodResult] = {}
+    objective_descriptions = {
+        "inherited_dynamics_only": "causal variational objective with frozen teacher-fitted dynamics and questionnaire likelihood",
+        "teacher_matching_only": "teacher-distribution matching without questionnaire re-anchoring",
+        "full_ball": "teacher-distribution matching plus questionnaire re-anchoring",
+    }
+    for arm_name, members in arms.items():
+        results[arm_name] = _assemble_ssm_ensemble(
+            members,
+            student_evaluation_batch,
+            q,
+            f"BALL-distillation-{arm_name}",
+            {
+                "role": "distillation_mechanistic_decomposition",
+                "arm": arm_name,
+                "objective": objective_descriptions[arm_name],
+                "same_teacher_within_member": True,
+                "ensemble_size": int(config.ensemble_size),
+                "encoder_use_rdoc": bool(config.encoder_use_rdoc),
+                "prediction_split": prediction_split,
+                "loss_history": histories[arm_name],
+            },
+        )
+    return results
+
+
 def fit_ball_ssm_direct_causal(
     data: SimulationData,
     config: SSMConfig | None = None,
@@ -5481,7 +5834,12 @@ def fit_ball_ssm_direct_causal(
     device = torch.device(device)
     q = data.config.q
     train_batch, stats = build_ssm_batch(
-        data, "train", device, config.max_individuals, causal_impute=True
+        data,
+        "train",
+        device,
+        config.max_individuals,
+        causal_impute=True,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
     )
     eval_batch, _ = build_ssm_batch(
         data,
@@ -5490,6 +5848,7 @@ def fit_ball_ssm_direct_causal(
         config.max_individuals,
         feature_stats=stats,
         causal_impute=True,
+        include_rdoc_in_encoder=config.encoder_use_rdoc,
     )
     members = []
     loss_history: list[dict[str, float | int | str]] = []
@@ -5533,6 +5892,7 @@ def fit_ball_ssm_direct_causal(
         "student_objective": "direct_tempered_variational_objective",
         "student_input_imputation": "forward_fill_no_future",
         "teacher_used": False,
+        "encoder_use_rdoc": bool(config.encoder_use_rdoc),
         "ensemble_size": int(config.ensemble_size),
         "anchor_warmup_epochs": int(config.anchor_warmup_epochs),
         "teacher_epochs": int(config.teacher_epochs),
@@ -5599,7 +5959,12 @@ from simulations.src.metrics import (
     rdoc_recovery_fraction,
     summarize_mcse,
 )
-from simulations.src.methods.ball_ssm import SSMConfig, fit_ball_ssm, fit_ball_ssm_direct_causal
+from simulations.src.methods.ball_ssm import (
+    SSMConfig,
+    fit_ball_ssm,
+    fit_ball_ssm_direct_causal,
+    fit_ball_ssm_distillation_decomposition,
+)
 from simulations.src.methods.ball_structural import (
     BallStructuralHyperparameters,
     conformal_calibrate_structural_posterior,
@@ -7403,7 +7768,12 @@ from simulations.src.methods.ball_structural import (
     conformal_calibrate_structural_posterior,
     oracle_latent_conformal_intervals,
 )
-from simulations.src.methods.ball_ssm import SSMConfig, fit_ball_ssm, fit_ball_ssm_direct_causal
+from simulations.src.methods.ball_ssm import (
+    SSMConfig,
+    fit_ball_ssm,
+    fit_ball_ssm_direct_causal,
+    fit_ball_ssm_distillation_decomposition,
+)
 from simulations.src import metrics as M
 
 
@@ -9669,8 +10039,15 @@ from scipy.sparse.linalg import lsqr
 import torch
 import torch.nn.functional as F
 
+import dataclasses as _dataclasses
+
 from simulations.src.model_utils import AnchorSpec, SimulationConfig, SimulationData, marginal_anchor_sd
-from simulations.src.methods.ball_ssm import SSMConfig, fit_ball_ssm, fit_ball_ssm_direct_causal
+from simulations.src.methods.ball_ssm import (
+    SSMConfig,
+    fit_ball_ssm,
+    fit_ball_ssm_direct_causal,
+    fit_ball_ssm_distillation_decomposition,
+)
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "derived"
@@ -9786,6 +10163,8 @@ FIT_FINAL_FILES = [
     "empirical_rdoc_transition_rows.csv",
     "empirical_rdoc_transition.csv",
     "empirical_rdoc_transition_coefficients.csv",
+    "empirical_rdoc_transition_full_record_sensitivity.csv",
+    "empirical_rdoc_transition_full_record_coefficients.csv",
     "empirical_prediction_rows.csv",
     "empirical_input_contract.csv",
     "empirical_leakage_audit.csv",
@@ -9794,6 +10173,7 @@ FIT_FINAL_FILES = [
     "empirical_pairwise_bootstrap.csv",
     "empirical_recovery_by_context.csv",
     "empirical_uncertainty_workload.csv",
+    "empirical_hyperparameter_selection.csv",
 ]
 
 
@@ -9817,6 +10197,22 @@ def _runtime_environment() -> dict:
         "gpu": gpu_name,
         "gpu_memory_bytes": gpu_memory_bytes,
     }
+
+
+def _dataframe_sha256(frame: pd.DataFrame, columns: list[str] | None = None) -> str:
+    """Return a deterministic content digest without exporting protected values."""
+
+    selected = frame.loc[:, columns].copy() if columns is not None else frame.copy()
+    header = "\x1f".join(str(column) for column in selected.columns).encode("utf-8")
+    try:
+        hashed = pd.util.hash_pandas_object(selected, index=False, categorize=True)
+    except TypeError:
+        hashed = pd.util.hash_pandas_object(selected.astype(str), index=False, categorize=True)
+    values = hashed.to_numpy(dtype=np.uint64, copy=False)
+    digest = hashlib.sha256()
+    digest.update(header)
+    digest.update(values.tobytes())
+    return digest.hexdigest()
 
 
 @dataclass
@@ -10082,8 +10478,33 @@ def _patient_balanced_conformal_quantile(
     return float(ordered["normalized_score"].iloc[position]), patient_count
 
 
+def _patient_max_conformal_quantile(
+    scores: pd.DataFrame,
+    *,
+    alpha: float,
+    default: float = 1.96,
+) -> tuple[float, int]:
+    """Quantile of one maximum normalized residual per calibration patient."""
+
+    required = {"id", "normalized_score"}
+    if not required.issubset(scores.columns):
+        raise ValueError(f"Patient-maximum calibration requires columns {sorted(required)}")
+    clean = scores.loc[
+        np.isfinite(pd.to_numeric(scores["normalized_score"], errors="coerce")),
+        ["id", "normalized_score"],
+    ].copy()
+    maxima = clean.groupby("id", sort=True)["normalized_score"].max().sort_values()
+    patient_count = int(len(maxima))
+    if patient_count == 0:
+        return float(default), 0
+    rank = int(np.ceil((patient_count + 1) * (1.0 - alpha)))
+    if rank > patient_count:
+        return float("inf"), patient_count
+    return float(maxima.iloc[rank - 1]), patient_count
+
+
 def _standardizers(anchors: pd.DataFrame) -> dict:
-    """Prespecified scale transforms that use no cohort or future values."""
+    """Return fixed legal-range transforms used for numerical conditioning."""
 
     fixed = {
         "PHQ9": (13.5, 13.5),
@@ -10095,6 +10516,230 @@ def _standardizers(anchors: pd.DataFrame) -> dict:
     if unknown:
         raise ValueError(f"No prespecified scale transform for anchors: {sorted(unknown)}")
     return {scale: fixed[scale] for scale in observed}
+
+
+def _measurement_sequences(
+    anchors: pd.DataFrame,
+    patient_ids: set[int],
+) -> tuple[list[list[tuple[int, tuple[tuple[str, float], ...]]]], dict]:
+    """Create development-only questionnaire sequences for measurement calibration."""
+
+    required = {"id", "session", "day", "anchor", "value"}
+    missing = required.difference(anchors.columns)
+    if missing:
+        raise ValueError(f"Measurement calibration is missing columns: {sorted(missing)}")
+    events = anchors[anchors["id"].astype(int).isin(patient_ids)].copy()
+    events["id"] = pd.to_numeric(events["id"], errors="raise").astype(int)
+    events["session"] = pd.to_numeric(events["session"], errors="raise").astype(int)
+    events["day"] = pd.to_numeric(events["day"], errors="raise").astype(int)
+    events["value"] = pd.to_numeric(events["value"], errors="raise").astype(float)
+    events["anchor"] = events["anchor"].astype(str)
+    allowed = {"PHQ9", "BDI", "GAD7"}
+    unexpected = sorted(set(events["anchor"]).difference(allowed))
+    if unexpected:
+        raise ValueError(f"Unexpected questionnaire instruments: {unexpected}")
+    duplicate = events.duplicated(["id", "session", "anchor"], keep=False)
+    if duplicate.any():
+        example = events.loc[duplicate, ["id", "session", "anchor"]].head().to_dict("records")
+        raise ValueError(f"Questionnaire events are not unique by patient-session-instrument: {example}")
+
+    transforms = _standardizers(events)
+    for instrument, (midpoint, half_range) in transforms.items():
+        mask = events["anchor"].eq(instrument)
+        events.loc[mask, "normalized_value"] = (
+            events.loc[mask, "value"] - midpoint
+        ) / half_range
+    if not np.isfinite(events["normalized_value"]).all():
+        raise ValueError("Measurement calibration contains a nonfinite questionnaire value.")
+
+    sequences: list[list[tuple[int, tuple[tuple[str, float], ...]]]] = []
+    for _, patient in events.sort_values(
+        ["id", "day", "session", "anchor"], kind="mergesort"
+    ).groupby("id", sort=True):
+        visits: list[tuple[int, tuple[tuple[str, float], ...]]] = []
+        for day, visit in patient.groupby("day", sort=True):
+            observations = tuple(
+                (str(row.anchor), float(row.normalized_value))
+                for row in visit.sort_values(["session", "anchor"], kind="mergesort").itertuples(index=False)
+            )
+            visits.append((int(day), observations))
+        sequences.append(visits)
+
+    depression = events[events["anchor"].isin(["PHQ9", "BDI"])]
+    paired = (
+        depression.groupby(["id", "session"])["anchor"].nunique().eq(2).sum()
+    )
+    summary = {
+        "patients": int(events["id"].nunique()),
+        "events": int(len(events)),
+        "events_by_instrument": {
+            key: int(value)
+            for key, value in events["anchor"].value_counts().sort_index().items()
+        },
+        "normalized_score_sd_by_instrument": {
+            instrument: float(group["normalized_value"].std(ddof=1))
+            for instrument, group in events.groupby("anchor", sort=True)
+        },
+        "paired_phq9_bdi_patient_sessions": int(paired),
+        "patient_id_hash": hashlib.sha256(
+            "|".join(str(value) for value in sorted(events["id"].unique())).encode("utf-8")
+        ).hexdigest(),
+    }
+    return sequences, summary
+
+
+def _kalman_measurement_nll(
+    parameters: np.ndarray,
+    sequences: list[list[tuple[int, tuple[tuple[str, float], ...]]]],
+    *,
+    channel: str,
+) -> float:
+    """Marginal likelihood for a one-channel longitudinal measurement model."""
+
+    if channel == "depression":
+        state_mean, rho_logit, log_process_sd, bdi_intercept, log_bdi_loading, log_phq_sd, log_bdi_sd = parameters
+        measurement = {
+            "PHQ9": (0.0, 1.0, math.exp(float(log_phq_sd))),
+            "BDI": (
+                float(bdi_intercept),
+                math.exp(float(log_bdi_loading)),
+                math.exp(float(log_bdi_sd)),
+            ),
+        }
+    elif channel == "anxiety":
+        state_mean, rho_logit, log_process_sd, log_gad_sd = parameters
+        measurement = {"GAD7": (0.0, 1.0, math.exp(float(log_gad_sd)))}
+    else:
+        raise ValueError(f"Unknown measurement-calibration channel: {channel}")
+
+    rho = 1.0 / (1.0 + math.exp(-float(rho_logit)))
+    process_variance = math.exp(2.0 * float(log_process_sd))
+    total = 0.0
+    used = 0
+    for patient in sequences:
+        filtered_mean = float(state_mean)
+        filtered_variance = 1.0
+        previous_day: int | None = None
+        for day, observations in patient:
+            channel_observations = [item for item in observations if item[0] in measurement]
+            if not channel_observations:
+                continue
+            if previous_day is not None:
+                elapsed = max(int(day) - int(previous_day), 0)
+                persistence = rho ** elapsed
+                if elapsed > 0:
+                    innovation_multiplier = (
+                        (1.0 - rho ** (2 * elapsed)) / max(1.0 - rho ** 2, 1e-8)
+                    )
+                    filtered_mean = state_mean + persistence * (filtered_mean - state_mean)
+                    filtered_variance = (
+                        persistence ** 2 * filtered_variance
+                        + process_variance * innovation_multiplier
+                    )
+            previous_day = int(day)
+            for instrument, observed_value in channel_observations:
+                intercept, loading, observation_sd = measurement[instrument]
+                residual = float(observed_value) - (intercept + loading * filtered_mean)
+                predictive_variance = loading ** 2 * filtered_variance + observation_sd ** 2
+                if predictive_variance <= 0 or not np.isfinite(predictive_variance):
+                    return float("inf")
+                total += 0.5 * (
+                    math.log(2.0 * math.pi * predictive_variance)
+                    + residual ** 2 / predictive_variance
+                )
+                gain = filtered_variance * loading / predictive_variance
+                filtered_mean = filtered_mean + gain * residual
+                filtered_variance = max(
+                    (1.0 - gain * loading) * filtered_variance,
+                    1e-8,
+                )
+                used += 1
+    return float(total / max(used, 1))
+
+
+def _fit_development_measurement_calibration(
+    anchors: pd.DataFrame,
+    patient_splits: dict[int, str],
+) -> dict:
+    """Estimate and freeze the empirical questionnaire observation layer once."""
+
+    development_ids = {
+        int(patient_id)
+        for patient_id, split in patient_splits.items()
+        if str(split).lower() == "train"
+    }
+    sequences, summary = _measurement_sequences(anchors, development_ids)
+    depression_fit = minimize(
+        lambda parameters: _kalman_measurement_nll(
+            parameters, sequences, channel="depression"
+        ),
+        x0=np.array([0.0, 0.0, math.log(0.25), 0.0, 0.0, math.log(0.25), math.log(0.25)]),
+        method="L-BFGS-B",
+        bounds=[
+            (-3.0, 3.0), (-4.6, 4.6), (-5.0, 1.0), (-2.0, 2.0),
+            (-2.0, 2.0), (-5.0, 1.0), (-5.0, 1.0),
+        ],
+        options={"maxiter": 160, "ftol": 1e-10},
+    )
+    anxiety_fit = minimize(
+        lambda parameters: _kalman_measurement_nll(
+            parameters, sequences, channel="anxiety"
+        ),
+        x0=np.array([0.0, 0.0, math.log(0.25), math.log(0.25)]),
+        method="L-BFGS-B",
+        bounds=[(-3.0, 3.0), (-4.6, 4.6), (-5.0, 1.0), (-5.0, 1.0)],
+        options={"maxiter": 120, "ftol": 1e-10},
+    )
+    if not depression_fit.success:
+        raise RuntimeError(f"Depression measurement calibration failed: {depression_fit.message}")
+    if not anxiety_fit.success:
+        raise RuntimeError(f"Anxiety measurement calibration failed: {anxiety_fit.message}")
+
+    dep = np.asarray(depression_fit.x, dtype=float)
+    anx = np.asarray(anxiety_fit.x, dtype=float)
+    transforms = _standardizers(anchors)
+    calibration = {
+        "version": "development_joint_longitudinal_measurement_v1",
+        "fit_scope": "clinic-exclusive development patients",
+        "fit_once_across_cadences": True,
+        "transforms": {
+            instrument: {"midpoint": float(values[0]), "half_range": float(values[1])}
+            for instrument, values in transforms.items()
+        },
+        "instruments": {
+            "PHQ9": {
+                "channel": 0, "intercept": 0.0, "loading": 1.0,
+                "observation_sd": float(math.exp(dep[5])), "legal_min": 0.0, "legal_max": 27.0,
+            },
+            "BDI": {
+                "channel": 0, "intercept": float(dep[3]),
+                "loading": float(math.exp(dep[4])),
+                "observation_sd": float(math.exp(dep[6])), "legal_min": 0.0, "legal_max": 63.0,
+            },
+            "GAD7": {
+                "channel": 1, "intercept": 0.0, "loading": 1.0,
+                "observation_sd": float(math.exp(anx[3])), "legal_min": 0.0, "legal_max": 21.0,
+            },
+        },
+        "latent_process": {
+            "depression_state_mean": float(dep[0]),
+            "depression_daily_persistence": float(1.0 / (1.0 + math.exp(-dep[1]))),
+            "depression_process_sd": float(math.exp(dep[2])),
+            "anxiety_state_mean": float(anx[0]),
+            "anxiety_daily_persistence": float(1.0 / (1.0 + math.exp(-anx[1]))),
+            "anxiety_process_sd": float(math.exp(anx[2])),
+        },
+        "optimization": {
+            "depression_success": bool(depression_fit.success),
+            "depression_nll_per_event": float(depression_fit.fun),
+            "depression_iterations": int(depression_fit.nit),
+            "anxiety_success": bool(anxiety_fit.success),
+            "anxiety_nll_per_event": float(anxiety_fit.fun),
+            "anxiety_iterations": int(anxiety_fit.nit),
+        },
+        "development_data": summary,
+    }
+    return calibration
 
 
 def _coerce_sessions(sessions_full: pd.DataFrame) -> pd.DataFrame:
@@ -10164,7 +10809,7 @@ def _empirical_neural_dataset(
     sessions_full: pd.DataFrame,
     rdoc_sessions: pd.DataFrame | None,
     comorbidity_sessions: pd.DataFrame,
-    stats: dict,
+    measurement_calibration: dict,
     *,
     max_patients: int | None = None,
     patient_splits: dict[int, str] | None = None,
@@ -10177,6 +10822,17 @@ def _empirical_neural_dataset(
     """
 
     sessions = _coerce_sessions(sessions_full)
+    instrument_parameters = measurement_calibration["instruments"]
+    instrument_order = ("PHQ9", "BDI", "GAD7")
+    if set(instrument_parameters) != set(instrument_order):
+        raise ValueError("Frozen empirical measurement calibration must define PHQ9, BDI, and GAD7.")
+    stats = {
+        instrument: (
+            float(measurement_calibration["transforms"][instrument]["midpoint"]),
+            float(measurement_calibration["transforms"][instrument]["half_range"]),
+        )
+        for instrument in instrument_order
+    }
     retained = anchors[anchors["role"] == "anchor"].copy()
     ids = sorted(set(retained["id"].astype(int)).intersection(set(sessions["id"].astype(int))))
     if patient_splits:
@@ -10344,14 +11000,33 @@ def _empirical_neural_dataset(
                 anchor_t = int(np.argmin(np.abs(days_i - int(arow.day))))
             anchor_rows.append({
                 "id": pid,
+                "instrument": scale,
                 "anchor": channel,
                 "t": anchor_t,
                 "value": float(value),
                 "observed": True,
-                "loading": 1.0,
+                "intercept": float(instrument_parameters[scale]["intercept"]),
+                "loading": float(instrument_parameters[scale]["loading"]),
+                "observation_sd": float(instrument_parameters[scale]["observation_sd"]),
                 "window_start": int(win_pos.min()),
                 "window_end": int(win_pos.max()),
             })
+
+    anchor_frame = pd.DataFrame(anchor_rows)
+    duplicate_events = anchor_frame.duplicated(["id", "t", "instrument"], keep=False)
+    if duplicate_events.any():
+        examples = anchor_frame.loc[
+            duplicate_events, ["id", "t", "instrument"]
+        ].head().to_dict("records")
+        raise ValueError(
+            "Empirical questionnaire events must be unique by patient-session-instrument: "
+            f"{examples}"
+        )
+    expected_event_count = int(len(retained))
+    if len(anchor_frame) != expected_event_count:
+        raise AssertionError(
+            f"Empirical questionnaire event loss: expected {expected_event_count}, built {len(anchor_frame)}."
+        )
 
     cfg = SimulationConfig(
         seed=EMPIRICAL_SEED,
@@ -10364,6 +11039,23 @@ def _empirical_neural_dataset(
         y2=AnchorSpec("Y2", 7, 7, 1.0, ANCHOR_SD, 0.0),
         rho_serial_y1=0.0,
         rho_serial_y2=0.0,
+        anchor_instrument_names=instrument_order,
+        anchor_instrument_channels=tuple(
+            int(instrument_parameters[instrument]["channel"])
+            for instrument in instrument_order
+        ),
+        anchor_instrument_intercepts=tuple(
+            float(instrument_parameters[instrument]["intercept"])
+            for instrument in instrument_order
+        ),
+        anchor_instrument_loadings=tuple(
+            float(instrument_parameters[instrument]["loading"])
+            for instrument in instrument_order
+        ),
+        anchor_instrument_obs_sd=tuple(
+            float(instrument_parameters[instrument]["observation_sd"])
+            for instrument in instrument_order
+        ),
     )
     individuals = pd.DataFrame({
         "id": ids,
@@ -10378,12 +11070,16 @@ def _empirical_neural_dataset(
         config=cfg,
         individuals=individuals,
         daily=pd.DataFrame(daily_rows),
-        anchors=pd.DataFrame(anchor_rows),
+        anchors=anchor_frame,
         treatments=pd.DataFrame(),
         components=pd.DataFrame(component_rows),
         metadata={
             "source": "empirical_rtms_sparse_anchor_tensor",
             "anchor_note": "Retained anchors only; held-out genuine measurements excluded from training.",
+            "measurement_calibration": measurement_calibration,
+            "anchor_representation": "one event per patient, session, and questionnaire instrument",
+            "questionnaire_event_collisions": 0,
+            "retained_questionnaire_event_count": expected_event_count,
             "feature_names": EMPIRICAL_FEATURE_NAMES,
             "feature_timing": "Diagnosis records and encoder treatment history are strictly earlier than the modeled session.",
             "time_encoding": "Raw treatment session number as context; raw inter-session days enter the transition interval dt.",
@@ -10413,12 +11109,163 @@ def _empirical_neural_dataset(
     return data, session_days
 
 
+def _empirical_selection_score(
+    anchors: pd.DataFrame,
+    result,
+    session_days: dict[int, np.ndarray],
+    measurement_calibration: dict,
+    validation_ids: set[int],
+) -> float:
+    """Patient-balanced held-out questionnaire RMSE in source validation clinics."""
+
+    depression = _prediction_lookup(result.predictions, "z_d_hat")
+    anxiety = _prediction_lookup(result.predictions, "z_p_hat")
+    rows = anchors[
+        anchors["role"].eq("heldout_eval")
+        & anchors["id"].astype(int).isin(validation_ids)
+    ]
+    errors: list[dict[str, float | int]] = []
+    for row in rows.itertuples(index=False):
+        instrument = str(row.anchor)
+        parameters = measurement_calibration["instruments"][instrument]
+        latent_by_id = anxiety if instrument == "GAD7" else depression
+        latent = latent_by_id.get(int(row.id))
+        days = session_days.get(int(row.id))
+        if latent is None or days is None:
+            continue
+        count = min(len(latent), len(days))
+        keep = (
+            (np.asarray(days[:count]) >= int(row.window_start_day))
+            & (np.asarray(days[:count]) <= int(row.window_end_day))
+        )
+        if not keep.any():
+            keep[int(np.argmin(np.abs(np.asarray(days[:count]) - int(row.day))))] = True
+        predicted = float(parameters["intercept"]) + float(parameters["loading"]) * float(
+            np.asarray(latent[:count], dtype=float)[keep].mean()
+        )
+        transform = measurement_calibration["transforms"][instrument]
+        observed = (float(row.value) - float(transform["midpoint"])) / float(
+            transform["half_range"]
+        )
+        pooling_sd = float(
+            measurement_calibration["development_data"][
+                "normalized_score_sd_by_instrument"
+            ][instrument]
+        )
+        errors.append(
+            {
+                "id": int(row.id),
+                "squared_error": float(np.square((predicted - observed) / pooling_sd)),
+            }
+        )
+    if not errors:
+        return float("inf")
+    error_frame = pd.DataFrame(errors)
+    return float(np.sqrt(error_frame.groupby("id")["squared_error"].mean().mean()))
+
+
+def _select_empirical_ball_hyperparameters(
+    anchors: pd.DataFrame,
+    sessions_full: pd.DataFrame,
+    comorbidity_sessions: pd.DataFrame,
+    measurement_calibration: dict,
+    primary_model_splits: dict[int, str],
+    args,
+) -> tuple[float, float, pd.DataFrame]:
+    """Select persistence and questionnaire weight within development clinics."""
+
+    source_split = (
+        sessions_full[sessions_full["id"].astype(int).isin(primary_model_splits)]
+        .groupby("id", sort=False)["split"]
+        .agg(lambda values: str(values.iloc[0]))
+    )
+    selection_splits = {
+        int(pid): ("train" if str(split) == "train" else "test")
+        for pid, split in source_split.items()
+        if str(split) in {"train", "val"}
+    }
+    validation_ids = {
+        pid for pid, split in selection_splits.items() if split == "test"
+    }
+    if not validation_ids:
+        raise AssertionError("Development-only hyperparameter selection has no validation patients.")
+    data, session_days = _empirical_neural_dataset(
+        anchors,
+        sessions_full,
+        None,
+        comorbidity_sessions,
+        measurement_calibration,
+        max_patients=args.max_patients,
+        patient_splits=selection_splits,
+    )
+    base = SSMConfig(
+        d_model=args.d_model,
+        n_heads=args.n_heads,
+        n_layers=args.n_layers,
+        teacher_epochs=int(args.selection_epochs),
+        student_epochs=int(args.selection_epochs),
+        anchor_warmup_epochs=min(int(args.anchor_warmup), int(args.selection_epochs)),
+        kl_warmup_epochs=min(int(args.kl_warmup), int(args.selection_epochs)),
+        batch_size=args.batch_size,
+        ensemble_size=int(args.selection_members),
+        max_individuals=data.config.n,
+        seed=EMPIRICAL_SEED + 77000 + int(args.seed_offset),
+        rdoc_drift_head=False,
+        use_alpha_slow=False,
+    )
+    records: list[dict[str, float | str]] = []
+
+    def evaluate(phi: float, weight: float, stage: str) -> float:
+        config = _dataclasses.replace(base, delta_phi=float(phi), anchor_weight=float(weight))
+        result = fit_ball_ssm(
+            data,
+            config,
+            device=args.device,
+            causal=True,
+            prediction_split="test",
+            return_teacher=False,
+        )
+        rmse = _empirical_selection_score(
+            anchors,
+            result,
+            session_days,
+            measurement_calibration,
+            validation_ids,
+        )
+        records.append(
+            {
+                "selection_stage": stage,
+                "daily_persistence": float(phi),
+                "questionnaire_weight": float(weight),
+                "validation_rmse_development_sd_units": float(rmse),
+                "n_validation_patients": int(len(validation_ids)),
+            }
+        )
+        return rmse
+
+    persistence_scores = {
+        phi: evaluate(phi, 40.0, "daily_persistence")
+        for phi in (0.1, 0.3, 0.6, 0.9)
+    }
+    selected_phi = min(persistence_scores, key=persistence_scores.get)
+    weight_scores = {
+        weight: evaluate(selected_phi, weight, "questionnaire_weight")
+        for weight in (10.0, 20.0, 40.0, 80.0)
+    }
+    selected_weight = min(weight_scores, key=weight_scores.get)
+    selection_table = pd.DataFrame(records)
+    selection_table["selected_daily_persistence"] = float(selected_phi)
+    selection_table["selected_questionnaire_weight"] = float(selected_weight)
+    selection_table["selection_scope"] = "source training and validation clinics only"
+    return float(selected_phi), float(selected_weight), selection_table
+
+
 def _fit_empirical_teacher_student(
     anchors: pd.DataFrame,
     sessions_full: pd.DataFrame,
     rdoc_sessions: pd.DataFrame | None,
     comorbidity_sessions: pd.DataFrame,
-    stats: dict,
+    measurement_calibration: dict,
     args,
     cadence: int,
     patient_splits: dict[int, str],
@@ -10434,10 +11281,19 @@ def _fit_empirical_teacher_student(
         # could influence both the recovered outcome and the post hoc exposure.
         None,
         comorbidity_sessions,
-        stats,
+        measurement_calibration,
         max_patients=args.max_patients,
         patient_splits=patient_splits,
     )
+    manifest_dir = artifact_dir or OUT
+    target_hash_columns = [
+        column
+        for column in (
+            "id", "session", "day", "anchor", "role", "value",
+            "window_start_day", "window_end_day",
+        )
+        if column in anchors.columns
+    ]
     fit_timing_seconds = {
         "dataset_construction": float(perf_counter() - fit_started),
     }
@@ -10456,6 +11312,7 @@ def _fit_empirical_teacher_student(
         rdoc_drift_head=False,
         use_alpha_slow=False,
         delta_phi=args.delta_phi,
+        anchor_weight=args.anchor_weight,
     )
     # Global parameters are fit only on development patients. The evaluation
     # batch contains the held-out-clinic patients so their retained prior anchors
@@ -10471,6 +11328,55 @@ def _fit_empirical_teacher_student(
     fit_timing_seconds["direct_causal_ensemble"] = (
         float(perf_counter() - stage_started) if direct_causal is not None else None
     )
+    focused_14d_results: dict[str, MethodResult] = {}
+    if int(cadence) == 14 and args.distillation_decomposition:
+        stage_started = perf_counter()
+        decomposition = fit_ball_ssm_distillation_decomposition(
+            data,
+            cfg,
+            device=args.device,
+            prediction_split="test",
+        )
+        focused_14d_results.update({
+            "ball_inherited_dynamics_only": decomposition["inherited_dynamics_only"],
+            "ball_teacher_matching_only": decomposition["teacher_matching_only"],
+            "ball_full_decomposition": decomposition["full_ball"],
+        })
+        fit_timing_seconds["distillation_decomposition"] = float(
+            perf_counter() - stage_started
+        )
+    if int(cadence) == 14 and args.compute_matched_direct:
+        stage_started = perf_counter()
+        compute_matched_config = _dataclasses.replace(
+            cfg,
+            teacher_epochs=int(cfg.teacher_epochs + cfg.student_epochs),
+        )
+        focused_14d_results["ball_direct_compute_matched"] = fit_ball_ssm_direct_causal(
+            data,
+            compute_matched_config,
+            device=args.device,
+            prediction_split="test",
+        )
+        fit_timing_seconds["compute_matched_direct"] = float(
+            perf_counter() - stage_started
+        )
+    if int(cadence) == 14 and args.session_balanced_anchors:
+        stage_started = perf_counter()
+        session_balanced_config = _dataclasses.replace(
+            cfg,
+            anchor_session_balance=True,
+        )
+        focused_14d_results["ball_session_balanced"] = fit_ball_ssm(
+            data,
+            session_balanced_config,
+            device=args.device,
+            causal=True,
+            prediction_split="test",
+            return_teacher=False,
+        )
+        fit_timing_seconds["session_balanced_anchor_sensitivity"] = float(
+            perf_counter() - stage_started
+        )
     no_dense_ehr = None
     if args.dense_ehr_ablation:
         stage_started = perf_counter()
@@ -10549,15 +11455,17 @@ def _fit_empirical_teacher_student(
         fit_timing_seconds["anchor_only_ensemble"] = float(perf_counter() - stage_started)
 
     gp_causal_predictions: dict[str, dict[int, np.ndarray]] = {}
+    gp_causal_metadata: dict[str, dict[str, object]] = {}
     if args.gp_benchmark:
         stage_started = perf_counter()
         for channel, anchor_name in (("depression", "Y1"), ("anxiety", "Y2")):
-            causal_gp = _fit_empirical_gp_channel(
+            causal_gp, causal_gp_metadata = _fit_empirical_gp_channel(
                 data,
                 anchor_name,
                 session_days,
             )
             gp_causal_predictions[channel] = causal_gp
+            gp_causal_metadata[channel] = causal_gp_metadata
         fit_timing_seconds["gaussian_process"] = float(perf_counter() - stage_started)
 
     ode_rnn_predictions = None
@@ -10568,7 +11476,10 @@ def _fit_empirical_teacher_student(
     fit_timing_seconds["complete_benchmark_suite"] = float(perf_counter() - fit_started)
     manifest = {
         "method": "BALL teacher/student transformer",
+        "run_id": manifest_dir.name,
         "ball_py_sha256": hashlib.sha256((ROOT.parent / "BALL.py").read_bytes()).hexdigest(),
+        "target_set_sha256": _dataframe_sha256(anchors, target_hash_columns),
+        "target_set_hash_columns": target_hash_columns,
         "primary_empirical_estimator": "BALL causal student",
         "cadence_days": int(cadence),
         "teacher_epochs": int(args.teacher_epochs),
@@ -10590,10 +11501,27 @@ def _fit_empirical_teacher_student(
         "causal_encoder_treatment_context": "previous-session treatment category only",
         "action_vocabulary_scope": "development partition only",
         "structured_feature_preprocessing": "raw per-session values with explicit availability masks",
+        "gaussian_process_preprocessing": (
+            "development-only standardization of continuous covariates; binary indicators and "
+            "one-hot treatment variables remain zero or one"
+        ),
+        "gaussian_process_channel_parameters": gp_causal_metadata,
         "elapsed_day_preprocessing": "raw nonnegative calendar-day gaps with no division, binning, or clipping",
         "same_day_transition_count": int(data.metadata.get("same_day_transition_count", 0)),
         "same_day_transition_policy": data.metadata.get("same_day_transition_policy"),
         "anchor_transform_preprocessing": "published questionnaire minimum and maximum totals",
+        "anchor_representation": data.metadata.get("anchor_representation"),
+        "questionnaire_event_collisions": int(
+            data.metadata.get("questionnaire_event_collisions", -1)
+        ),
+        "retained_questionnaire_event_count": int(
+            data.metadata.get("retained_questionnaire_event_count", -1)
+        ),
+        "anchor_instrument_names": list(data.config.anchor_instrument_names),
+        "anchor_instrument_channels": list(data.config.anchor_instrument_channels),
+        "measurement_calibration": measurement_calibration,
+        "selected_daily_persistence": float(args.delta_phi),
+        "selected_questionnaire_weight": float(args.anchor_weight),
         "target_fields_in_structured_feature_allowlist": False,
         "t": int(data.config.t),
         "empirical_feature_names": list(EMPIRICAL_FEATURE_NAMES),
@@ -10609,7 +11537,7 @@ def _fit_empirical_teacher_student(
         "gp_benchmark": bool(args.gp_benchmark),
         "gp_modes": ["causal filter"] if args.gp_benchmark else [],
         "gp_input_contract": (
-            "retained anchors, raw structured features and availability masks, "
+            "retained anchors, development-standardized continuous features, binary availability and diagnosis indicators, "
             "previous-session treatment, and raw calendar days"
             if args.gp_benchmark else None
         ),
@@ -10630,8 +11558,10 @@ def _fit_empirical_teacher_student(
         "direct_causal_metadata": direct_causal.metadata if direct_causal is not None else None,
         "no_dense_ehr_metadata": no_dense_ehr.metadata if no_dense_ehr is not None else None,
         "anchor_only_metadata": ball_anchor_only.metadata if ball_anchor_only is not None else None,
+        "focused_14d_sensitivity_metadata": {
+            name: result.metadata for name, result in focused_14d_results.items()
+        },
     }
-    manifest_dir = artifact_dir or OUT
     manifest_dir.mkdir(parents=True, exist_ok=True)
     (manifest_dir / f"empirical_teacher_student_manifest_{int(cadence)}d.json").write_text(
         json.dumps(manifest, indent=2, default=str) + "\n",
@@ -10641,24 +11571,16 @@ def _fit_empirical_teacher_student(
     # Y2 into one scalar trajectory would unfairly mix depression and anxiety and
     # would not estimate the same target as BALL's channel-specific predictions.
     dc_args = _dc_args("linear")
-    s0_predictions = {}
-    markov_predictions = {}
-    for channel, anchor_name in (("depression", "Y1"), ("anxiety", "Y2")):
-        channel_data = SimulationData(
-            config=data.config,
-            individuals=data.individuals.copy(),
-            daily=data.daily.copy(),
-            anchors=data.anchors[data.anchors["anchor"] == anchor_name].copy(),
-            treatments=data.treatments.copy(),
-            components=data.components.copy(),
-            metadata={**data.metadata, "comparator_channel": channel},
-        )
-        s0_predictions[channel] = _dc_predictions(
-            _dc_fit_direct_map(channel_data, dc_args)[0]
-        )
-        markov_predictions[channel] = _dc_predictions(
-            _dc_fit_markov_direct(channel_data, dc_args, basis="linear")
-        )
+    s0_frame, _ = _dc_fit_direct_map(data, dc_args)
+    markov_frame = _dc_fit_markov_direct(data, dc_args, basis="linear")
+    s0_predictions = {
+        "depression": _dc_predictions(s0_frame, "z_d_hat"),
+        "anxiety": _dc_predictions(s0_frame, "z_p_hat"),
+    }
+    markov_predictions = {
+        "depression": _dc_predictions(markov_frame, "z_d_hat"),
+        "anxiety": _dc_predictions(markov_frame, "z_p_hat"),
+    }
     return (
         student,
         teacher,
@@ -10669,6 +11591,7 @@ def _fit_empirical_teacher_student(
         markov_predictions,
         gp_causal_predictions,
         ode_rnn_predictions,
+        focused_14d_results,
         session_days,
     )
 
@@ -10703,7 +11626,41 @@ def _causal_empirical_actions(comp: pd.DataFrame) -> np.ndarray:
     return previous
 
 
-def _empirical_benchmark_inputs(data: SimulationData, pid: int) -> tuple[pd.DataFrame, np.ndarray]:
+def _fit_empirical_gp_scaler(data: SimulationData) -> dict[str, np.ndarray]:
+    """Estimate continuous-feature scaling from development patients only."""
+
+    train_ids = set(
+        data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
+    )
+    p = int(data.config.p_daily)
+    continuous_indices = np.asarray([index for index in (0, 1) if index < p], dtype=int)
+    rows = data.daily[data.daily["id"].astype(int).isin(train_ids)].copy()
+    if "session_observed" in data.components.columns:
+        valid_keys = data.components.loc[
+            data.components["id"].astype(int).isin(train_ids)
+            & data.components["session_observed"].fillna(False).astype(bool),
+            ["id", "t"],
+        ]
+        rows = rows.merge(valid_keys, on=["id", "t"], how="inner")
+    if continuous_indices.size:
+        values = rows[[f"X{index}" for index in continuous_indices]].apply(
+            pd.to_numeric, errors="coerce"
+        ).to_numpy(dtype=float)
+        means = np.nanmean(values, axis=0)
+        means = np.where(np.isfinite(means), means, 0.0)
+        sds = np.nanstd(values, axis=0)
+        sds = np.where(np.isfinite(sds) & (sds > 1e-8), sds, 1.0)
+    else:
+        means = np.zeros(0, dtype=float)
+        sds = np.ones(0, dtype=float)
+    return {"indices": continuous_indices, "means": means, "sds": sds}
+
+
+def _empirical_benchmark_inputs(
+    data: SimulationData,
+    pid: int,
+    scaler: dict[str, np.ndarray] | None = None,
+) -> tuple[pd.DataFrame, np.ndarray]:
     """The shared structured inputs available before each session measurement."""
 
     comp, daily = _real_empirical_person(data, pid)
@@ -10715,6 +11672,12 @@ def _empirical_benchmark_inputs(data: SimulationData, pid: int) -> tuple[pd.Data
     else:
         available = np.isfinite(values)
     values = np.where(available, values, 0.0)
+    if scaler is not None:
+        indices = np.asarray(scaler["indices"], dtype=int)
+        if indices.size:
+            values[:, indices] = (
+                values[:, indices] - np.asarray(scaler["means"], dtype=float)
+            ) / np.asarray(scaler["sds"], dtype=float)
     actions = _causal_empirical_actions(comp) + 1
     action_count = int(data.config.n_treatment_types) + 1
     actions = np.clip(actions, 0, action_count - 1)
@@ -10726,6 +11689,7 @@ def _empirical_benchmark_inputs(data: SimulationData, pid: int) -> tuple[pd.Data
 def _fit_empirical_gp_mean(
     data: SimulationData,
     anchor_name: str,
+    scaler: dict[str, np.ndarray],
 ) -> tuple[np.ndarray, float]:
     """Fit the Gaussian-process mean function on development patients only."""
 
@@ -10735,7 +11699,7 @@ def _fit_empirical_gp_mean(
     rows, targets = [], []
     feature_dim = None
     for pid in sorted(train_ids):
-        comp, features = _empirical_benchmark_inputs(data, pid)
+        comp, features = _empirical_benchmark_inputs(data, pid, scaler)
         feature_dim = features.shape[1]
         anchors = data.anchors[
             (data.anchors["id"].astype(int) == pid)
@@ -10752,7 +11716,7 @@ def _fit_empirical_gp_mean(
             if not np.isfinite(value) or not np.isfinite(loading) or abs(loading) < 1e-8:
                 continue
             rows.append(np.r_[1.0, features[start : end + 1].mean(axis=0)])
-            targets.append(value / loading)
+            targets.append((value - float(row.intercept)) / loading)
     if feature_dim is None:
         feature_dim = 2 * int(data.config.p_daily) + int(data.config.n_treatment_types) + 1
     if not rows:
@@ -10767,15 +11731,23 @@ def _fit_empirical_gp_mean(
     return beta, variance
 
 
-def _empirical_gp_kernel(days: np.ndarray, features: np.ndarray, variance: float) -> np.ndarray:
+def _empirical_gp_kernel(
+    days: np.ndarray,
+    features: np.ndarray,
+    variance: float,
+    *,
+    slow_length_days: float,
+    fast_length_days: float,
+    auxiliary_weight: float,
+) -> np.ndarray:
     elapsed = np.abs(days[:, None] - days[None, :]).astype(float)
     time_kernel = variance * (
-        GP_SLOW_WEIGHT * np.exp(-0.5 * np.square(elapsed / GP_SLOW_LENGTH_DAYS))
-        + GP_FAST_WEIGHT * np.exp(-elapsed / GP_FAST_LENGTH_DAYS)
+        GP_SLOW_WEIGHT * np.exp(-0.5 * np.square(elapsed / slow_length_days))
+        + GP_FAST_WEIGHT * np.exp(-elapsed / fast_length_days)
     )
     if features.shape[1]:
         auxiliary_distance = np.square(features[:, None, :] - features[None, :, :]).mean(axis=2)
-        auxiliary_kernel = GP_AUXILIARY_WEIGHT * variance * np.exp(-0.5 * auxiliary_distance)
+        auxiliary_kernel = auxiliary_weight * variance * np.exp(-0.5 * auxiliary_distance)
     else:
         auxiliary_kernel = 0.0
     return time_kernel + auxiliary_kernel + 1e-6 * np.eye(len(days))
@@ -10786,11 +11758,12 @@ def _gp_conditioned_mean(
     kernel: np.ndarray,
     design: np.ndarray,
     targets: np.ndarray,
+    observation_sds: np.ndarray,
 ) -> np.ndarray:
     if design.size == 0:
         return prior_mean.copy()
     residual = targets - design @ prior_mean
-    covariance = design @ kernel @ design.T + (ANCHOR_SD ** 2) * np.eye(len(targets))
+    covariance = design @ kernel @ design.T + np.diag(np.square(observation_sds))
     try:
         factor = cho_factor(covariance, lower=True, check_finite=False)
         weight = cho_solve(factor, residual, check_finite=False)
@@ -10799,27 +11772,104 @@ def _gp_conditioned_mean(
     return prior_mean + kernel @ design.T @ weight
 
 
+def _select_empirical_gp_kernel(
+    data: SimulationData,
+    anchor_name: str,
+    session_days: dict[int, np.ndarray],
+    scaler: dict[str, np.ndarray],
+    beta: np.ndarray,
+    variance: float,
+) -> dict[str, float]:
+    """Select channel-specific kernel settings using development patients only."""
+
+    train_ids = sorted(
+        data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
+    )
+    candidates = [
+        {"slow_length_days": slow, "fast_length_days": fast, "auxiliary_weight": auxiliary}
+        for slow in (14.0, 28.0, 56.0)
+        for fast in (1.0, 3.0, 7.0)
+        for auxiliary in (0.05, 0.15, 0.30)
+    ]
+    best, best_score = candidates[0], float("inf")
+    for candidate in candidates:
+        score = 0.0
+        event_count = 0
+        for pid in train_ids:
+            comp, features = _empirical_benchmark_inputs(data, pid, scaler)
+            count = len(comp)
+            if count == 0:
+                continue
+            days = np.asarray(session_days[int(pid)][:count], dtype=float)
+            prior_mean = np.column_stack([np.ones(count), features]) @ beta
+            kernel = _empirical_gp_kernel(days, features, variance, **candidate)
+            anchors = data.anchors[
+                (data.anchors["id"].astype(int) == pid)
+                & (data.anchors["anchor"] == anchor_name)
+                & data.anchors["observed"].astype(bool)
+            ]
+            design_rows, targets, sds = [], [], []
+            for row in anchors.itertuples(index=False):
+                start = max(0, int(row.window_start))
+                end = min(count - 1, int(row.window_end))
+                if end < start:
+                    continue
+                h = np.zeros(count, dtype=float)
+                h[start : end + 1] = float(row.loading) / (end - start + 1)
+                design_rows.append(h)
+                targets.append(float(row.value) - float(row.intercept))
+                sds.append(float(row.observation_sd))
+            if not design_rows:
+                continue
+            design = np.vstack(design_rows)
+            residual = np.asarray(targets) - design @ prior_mean
+            covariance = design @ kernel @ design.T + np.diag(np.square(sds))
+            try:
+                factor = cho_factor(covariance, lower=True, check_finite=False)
+                quadratic = float(residual @ cho_solve(factor, residual, check_finite=False))
+                logdet = 2.0 * float(np.log(np.diag(factor[0])).sum())
+            except np.linalg.LinAlgError:
+                continue
+            score += 0.5 * (quadratic + logdet + len(residual) * np.log(2.0 * np.pi))
+            event_count += len(residual)
+        if event_count and score / event_count < best_score:
+            best_score = score / event_count
+            best = candidate
+    return {**best, "development_negative_log_likelihood_per_event": float(best_score)}
+
+
 def _fit_empirical_gp_channel(
     data: SimulationData,
     anchor_name: str,
     session_days: dict[int, np.ndarray],
-) -> dict[int, np.ndarray]:
+) -> tuple[dict[int, np.ndarray], dict[str, object]]:
     """Fit a causal Gaussian-process filter."""
 
-    beta, variance = _fit_empirical_gp_mean(data, anchor_name)
+    scaler = _fit_empirical_gp_scaler(data)
+    beta, variance = _fit_empirical_gp_mean(data, anchor_name, scaler)
+    kernel_parameters = _select_empirical_gp_kernel(
+        data, anchor_name, session_days, scaler, beta, variance
+    )
     causal_predictions: dict[int, np.ndarray] = {}
     for pid in sorted(data.individuals["id"].astype(int)):
-        comp, features = _empirical_benchmark_inputs(data, pid)
+        comp, features = _empirical_benchmark_inputs(data, pid, scaler)
         count = len(comp)
         days = np.asarray(session_days[int(pid)][:count], dtype=float)
         prior_mean = np.column_stack([np.ones(count), features]) @ beta
-        kernel = _empirical_gp_kernel(days, features, variance)
+        kernel = _empirical_gp_kernel(
+            days,
+            features,
+            variance,
+            slow_length_days=float(kernel_parameters["slow_length_days"]),
+            fast_length_days=float(kernel_parameters["fast_length_days"]),
+            auxiliary_weight=float(kernel_parameters["auxiliary_weight"]),
+        )
         anchors = data.anchors[
             (data.anchors["id"].astype(int) == pid)
             & (data.anchors["anchor"] == anchor_name)
             & data.anchors["observed"].astype(bool)
         ].sort_values(["t", "window_end"])
-        design_rows, target_values, measurement_positions = [], [], []
+        design_rows, target_values, observation_sds, measurement_positions = [], [], [], []
         for row in anchors.itertuples(index=False):
             start = max(0, int(row.window_start))
             end = min(count - 1, int(row.window_end))
@@ -10828,14 +11878,17 @@ def _fit_empirical_gp_channel(
             h = np.zeros(count, dtype=float)
             h[start : end + 1] = float(row.loading) / (end - start + 1)
             design_rows.append(h)
-            target_values.append(float(row.value))
+            target_values.append(float(row.value) - float(row.intercept))
+            observation_sds.append(float(row.observation_sd))
             measurement_positions.append(int(row.t))
         if design_rows:
             full_design = np.vstack(design_rows)
             full_targets = np.asarray(target_values, dtype=float)
+            full_observation_sds = np.asarray(observation_sds, dtype=float)
         else:
             full_design = np.zeros((0, count), dtype=float)
             full_targets = np.zeros(0, dtype=float)
+            full_observation_sds = np.zeros(0, dtype=float)
         filtered = prior_mean.copy()
         measurement_positions = np.asarray(measurement_positions, dtype=int)
         for step in range(count):
@@ -10846,10 +11899,20 @@ def _fit_empirical_gp_channel(
                     kernel,
                     full_design[eligible],
                     full_targets[eligible],
+                    full_observation_sds[eligible],
                 )
                 filtered[step] = conditioned[step]
         causal_predictions[pid] = filtered
-    return causal_predictions
+    metadata = {
+        "anchor_channel": str(anchor_name),
+        "kernel_parameters": kernel_parameters,
+        "continuous_feature_indices": scaler["indices"].astype(int).tolist(),
+        "continuous_feature_means": scaler["means"].astype(float).tolist(),
+        "continuous_feature_standard_deviations": scaler["sds"].astype(float).tolist(),
+        "binary_features_retained_as_zero_one": True,
+        "parameter_training_scope": "development patients only",
+    }
+    return causal_predictions, metadata
 
 
 class _EmpiricalCausalODERNN(torch.nn.Module):
@@ -10879,7 +11942,9 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
     p = int(data.config.p_daily)
     action_count = int(data.config.n_treatment_types) + 1
     x_rows, gap_rows, valid_rows = [], [], []
-    anchor_rows: list[tuple[int, int, int, int, float, float]] = []
+    instrument_names = tuple(data.config.anchor_instrument_names)
+    instrument_index = {name: index for index, name in enumerate(instrument_names)}
+    anchor_rows: list[tuple[int, int, int, int, float, float, float]] = []
     row_by_id = {int(pid): row for row, pid in enumerate(ids)}
     for pid in ids:
         comp_all = data.components[data.components["id"].astype(int) == int(pid)].sort_values("t").reset_index(drop=True)
@@ -10901,8 +11966,8 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
         actions = _causal_empirical_actions(comp_all) + 1
         actions = np.clip(actions, 0, action_count - 1)
         action_onehot = np.eye(action_count, dtype=np.float32)[actions]
-        anchor_input = np.zeros((t_count, 2), dtype=np.float32)
-        anchor_flag = np.zeros((t_count, 2), dtype=np.float32)
+        anchor_input = np.zeros((t_count, len(instrument_names)), dtype=np.float32)
+        anchor_flag = np.zeros((t_count, len(instrument_names)), dtype=np.float32)
         anchors = data.anchors[
             (data.anchors["id"].astype(int) == int(pid))
             & data.anchors["observed"].astype(bool)
@@ -10912,17 +11977,23 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
             if position < 0 or position >= t_count or not valid[position]:
                 continue
             channel = 0 if str(anchor.anchor) == "Y1" else 1
+            instrument = str(anchor.instrument)
+            if instrument not in instrument_index:
+                raise ValueError(f"Unknown empirical questionnaire instrument: {instrument}")
+            instrument_position = instrument_index[instrument]
             value = float(anchor.value)
-            if anchor_flag[position, channel] > 0:
-                anchor_input[position, channel] = 0.5 * (anchor_input[position, channel] + value)
-            else:
-                anchor_input[position, channel] = value
-            anchor_flag[position, channel] = 1.0
+            if anchor_flag[position, instrument_position] > 0:
+                raise ValueError("Duplicate patient-session-instrument event entered the recurrent comparator.")
+            anchor_input[position, instrument_position] = value
+            anchor_flag[position, instrument_position] = 1.0
             start = max(0, int(anchor.window_start))
             end = min(t_count - 1, int(anchor.window_end))
             if end >= start:
                 anchor_rows.append(
-                    (row_by_id[int(pid)], channel, start, end, float(anchor.loading), value)
+                    (
+                        row_by_id[int(pid)], channel, start, end,
+                        float(anchor.intercept), float(anchor.loading), value,
+                    )
                 )
         feature = np.concatenate(
             [values, available.astype(np.float32), action_onehot, anchor_input, anchor_flag],
@@ -10945,23 +12016,24 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
 
 def _empirical_ode_anchor_loss(prediction: torch.Tensor, rows, device: torch.device) -> torch.Tensor:
     if not rows:
-        raise ValueError("The ODE-RNN comparator has no development anchors.")
+        raise ValueError("The exponential-decay GRU comparator has no development anchors.")
     values = np.asarray(rows, dtype=float)
     patient = torch.as_tensor(values[:, 0], dtype=torch.long, device=device)
     channel = torch.as_tensor(values[:, 1], dtype=torch.long, device=device)
     start = torch.as_tensor(values[:, 2], dtype=torch.long, device=device)
     end = torch.as_tensor(values[:, 3], dtype=torch.long, device=device)
-    loading = torch.as_tensor(values[:, 4], dtype=torch.float32, device=device)
-    target = torch.as_tensor(values[:, 5], dtype=torch.float32, device=device)
+    intercept = torch.as_tensor(values[:, 4], dtype=torch.float32, device=device)
+    loading = torch.as_tensor(values[:, 5], dtype=torch.float32, device=device)
+    target = torch.as_tensor(values[:, 6], dtype=torch.float32, device=device)
     trajectory = prediction[patient, :, channel]
     cumulative = F.pad(torch.cumsum(trajectory, dim=1), (1, 0))
     index = torch.arange(len(patient), device=device)
     window_mean = (cumulative[index, end + 1] - cumulative[index, start]) / (end - start + 1).to(prediction.dtype)
-    return torch.square(loading * window_mean - target).mean()
+    return torch.square(intercept + loading * window_mean - target).mean()
 
 
 def _fit_empirical_ode_rnn(data: SimulationData, args) -> pd.DataFrame:
-    """Fit an ensemble of forward ODE-RNNs using the same development patients and inputs."""
+    """Fit an ensemble of forward exponential-decay GRUs on the shared inputs."""
 
     requested_device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     device = torch.device(requested_device)
@@ -11147,7 +12219,7 @@ def _dc_impute_by_time(frame: pd.DataFrame, cols: list[str]) -> np.ndarray:
     return vals.to_numpy(dtype=float)
 
 
-def _dc_fit_daily_readout(data, train_ids, ridge: float = 1.0):
+def _dc_fit_daily_readout(data, train_ids, ridge: float = 1.0, *, anchor_name: str | None = None):
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(data.config.p_daily)]
     input_cols = [f"input_X{j}" for j in range(data.config.p_daily)]
@@ -11168,12 +12240,15 @@ def _dc_fit_daily_readout(data, train_ids, ridge: float = 1.0):
         for row in anc_i.itertuples(index=False):
             if not bool(getattr(row, "observed", False)):
                 continue
+            if anchor_name is not None and str(getattr(row, "anchor")) != str(anchor_name):
+                continue
             value = float(getattr(row, "value"))
+            intercept = float(getattr(row, "intercept", 0.0))
             loading = float(getattr(row, "loading"))
             if not np.isfinite(value) or not np.isfinite(loading) or abs(loading) < 1e-8:
                 continue
             points_x.append(float(getattr(row, "window_end")))
-            points_y.append(value / loading)
+            points_y.append((value - intercept) / loading)
         if len(points_x) < 2:
             continue
         order = np.argsort(points_x)
@@ -11199,13 +12274,15 @@ def _dc_fit_daily_readout(data, train_ids, ridge: float = 1.0):
     return float(coef[0]), coef[1:].astype(float), means.astype(float), sigma
 
 
-def _dc_person_arrays(data, pid, daily_readout):
+def _dc_person_arrays(data, pid, daily_readout, *, anchor_name: str | None = None):
     comp_i = data.components[data.components["id"] == pid].sort_values("t").reset_index(drop=True)
     daily_i = data.daily[data.daily["id"] == pid].sort_values("t").reset_index(drop=True)
     if "session_observed" in comp_i.columns:
         comp_i = comp_i[comp_i["session_observed"].fillna(False).astype(bool)].reset_index(drop=True)
         daily_i = daily_i[daily_i["t"].isin(comp_i["t"])].reset_index(drop=True)
     anchors_i = data.anchors[data.anchors["id"] == pid].sort_values(["anchor", "t"]).reset_index(drop=True)
+    if anchor_name is not None:
+        anchors_i = anchors_i[anchors_i["anchor"].astype(str).eq(str(anchor_name))].copy()
     q = data.config.q
     b = _dc_impute_by_time(comp_i, [f"B{j}" for j in range(q)])
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
@@ -11249,8 +12326,10 @@ def _dc_transition_features(b, action, recent, burden, n_actions, *, basis="line
     return np.asarray(rows, dtype=float)
 
 
-def _dc_solve_person(data, pid, theta, daily_readout, args):
-    comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden = _dc_person_arrays(data, pid, daily_readout)
+def _dc_solve_person(data, pid, theta, daily_readout, args, *, anchor_name: str):
+    comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden = _dc_person_arrays(
+        data, pid, daily_readout, anchor_name=anchor_name
+    )
     t_count = len(comp_i)
     basis = getattr(args, "s0_basis", "linear")
     subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
@@ -11271,15 +12350,15 @@ def _dc_solve_person(data, pid, theta, daily_readout, args):
         if not bool(getattr(row, "observed", False)):
             continue
         value = float(getattr(row, "value")); loading = float(getattr(row, "loading"))
+        intercept = float(getattr(row, "intercept", 0.0))
         if not np.isfinite(value) or not np.isfinite(loading) or abs(loading) < 1e-8:
             continue
         start = max(0, int(getattr(row, "window_start"))); end = min(t_count - 1, int(getattr(row, "window_end")))
         if end < start:
             continue
         window = list(range(start, end + 1))
-        spec = data.config.y1 if getattr(row, "anchor") == "Y1" else data.config.y2
-        rho = data.config.rho_serial_y1 if getattr(row, "anchor") == "Y1" else data.config.rho_serial_y2
-        add([(k, loading / len(window)) for k in window], value, marginal_anchor_sd(spec, rho))
+        observation_sd = float(getattr(row, "observation_sd", ANCHOR_SD))
+        add([(k, loading / len(window)) for k in window], value - intercept, observation_sd)
     for k, observed in enumerate(any_daily):
         if observed and np.isfinite(daily_pred[k]):
             add([(k, 1.0)], float(daily_pred[k]), daily_sd)
@@ -11303,9 +12382,11 @@ def _dc_solve_person(data, pid, theta, daily_readout, args):
     return pred, b, action, recent, burden, next_gaps
 
 
-def _dc_fit_direct_map(data, args):
+def _dc_fit_direct_map_channel(data, args, *, anchor_name: str):
     train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
-    daily_readout = _dc_fit_daily_readout(data, train_ids, ridge=args.daily_ridge)
+    daily_readout = _dc_fit_daily_readout(
+        data, train_ids, ridge=args.daily_ridge, anchor_name=anchor_name
+    )
     basis = getattr(args, "s0_basis", "linear")
     n_features = _dc_transition_features(np.zeros((2, data.config.q)), np.zeros(2, dtype=int), np.zeros(2), np.zeros(2),
                                          data.config.n_treatment_types, basis=basis, subtype=0,
@@ -11318,7 +12399,7 @@ def _dc_fit_direct_map(data, args):
         pred_by_pid.clear(); arrays_by_pid.clear()
         for pid in ids:
             pred, b, action, recent, burden, next_gaps = _dc_solve_person(
-                data, pid, theta, daily_readout, args
+                data, pid, theta, daily_readout, args, anchor_name=anchor_name
             )
             pred_by_pid[pid] = pred; arrays_by_pid[pid] = (b, action, recent, burden, next_gaps)
             if pid not in train_ids:
@@ -11338,6 +12419,24 @@ def _dc_fit_direct_map(data, args):
         theta = np.linalg.solve(x.T @ x + penalty, x.T @ y)
     preds = pd.concat([pred_by_pid[pid] for pid in ids], ignore_index=True)
     return preds, theta
+
+
+def _dc_fit_direct_map(data, args):
+    depression, depression_theta = _dc_fit_direct_map_channel(
+        data, args, anchor_name="Y1"
+    )
+    anxiety, anxiety_theta = _dc_fit_direct_map_channel(
+        data, args, anchor_name="Y2"
+    )
+    merged = depression[["id", "t", "L_hat"]].rename(
+        columns={"L_hat": "z_d_hat"}
+    ).merge(
+        anxiety[["id", "t", "L_hat"]].rename(columns={"L_hat": "z_p_hat"}),
+        on=["id", "t"],
+        validate="one_to_one",
+    )
+    merged["L_hat"] = 0.5 * (merged["z_d_hat"] + merged["z_p_hat"])
+    return merged, {"depression": depression_theta, "anxiety": anxiety_theta}
 
 
 def _dc_anchor_pattern_strata(data, n_strata):
@@ -11368,8 +12467,12 @@ def _dc_markov_design(base_feats, l_hat, gaps, stratum, n_strata):
     return x, y
 
 
-def _dc_solve_markov_person(data, pid, theta, daily_readout, args, *, basis, stratum, n_strata):
-    comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden = _dc_person_arrays(data, pid, daily_readout)
+def _dc_solve_markov_person(
+    data, pid, theta, daily_readout, args, *, basis, stratum, n_strata, anchor_name
+):
+    comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden = _dc_person_arrays(
+        data, pid, daily_readout, anchor_name=anchor_name
+    )
     t_count = len(comp_i)
     subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
     feats = _dc_transition_features(b, action, recent, burden, data.config.n_treatment_types,
@@ -11395,15 +12498,15 @@ def _dc_solve_markov_person(data, pid, theta, daily_readout, args, *, basis, str
         if not bool(getattr(row, "observed", False)):
             continue
         value = float(getattr(row, "value")); loading = float(getattr(row, "loading"))
+        intercept = float(getattr(row, "intercept", 0.0))
         if not np.isfinite(value) or not np.isfinite(loading) or abs(loading) < 1e-8:
             continue
         start = max(0, int(getattr(row, "window_start"))); end = min(t_count - 1, int(getattr(row, "window_end")))
         if end < start:
             continue
         window = list(range(start, end + 1))
-        spec = data.config.y1 if getattr(row, "anchor") == "Y1" else data.config.y2
-        rho = data.config.rho_serial_y1 if getattr(row, "anchor") == "Y1" else data.config.rho_serial_y2
-        add([(k, loading / len(window)) for k in window], value, marginal_anchor_sd(spec, rho))
+        observation_sd = float(getattr(row, "observation_sd", ANCHOR_SD))
+        add([(k, loading / len(window)) for k in window], value - intercept, observation_sd)
     for k, observed in enumerate(any_daily):
         if observed and np.isfinite(daily_pred[k]):
             add([(k, 1.0)], float(daily_pred[k]), daily_sd)
@@ -11428,12 +12531,16 @@ def _dc_solve_markov_person(data, pid, theta, daily_readout, args, *, basis, str
     return pd.DataFrame({"id": comp_i["id"].to_numpy(dtype=int), "t": comp_i["t"].to_numpy(dtype=int), "L_hat": sol})
 
 
-def _dc_fit_markov_direct(data, args, *, basis):
+def _dc_fit_markov_direct_channel(data, args, *, basis, anchor_name):
     train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
     ids = sorted(data.individuals["id"].astype(int).tolist())
-    daily_readout = _dc_fit_daily_readout(data, train_ids, ridge=args.daily_ridge)
+    daily_readout = _dc_fit_daily_readout(
+        data, train_ids, ridge=args.daily_ridge, anchor_name=anchor_name
+    )
     init_args = _DCArgs(**vars(args)); init_args.s0_basis = basis
-    init_preds, base_theta = _dc_fit_direct_map(data, init_args)
+    init_preds, base_theta = _dc_fit_direct_map_channel(
+        data, init_args, anchor_name=anchor_name
+    )
     n_base = int(len(base_theta))
     n_strata = max(1, int(args.markov_strata))
     strata = _dc_anchor_pattern_strata(data, n_strata)
@@ -11444,7 +12551,9 @@ def _dc_fit_markov_direct(data, args, *, basis):
         for pid in ids:
             if pid not in train_ids or pid not in pred_by_pid:
                 continue
-            comp_i, _, b, _, _, _, action, recent, burden = _dc_person_arrays(data, pid, daily_readout)
+            comp_i, _, b, _, _, _, action, recent, burden = _dc_person_arrays(
+                data, pid, daily_readout, anchor_name=anchor_name
+            )
             subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
             base_feats = _dc_transition_features(b, action, recent, burden, data.config.n_treatment_types,
                                                  basis=basis, subtype=subtype, n_subtypes=data.config.n_subtypes)
@@ -11464,15 +12573,34 @@ def _dc_fit_markov_direct(data, args, *, basis):
         theta = np.linalg.solve(x.T @ x + penalty, x.T @ y)
         theta[n_base + n_strata:] = np.clip(theta[n_base + n_strata:], -0.95, 0.05)
         pred_by_pid = {pid: _dc_solve_markov_person(data, pid, theta, daily_readout, args, basis=basis,
-                                                    stratum=strata[pid], n_strata=n_strata) for pid in ids}
+                                                    stratum=strata[pid], n_strata=n_strata,
+                                                    anchor_name=anchor_name) for pid in ids}
     return pd.concat([pred_by_pid[pid] for pid in ids], ignore_index=True)
 
 
-def _dc_predictions(preds: pd.DataFrame) -> dict[int, np.ndarray]:
-    """Map a direct-comparator prediction frame to {id: L over session index}."""
+def _dc_fit_markov_direct(data, args, *, basis):
+    depression = _dc_fit_markov_direct_channel(
+        data, args, basis=basis, anchor_name="Y1"
+    )
+    anxiety = _dc_fit_markov_direct_channel(
+        data, args, basis=basis, anchor_name="Y2"
+    )
+    merged = depression[["id", "t", "L_hat"]].rename(
+        columns={"L_hat": "z_d_hat"}
+    ).merge(
+        anxiety[["id", "t", "L_hat"]].rename(columns={"L_hat": "z_p_hat"}),
+        on=["id", "t"],
+        validate="one_to_one",
+    )
+    merged["L_hat"] = 0.5 * (merged["z_d_hat"] + merged["z_p_hat"])
+    return merged
+
+
+def _dc_predictions(preds: pd.DataFrame, column: str = "L_hat") -> dict[int, np.ndarray]:
+    """Map one direct-comparator channel to patient-indexed session arrays."""
     out = {}
     for pid, g in preds.groupby("id", sort=True):
-        out[int(pid)] = g.sort_values("t")["L_hat"].to_numpy(dtype=float)
+        out[int(pid)] = g.sort_values("t")[column].to_numpy(dtype=float)
     return out
 
 
@@ -11482,11 +12610,12 @@ def _channel_eval(
     stats: dict,
     neural_predictions: dict[str, dict[int, np.ndarray]] | None = None,
     session_days_by_id: dict[int, np.ndarray] | None = None,
+    measurement_calibration: dict | None = None,
 ) -> pd.DataFrame:
     """Held-out recovery rows for one channel, all methods.
 
     BALL, its bidirectional teacher, the direct causal transformer, the Gaussian
-    process, the ODE-RNN and the channel-specific statistical comparators are
+    process, the exponential-decay GRU and the channel-specific statistical comparators are
     evaluated on the same held-out measurements after the recall-window embargo.
     The BALL interval scale comes from its deep ensemble and last-layer Laplace
     predictive standard deviation.
@@ -11524,8 +12653,20 @@ def _channel_eval(
             if L is None:
                 continue
         ret_days = retained["day"].to_numpy(dtype=float)
-        ret_z = np.array([(float(v) - stats[s][0]) / stats[s][1]
-                          for v, s in zip(retained["value"], retained["anchor"])])
+        ret_z_values = []
+        for value, instrument in zip(retained["value"], retained["anchor"]):
+            midpoint, half_range = stats[instrument]
+            normalized = (float(value) - midpoint) / half_range
+            parameters = (
+                measurement_calibration["instruments"][instrument]
+                if measurement_calibration is not None
+                else {"intercept": 0.0, "loading": 1.0}
+            )
+            ret_z_values.append(
+                (normalized - float(parameters["intercept"]))
+                / float(parameters["loading"])
+            )
+        ret_z = np.asarray(ret_z_values, dtype=float)
         order = np.argsort(ret_days)
         baseline_rows = (
             ach.sort_values(["day", "session"], kind="mergesort")
@@ -11561,6 +12702,30 @@ def _channel_eval(
                 continue  # recall-window embargo
             mu, sd = stats[h.anchor]
             z_true = (float(h.value) - mu) / sd
+            parameters = (
+                measurement_calibration["instruments"][h.anchor]
+                if measurement_calibration is not None
+                else {
+                    "intercept": 0.0,
+                    "loading": 1.0,
+                    "observation_sd": float(predictions.get("student_anchor_obs_sd", np.nan)),
+                }
+            )
+            instrument_intercept = float(parameters["intercept"])
+            instrument_loading = float(parameters["loading"])
+            instrument_observation_sd = float(parameters["observation_sd"])
+            pooling_sd_normalized = float(
+                measurement_calibration["development_data"]["normalized_score_sd_by_instrument"][h.anchor]
+                if measurement_calibration is not None
+                else 1.0
+            )
+
+            def to_measurement_scale(latent_value: float) -> float:
+                return (
+                    instrument_intercept + instrument_loading * float(latent_value)
+                    if np.isfinite(latent_value)
+                    else float("nan")
+                )
             baseline_day = float(p["baseline_day_by_anchor"].get(h.anchor, np.nan))
             if np.isfinite(baseline_day) and baseline_day > day:
                 raise AssertionError("A clinical classification baseline occurs after its target.")
@@ -11571,57 +12736,89 @@ def _channel_eval(
             # have no such gap and are reported in their own stratum.
             gap = float(day - np.max(ret_days_s[prior_mask])) if prior_anchor_count else float("nan")
             if has_neural:
-                ball = _predict_lookup_window(predictions["student"], pid, sess_days, w0, w1, day)
-                ball_teacher = _predict_lookup_window(predictions["teacher"], pid, sess_days, w0, w1, day)
+                ball = to_measurement_scale(
+                    _predict_lookup_window(predictions["student"], pid, sess_days, w0, w1, day)
+                )
+                ball_teacher = to_measurement_scale(
+                    _predict_lookup_window(predictions["teacher"], pid, sess_days, w0, w1, day)
+                )
                 ball_direct_causal = (
-                    _predict_lookup_window(predictions["direct_causal"], pid, sess_days, w0, w1, day)
+                    to_measurement_scale(
+                        _predict_lookup_window(predictions["direct_causal"], pid, sess_days, w0, w1, day)
+                    )
                     if "direct_causal" in predictions else float("nan")
                 )
                 ball_no_dense_ehr = (
-                    _predict_lookup_window(predictions["no_dense_ehr"], pid, sess_days, w0, w1, day)
+                    to_measurement_scale(
+                        _predict_lookup_window(predictions["no_dense_ehr"], pid, sess_days, w0, w1, day)
+                    )
                     if "no_dense_ehr" in predictions else float("nan")
                 )
                 gp_causal = (
-                    _predict_lookup_window(predictions["gp_causal"], pid, sess_days, w0, w1, day)
+                    to_measurement_scale(
+                        _predict_lookup_window(predictions["gp_causal"], pid, sess_days, w0, w1, day)
+                    )
                     if "gp_causal" in predictions else float("nan")
                 )
                 ode_rnn = (
-                    _predict_lookup_window(predictions["ode_rnn"], pid, sess_days, w0, w1, day)
+                    to_measurement_scale(
+                        _predict_lookup_window(predictions["ode_rnn"], pid, sess_days, w0, w1, day)
+                    )
                     if "ode_rnn" in predictions else float("nan")
                 )
+                focused_predictions = {
+                    method: to_measurement_scale(
+                        _predict_lookup_window(
+                            predictions[method], pid, sess_days, w0, w1, day
+                        )
+                    )
+                    for method in (
+                        "ball_inherited_dynamics_only",
+                        "ball_teacher_matching_only",
+                        "ball_full_decomposition",
+                        "ball_direct_compute_matched",
+                        "ball_session_balanced",
+                    )
+                    if method in predictions
+                }
                 latent_window_sd = (
                     _predict_lookup_window_sd(predictions["student_sd"], pid, sess_days, w0, w1, day)
                     if "student_sd" in predictions else float("nan")
                 )
-                observation_sd = float(predictions.get("student_anchor_obs_sd", np.nan))
                 ball_sd = float(
-                    np.sqrt(latent_window_sd**2 + observation_sd**2)
+                    np.sqrt(
+                        (instrument_loading * latent_window_sd) ** 2
+                        + instrument_observation_sd ** 2
+                    )
                 )
                 if not np.isfinite(ball_sd) or ball_sd <= 0:
                     raise AssertionError("BALL predictive standard deviation must be finite and positive.")
             else:
-                ball = _predict_window(L, sess_days, w0, w1, day)
+                ball = to_measurement_scale(_predict_window(L, sess_days, w0, w1, day))
                 ball_teacher = float("nan")
                 ball_direct_causal = float("nan")
                 ball_no_dense_ehr = float("nan")
                 gp_causal = float("nan")
                 ode_rnn = float("nan")
+                focused_predictions = {}
                 si = int(np.argmin(np.abs(sess_days - day)))
                 ball_sd = float(raw_sd[si])
-            s0 = (_predict_lookup_window(predictions["s0"], pid, sess_days, w0, w1, day)
-                  if "s0" in predictions else _predict_window(L, sess_days, w0, w1, day))
-            markov = (_predict_lookup_window(predictions["markov"], pid, sess_days, w0, w1, day)
+            s0 = (to_measurement_scale(_predict_lookup_window(predictions["s0"], pid, sess_days, w0, w1, day))
+                  if "s0" in predictions else to_measurement_scale(_predict_window(L, sess_days, w0, w1, day)))
+            markov = (to_measurement_scale(_predict_lookup_window(predictions["markov"], pid, sess_days, w0, w1, day))
                       if "markov" in predictions else float("nan"))
-            interp = float(np.interp(day, ret_days_s, ret_z_s)) if ret_days_s.size else float("nan")
+            interp = to_measurement_scale(float(np.interp(day, ret_days_s, ret_z_s))) if ret_days_s.size else float("nan")
             # Both deployable anchor baselines use only measurements available by
             # the day being estimated. Zero is the midpoint after each questionnaire
             # is transformed using its published minimum and maximum totals. The cumulative anchor mean
             # is distinct from LOCF and never falls back to interpolation.
             prior_z = ret_z_s[prior_mask]
-            locf = float(prior_z[-1]) if prior_z.size else 0.0
-            causal_anchor_mean = float(prior_z.mean()) if prior_z.size else 0.0
+            locf = to_measurement_scale(float(prior_z[-1]) if prior_z.size else 0.0)
+            causal_anchor_mean = to_measurement_scale(float(prior_z.mean()) if prior_z.size else 0.0)
             ball_anchor_only = (
-                _predict_lookup_window(predictions["ball_anchor_only"], pid, sess_days, w0, w1, day)
+                to_measurement_scale(
+                    _predict_lookup_window(predictions["ball_anchor_only"], pid, sess_days, w0, w1, day)
+                )
                 if "ball_anchor_only" in predictions else float("nan")
             )
             recs.append({
@@ -11633,18 +12830,32 @@ def _channel_eval(
                 "ball_direct_causal": ball_direct_causal,
                 "ball_no_dense_ehr": ball_no_dense_ehr,
                 "gp_causal_filter": gp_causal,
-                "ode_rnn_causal": ode_rnn,
+                "exponential_decay_gru": ode_rnn,
                 "markov_direct_transition": markov, "interpolation": interp, "locf": locf,
                 "causal_anchor_mean": causal_anchor_mean,
                 "ball_anchor_only": ball_anchor_only,
                 "ball_sd": float(ball_sd),
+                **focused_predictions,
                 "raw_true": float(h.value),
                 "scale_center": float(mu),
                 "scale_half_range": float(sd),
+                "pooling_sd_normalized": pooling_sd_normalized,
+                "instrument_intercept": instrument_intercept,
+                "instrument_loading": instrument_loading,
+                "instrument_observation_sd": instrument_observation_sd,
                 "baseline_raw": float(p["baseline_by_anchor"].get(h.anchor, np.nan)),
                 "baseline_day": baseline_day,
             })
     return pd.DataFrame(recs)
+
+
+def _development_scaled_squared_error(frame: pd.DataFrame, method: str) -> pd.Series:
+    """Squared error after the frozen development-instrument normalization."""
+
+    scale = pd.to_numeric(frame["pooling_sd_normalized"], errors="coerce")
+    if scale.isna().any() or scale.le(0).any():
+        raise ValueError("Development pooling scales must be finite and positive.")
+    return ((frame[method] - frame["z_true"]) / scale) ** 2
 
 
 def _patient_balanced_binary_metrics(
@@ -12000,7 +13211,13 @@ def _cv_error(frame: pd.DataFrame, features: list[str]) -> tuple[float, float]:
     return float(np.sqrt(np.mean(err**2))), float(np.sum(err**2))
 
 
-def _transition_one_group(frame: pd.DataFrame, cadence: int, channel: str) -> tuple[dict, list[dict]]:
+def _transition_one_group(
+    frame: pd.DataFrame,
+    cadence: int,
+    channel: str,
+    *,
+    patient_mean_mode: str = "expanding_strictly_earlier",
+) -> tuple[dict, list[dict]]:
     frame = frame.dropna(subset=["delta", *RDOC_NUISANCE_COLS, *RDOC_COLS]).copy()
     frame = frame.sort_values(["id", "day", "next_day"], kind="mergesort").reset_index(drop=True)
     if len(frame) < 25 or frame["id"].nunique() < 5:
@@ -12012,16 +13229,26 @@ def _transition_one_group(frame: pd.DataFrame, cadence: int, channel: str) -> tu
             "top_domain": "", "permutation_p": float("nan"),
         }, []
 
-    # Mundlak decomposition separates stable between-patient content salience
-    # from the within-patient deviations relevant to a transition claim.
+    # The primary decomposition uses the mean of strictly earlier profiles, so
+    # the current profile and every later note remain outside its reference
+    # value. A full-record patient mean is retained as a retrospective
+    # sensitivity and written to separate output files.
     between_cols, within_cols = [], []
     for col in RDOC_COLS:
         between_col = f"{col}_between"
         within_col = f"{col}_within"
-        frame[between_col] = frame.groupby("id")[col].transform("mean")
+        if patient_mean_mode == "expanding_strictly_earlier":
+            cumulative = frame.groupby("id", sort=False)[col].cumsum() - frame[col]
+            prior_count = frame.groupby("id", sort=False).cumcount()
+            frame[between_col] = cumulative / prior_count.replace(0, np.nan)
+        elif patient_mean_mode == "full_record_retrospective":
+            frame[between_col] = frame.groupby("id")[col].transform("mean")
+        else:
+            raise ValueError(f"Unknown patient_mean_mode: {patient_mean_mode}")
         frame[within_col] = frame[col] - frame[between_col]
         between_cols.append(between_col)
         within_cols.append(within_col)
+    frame = frame.dropna(subset=between_cols + within_cols).reset_index(drop=True)
     base_features = list(RDOC_NUISANCE_COLS) + between_cols
     full_features = base_features + within_cols
     base_rmse, base_sse = _cv_error(frame, base_features)
@@ -12073,23 +13300,41 @@ def _transition_one_group(frame: pd.DataFrame, cadence: int, channel: str) -> tu
         "top_domain": top_domain,
         "permutation_p": perm_p,
         "permutation_scheme": "within-patient circular time shift",
-        "rdoc_estimand": "within-patient deviation adjusted for patient mean",
+        "rdoc_estimand": (
+            "current profile deviation from the mean of strictly earlier profiles"
+            if patient_mean_mode == "expanding_strictly_earlier"
+            else "current profile deviation from the full-record patient mean"
+        ),
+        "patient_mean_mode": patient_mean_mode,
+        "current_profile_in_reference_mean": bool(
+            patient_mean_mode == "full_record_retrospective"
+        ),
     }
     coefs = [
         {"cadence": int(cadence), "channel": channel, "domain": col,
          "coefficient": float(coef_map.get(within_col, 0.0)),
-         "estimand": "within-patient deviation"}
+         "estimand": summary["rdoc_estimand"],
+         "patient_mean_mode": patient_mean_mode}
         for col, within_col in zip(RDOC_COLS, within_cols)
     ]
     return summary, coefs
 
 
-def _summarize_rdoc_transitions(transitions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def _summarize_rdoc_transitions(
+    transitions: pd.DataFrame,
+    *,
+    patient_mean_mode: str = "expanding_strictly_earlier",
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     summaries, coefs = [], []
     if transitions.empty:
         return pd.DataFrame(), pd.DataFrame()
     for (cadence, channel), group in transitions.groupby(["cadence", "channel"], sort=True):
-        summary, coef_rows = _transition_one_group(group, int(cadence), str(channel))
+        summary, coef_rows = _transition_one_group(
+            group,
+            int(cadence),
+            str(channel),
+            patient_mean_mode=patient_mean_mode,
+        )
         summaries.append(summary)
         coefs.extend(coef_rows)
     return pd.DataFrame(summaries), pd.DataFrame(coefs)
@@ -12114,8 +13359,13 @@ def _write_fit_tables(
     transitions = pd.concat(transition_frames, ignore_index=True) if transition_frames else pd.DataFrame()
     if summarize_transitions:
         transition_summary, transition_coef = _summarize_rdoc_transitions(transitions)
+        retrospective_summary, retrospective_coef = _summarize_rdoc_transitions(
+            transitions,
+            patient_mean_mode="full_record_retrospective",
+        )
     else:
         transition_summary, transition_coef = pd.DataFrame(), pd.DataFrame()
+        retrospective_summary, retrospective_coef = pd.DataFrame(), pd.DataFrame()
     overall.to_csv(out_dir / f"empirical_recovery_overall{suffix}.csv", index=False)
     strata.to_csv(out_dir / f"empirical_recovery_by_gap{suffix}.csv", index=False)
     calib.to_csv(out_dir / f"empirical_calibration{suffix}.csv", index=False)
@@ -12123,6 +13373,14 @@ def _write_fit_tables(
     transitions.to_csv(out_dir / f"empirical_rdoc_transition_rows{suffix}.csv", index=False)
     transition_summary.to_csv(out_dir / f"empirical_rdoc_transition{suffix}.csv", index=False)
     transition_coef.to_csv(out_dir / f"empirical_rdoc_transition_coefficients{suffix}.csv", index=False)
+    retrospective_summary.to_csv(
+        out_dir / f"empirical_rdoc_transition_full_record_sensitivity{suffix}.csv",
+        index=False,
+    )
+    retrospective_coef.to_csv(
+        out_dir / f"empirical_rdoc_transition_full_record_coefficients{suffix}.csv",
+        index=False,
+    )
     return overall, strata, calib, boot, transitions, transition_summary, transition_coef
 
 
@@ -12151,6 +13409,7 @@ def _write_fit_run_manifest(
     sessions_full: pd.DataFrame | None = None,
     rdoc_sessions: pd.DataFrame | None = None,
     comorbidity_sessions: pd.DataFrame | None = None,
+    prediction_rows: pd.DataFrame | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = run_dir / "fit_run_manifest.json"
@@ -12168,6 +13427,7 @@ def _write_fit_run_manifest(
         for k, v in vars(args).items()
     }
     payload = {
+        "run_id": run_dir.name,
         "status": status,
         "started_at": started_at,
         "updated_at": now.isoformat(timespec="seconds"),
@@ -12203,6 +13463,7 @@ def _write_fit_run_manifest(
         except ValueError:
             payload["elapsed_seconds"] = None
     if sessions_full is not None and not sessions_full.empty:
+        payload["empirical_data_sha256"] = _dataframe_sha256(sessions_full)
         payload["n_sessions"] = int(len(sessions_full))
         payload["n_patients"] = int(sessions_full["id"].nunique()) if "id" in sessions_full.columns else None
         if {"id", "session", "day"}.issubset(sessions_full.columns):
@@ -12294,6 +13555,31 @@ def _write_fit_run_manifest(
         }
         payload["comorbidity_source"] = "protected external numeric feature table"
         payload["comorbidity_strictly_prior"] = True
+    if prediction_rows is not None and not prediction_rows.empty:
+        target_columns = [
+            column
+            for column in ("cadence", "id", "anchor", "day", "z_true", "raw_true")
+            if column in prediction_rows.columns
+        ]
+        payload["target_set_sha256"] = _dataframe_sha256(
+            prediction_rows, target_columns
+        )
+        payload["target_set_hash_columns"] = target_columns
+        payload["target_set_rows"] = int(len(prediction_rows))
+        payload["target_set_sha256_by_cadence"] = {
+            str(int(cadence)): _dataframe_sha256(group, target_columns)
+            for cadence, group in prediction_rows.groupby("cadence", sort=True)
+        }
+    measurement_path = run_dir / "measurement_calibration.json"
+    if measurement_path.is_file():
+        payload["measurement_calibration_sha256"] = hashlib.sha256(
+            measurement_path.read_bytes()
+        ).hexdigest()
+    hyperparameter_path = run_dir / "empirical_hyperparameter_selection.csv"
+    if hyperparameter_path.is_file():
+        payload["hyperparameter_selection_sha256"] = hashlib.sha256(
+            hyperparameter_path.read_bytes()
+        ).hexdigest()
     manifest_path.write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
 
@@ -12483,7 +13769,7 @@ def _fit_generalization_sensitivities(
     sessions_full: pd.DataFrame,
     sessions: pd.DataFrame,
     comorbidity_sessions: pd.DataFrame,
-    stats: dict,
+    measurement_calibration: dict,
     args,
 ) -> pd.DataFrame:
     rows = []
@@ -12512,7 +13798,7 @@ def _fit_generalization_sensitivities(
             sessions_use,
             None,
             comorbidity_use,
-            stats,
+            measurement_calibration,
             max_patients=None,
             patient_splits=patient_splits,
         )
@@ -12549,7 +13835,19 @@ def _fit_generalization_sensitivities(
             sub = anchors[
                 anchors["anchor"].isin(scales) & anchors["id"].astype(int).isin(test_ids)
             ].copy()
-            ev = _channel_eval(sub, sessions, stats, predictions, session_days)
+            ev = _channel_eval(
+                sub,
+                sessions,
+                {
+                    instrument: (
+                        float(values["midpoint"]), float(values["half_range"])
+                    )
+                    for instrument, values in measurement_calibration["transforms"].items()
+                },
+                predictions,
+                session_days,
+                measurement_calibration=measurement_calibration,
+            )
             if not ev.empty:
                 ev["channel"] = channel
                 frames.append(ev)
@@ -12557,7 +13855,7 @@ def _fit_generalization_sensitivities(
             continue
         ev = pd.concat(frames, ignore_index=True)
         for method in ("ball", "locf", "interpolation", "causal_anchor_mean"):
-            per_patient = ((ev[method] - ev["z_true"]) ** 2).groupby(ev["id"]).mean()
+            per_patient = _development_scaled_squared_error(ev, method).groupby(ev["id"]).mean()
             rows.append({
                 "validation": validation,
                 "cadence": 14,
@@ -12596,7 +13894,7 @@ def _empirical_input_contract_table() -> pd.DataFrame:
     rows = [
         ("ball", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("ball_direct_causal", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ode_rnn_causal", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("exponential_decay_gru", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("gp_causal_filter", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw calendar days"),
         ("locf", "causal", "most recent retained anchor", "questionnaire history", "questionnaire history", "raw calendar days"),
         ("causal_anchor_mean", "causal", "retained anchors through the current session", "questionnaire history", "questionnaire history", "raw calendar days"),
@@ -12606,6 +13904,11 @@ def _empirical_input_contract_table() -> pd.DataFrame:
         ("interpolation", "retrospective", "nearest retained anchors on both sides", "questionnaire history", "questionnaire history", "raw calendar days"),
         ("ball_no_dense_ehr", "causal", "retained anchors through the current session", "raw session number", "previous-session treatment", "raw elapsed days"),
         ("ball_anchor_only", "causal", "retained anchors through the current session", "questionnaire history", "questionnaire history", "raw elapsed days"),
+        ("ball_inherited_dynamics_only", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_teacher_matching_only", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_full_decomposition", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_direct_compute_matched", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_session_balanced", "causal", "retained anchors through the current session with total questionnaire weight balanced by session", "all structured features", "previous-session treatment", "raw elapsed days"),
     ]
     return pd.DataFrame(
         [
@@ -12787,6 +14090,24 @@ def main() -> None:
         help="Fit the forward-only transformer directly against anchors, without a teacher.",
     )
     parser.add_argument(
+        "--distillation-decomposition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At 14 days, fit inherited-dynamics, teacher-matching, and fully re-anchored causal students against the same teacher.",
+    )
+    parser.add_argument(
+        "--compute-matched-direct",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At 14 days, train the direct causal transformer for the combined teacher-plus-student optimizer-update budget.",
+    )
+    parser.add_argument(
+        "--session-balanced-anchors",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="At 14 days, repeat BALL with total questionnaire likelihood weight fixed at one per observed patient-session.",
+    )
+    parser.add_argument(
         "--generalization-sensitivity",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -12814,13 +14135,27 @@ def main() -> None:
         "--ode-rnn-benchmark",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Fit the forward ODE-RNN benchmark on the same development patients and inputs.",
+        help="Fit the forward exponential-decay GRU benchmark on the same development patients and inputs.",
     )
     parser.add_argument("--ode-hidden", type=int, default=96)
     parser.add_argument("--ode-epochs", type=int, default=120)
     parser.add_argument("--ode-members", type=int, default=None)
     parser.add_argument("--ode-lr", type=float, default=1e-3)
     parser.add_argument("--ode-smoothness", type=float, default=0.02)
+    parser.add_argument(
+        "--anchor-weight",
+        type=float,
+        default=40.0,
+        help="Questionnaire-likelihood weight used after development-only selection.",
+    )
+    parser.add_argument(
+        "--select-core-hyperparameters",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Select daily persistence and questionnaire weight in source validation clinics before the final fit.",
+    )
+    parser.add_argument("--selection-epochs", type=int, default=120)
+    parser.add_argument("--selection-members", type=int, default=1)
     parser.add_argument(
         "--comorbidity-features",
         required=True,
@@ -12895,7 +14230,7 @@ def main() -> None:
     if args.gp_benchmark:
         methods.append("gp_causal_filter")
     if args.ode_rnn_benchmark:
-        methods.append("ode_rnn_causal")
+        methods.append("exponential_decay_gru")
     all_strata, all_overall, calib_rows, boot_rows, transition_frames = [], [], [], [], []
     ball_transition_frames = []
     instrument_rows, subgroup_rows, conditional_calibration_rows = [], [], []
@@ -12924,14 +14259,76 @@ def main() -> None:
         sessions_full=sessions_full,
         rdoc_sessions=rdoc_sessions,
         comorbidity_sessions=comorbidity_sessions,
+        prediction_rows=prediction_rows,
     )
     print(f"clean empirical fit run directory: {run_dir}", flush=True)
+
+    calibration_source = pd.read_csv(OUT / "anchors_sparse_14d.csv")
+    measurement_calibration = _fit_development_measurement_calibration(
+        calibration_source,
+        primary_model_splits,
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "measurement_calibration.json").write_text(
+        json.dumps(measurement_calibration, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stats = {
+        instrument: (float(values["midpoint"]), float(values["half_range"]))
+        for instrument, values in measurement_calibration["transforms"].items()
+    }
+    print(
+        "frozen development-only questionnaire measurement calibration: "
+        f"BDI intercept={measurement_calibration['instruments']['BDI']['intercept']:.4f}, "
+        f"BDI loading={measurement_calibration['instruments']['BDI']['loading']:.4f}",
+        flush=True,
+    )
+    if args.select_core_hyperparameters:
+        selection_anchors = pd.read_csv(OUT / "anchors_sparse_14d.csv")
+        selected_phi, selected_anchor_weight, hyperparameter_selection = (
+            _select_empirical_ball_hyperparameters(
+                selection_anchors,
+                sessions_full,
+                comorbidity_sessions,
+                measurement_calibration,
+                primary_model_splits,
+                args,
+            )
+        )
+        args.delta_phi = float(selected_phi)
+        args.anchor_weight = float(selected_anchor_weight)
+    else:
+        hyperparameter_selection = pd.DataFrame(
+            [
+                {
+                    "selection_stage": "fixed_by_command_line",
+                    "daily_persistence": float(args.delta_phi),
+                    "questionnaire_weight": float(args.anchor_weight),
+                    "validation_rmse_development_sd_units": float("nan"),
+                    "selected_daily_persistence": float(args.delta_phi),
+                    "selected_questionnaire_weight": float(args.anchor_weight),
+                    "selection_scope": "command-line sensitivity",
+                }
+            ]
+        )
+    hyperparameter_selection.to_csv(
+        run_dir / "empirical_hyperparameter_selection.csv", index=False
+    )
+    print(
+        "development-selected BALL settings: "
+        f"daily persistence={args.delta_phi:.1f}, questionnaire weight={args.anchor_weight:.0f}",
+        flush=True,
+    )
 
     for cad in requested_cadences:
         cad_strata, cad_overall, cad_calib_rows, cad_boot_rows, cad_transition_frames = [], [], [], [], []
         cad_ball_transition_frames = []
         anchors = pd.read_csv(OUT / f"anchors_sparse_{cad}d.csv")
-        stats = _standardizers(anchors)
+        observed_instruments = set(anchors["anchor"].dropna().astype(str))
+        if observed_instruments != set(measurement_calibration["instruments"]):
+            raise AssertionError(
+                "Every empirical cadence must contain the frozen PHQ9, BDI, and GAD7 instruments."
+            )
         burden_source = anchors[
             anchors["id"].astype(int).isin(primary_model_splits)
             & anchors["role"].isin(["anchor", "heldout_eval"])
@@ -12984,13 +14381,14 @@ def main() -> None:
             markov_pred,
             gp_causal_pred,
             ode_rnn_result,
+            focused_14d_results,
             session_days,
         ) = _fit_empirical_teacher_student(
             anchors,
             sessions_full,
             None,
             comorbidity_sessions,
-            stats,
+            measurement_calibration,
             args,
             cad,
             primary_model_splits,
@@ -13000,18 +14398,16 @@ def main() -> None:
             method for method in methods
             if method != "ball_anchor_only" or ball_anchor_only_result is not None
         ]
+        cadence_methods.extend(
+            method for method in focused_14d_results if method not in cadence_methods
+        )
         ch_frames = []
         for ch, scales in CHANNELS.items():
             value_col = "z_d_hat" if ch == "depression" else "z_p_hat"
             sd_col = "z_d_total_sd" if ch == "depression" else "z_p_total_sd"
-            channel_index = 0 if ch == "depression" else 1
-            observation_sds = student_result.metadata.get("anchor_observation_sd", [])
-            if len(observation_sds) <= channel_index:
-                raise AssertionError("BALL result lacks the anchor-observation standard deviation.")
             neural_predictions = {
                 "student": _prediction_lookup(student_result.predictions, value_col),
                 "student_sd": _prediction_lookup(student_result.intervals, sd_col),
-                "student_anchor_obs_sd": float(observation_sds[channel_index]),
                 "teacher": _prediction_lookup(teacher_result.predictions, value_col),
                 "s0": s0_pred[ch],
                 "markov": markov_pred[ch],
@@ -13035,13 +14431,25 @@ def main() -> None:
                     ode_rnn_result,
                     value_col,
                 )
+            for method, result in focused_14d_results.items():
+                neural_predictions[method] = _prediction_lookup(
+                    result.predictions,
+                    value_col,
+                )
             sub = anchors[
                 anchors["anchor"].isin(scales)
                 & anchors["id"].astype(int).isin(primary_heldout_ids)
             ].copy()
             if args.max_patients is not None:
                 sub = sub[sub["id"].astype(int).isin(neural_predictions["student"].keys())].copy()
-            channel_ev = _channel_eval(sub, sessions, stats, neural_predictions, session_days)
+            channel_ev = _channel_eval(
+                sub,
+                sessions,
+                stats,
+                neural_predictions,
+                session_days,
+                measurement_calibration=measurement_calibration,
+            )
             if not channel_ev.empty:
                 channel_ev["channel"] = ch
                 channel_ev["evaluation_role"] = channel_ev["id"].astype(int).map(primary_evaluation_roles)
@@ -13115,15 +14523,21 @@ def main() -> None:
             bins=[0, 1, 2, 3, 4, np.inf],
             labels=["week_1", "week_2", "week_3", "week_4", "week_5_or_later"],
         ).astype(str)
+        for method in cadence_methods:
+            ev_all[f"{method}_native"] = (
+                ev_all[method] * ev_all["scale_half_range"] + ev_all["scale_center"]
+            )
+        ev_all["ball_native_clipped"] = np.clip(
+            ev_all["ball_native"],
+            0.0,
+            2.0 * ev_all["scale_half_range"],
+        )
         calibration_ev = ev_all[ev_all["evaluation_role"] == "calibration"].copy()
         ev = ev_all[ev_all["evaluation_role"] == "test"].copy()
         if calibration_ev.empty or ev.empty:
             raise AssertionError(
                 "Primary empirical evaluation requires nonempty held-out calibration and test patients."
             )
-        prediction_export = ev_all.copy()
-        prediction_export.insert(0, "cadence", int(cad))
-        prediction_row_frames.append(prediction_export)
         timing_manifest_path = run_dir / f"empirical_teacher_student_manifest_{int(cad)}d.json"
         if timing_manifest_path.exists():
             timing_payload = json.loads(timing_manifest_path.read_text(encoding="utf-8"))
@@ -13140,7 +14554,7 @@ def main() -> None:
                 "ball_no_dense_ehr",
                 "ball_anchor_only",
                 "gp_causal_filter",
-                "ode_rnn_causal",
+                "exponential_decay_gru",
                 "locf",
                 "causal_anchor_mean",
             )
@@ -13157,24 +14571,37 @@ def main() -> None:
         # Overall held-out RMSE per method (patient-clustered mean of squared error).
         per_pt_se = {}
         for m in cadence_methods:
-            err2 = (ev[m] - ev["z_true"]) ** 2
+            err2 = _development_scaled_squared_error(ev, m)
             per_pt = err2.groupby(ev["id"]).mean()
             per_pt_se[m] = per_pt
             row = {"cadence": cad, "method": m,
                    "rmse": float(np.sqrt(per_pt.mean())),
+                   "unit": "development-questionnaire standard deviations",
+                   "pooling": "patient-balanced after instrument-specific development normalization",
                    "n": int(len(ev)),
                    "n_patients": int(ev["id"].nunique()),
                    "evaluation_partition": "final_test_six_heldout_clinics"}
             all_overall.append(row)
             cad_overall.append(row)
             for instrument, instrument_ev in ev.groupby("anchor", sort=True):
-                instrument_err2 = (instrument_ev[m] - instrument_ev["z_true"]) ** 2
-                instrument_pt = instrument_err2.groupby(instrument_ev["id"]).mean()
+                native_error = (
+                    (instrument_ev[m] - instrument_ev["z_true"])
+                    * instrument_ev["scale_half_range"]
+                ) ** 2
+                instrument_pt = native_error.groupby(instrument_ev["id"]).mean()
+                normalized_instrument_pt = _development_scaled_squared_error(
+                    instrument_ev, m
+                ).groupby(instrument_ev["id"]).mean()
                 instrument_rows.append({
                     "cadence": cad,
                     "instrument": instrument,
                     "method": m,
                     "rmse": float(np.sqrt(instrument_pt.mean())),
+                    "rmse_native_points": float(np.sqrt(instrument_pt.mean())),
+                    "rmse_development_sd_units": float(
+                        np.sqrt(normalized_instrument_pt.mean())
+                    ),
+                    "unit": "questionnaire points",
                     "n": int(len(instrument_ev)),
                     "n_patients": int(instrument_ev["id"].nunique()),
                 })
@@ -13184,7 +14611,7 @@ def main() -> None:
                 ("clinic", "clinic"),
             ):
                 for stratum, subgroup_ev in ev.groupby(stratum_col, sort=True):
-                    subgroup_err2 = (subgroup_ev[m] - subgroup_ev["z_true"]) ** 2
+                    subgroup_err2 = _development_scaled_squared_error(subgroup_ev, m)
                     subgroup_pt = subgroup_err2.groupby(subgroup_ev["id"]).mean()
                     subgroup_rows.append({
                         "cadence": cad,
@@ -13202,7 +14629,7 @@ def main() -> None:
                 ("treatment_week", "treatment_week"),
             ):
                 for stratum, context_ev in ev.groupby(stratum_col, sort=True):
-                    context_error = (context_ev[m] - context_ev["z_true"]) ** 2
+                    context_error = _development_scaled_squared_error(context_ev, m)
                     context_patient = context_error.groupby(context_ev["id"]).mean()
                     context_rows.append(
                         {
@@ -13311,7 +14738,7 @@ def main() -> None:
                 mask = ev["gap_bin"] == lab
                 if not mask.any():
                     continue
-                err2 = (ev.loc[mask, m] - ev.loc[mask, "z_true"]) ** 2
+                err2 = _development_scaled_squared_error(ev.loc[mask], m)
                 patient_err2 = err2.groupby(ev.loc[mask, "id"]).mean()
                 row = {"cadence": cad, "method": m, "gap_bin": lab,
                        "rmse": float(np.sqrt(patient_err2.mean())),
@@ -13320,108 +14747,227 @@ def main() -> None:
                 all_strata.append(row)
                 cad_strata.append(row)
 
-        # Patient-balanced, cluster-weighted variance-normalized split conformal
-        # calibration. Each patient contributes total weight one across all of
-        # that patient's calibration measurements. This targets patient-balanced
-        # marginal measurement coverage without treating repeated rows as equally
-        # weighted independent observations.
+        # Instrument-specific patient-balanced weighted conformal calibration.
+        # Repeated questionnaire residuals remain within patient clusters and
+        # every patient contributes total weight one. A patient-maximum score is
+        # reported as a conservative cluster-level sensitivity.
         cal = calibration_ev
         tst = ev
         if len(cal) and len(tst):
             eps = 1e-3
-            cal_scale = np.maximum(cal["ball_sd"].to_numpy(dtype=float), eps)
-            cal = cal.assign(
-                normalized_score=np.abs(cal["ball"] - cal["z_true"]) / cal_scale
-            )
-            q, conformal_patient_count = _patient_balanced_conformal_quantile(
-                cal[["id", "normalized_score"]],
-                alpha=CONFORMAL_ALPHA,
-            )
-            test_scale = np.maximum(tst["ball_sd"].to_numpy(dtype=float), eps)
-            half_width = q * test_scale
-            abs_error = np.abs(tst["ball"] - tst["z_true"]).to_numpy(dtype=float)
-            covered = pd.Series(abs_error <= half_width, index=tst.index)
-            raw_covered = pd.Series(abs_error <= 1.96 * test_scale, index=tst.index)
-            per_pt = covered.groupby(tst["id"]).mean()
-            per_pt_raw = raw_covered.groupby(tst["id"]).mean()
-            patient_all = covered.groupby(tst["id"]).all()
-            z_sd = float(np.std(tst["z_true"]))
-            calib_row = {"cadence": cad, "conformal_q": q,
-                         "coverage": float(per_pt.mean()),
-                         "measurement_coverage": float(covered.mean()),
-                         "patient_all_measurements_coverage": float(patient_all.mean()),
-                         "raw_model_coverage": float(per_pt_raw.mean()),
-                         "mean_width": float(np.mean(2.0 * half_width)),
-                         "median_width": float(np.median(2.0 * half_width)),
-                         "rel_width": float(np.mean(2.0 * half_width) / z_sd) if z_sd else float("nan"),
-                         "score_unit": "equal-patient-weight absolute residual divided by BALL predictive SD",
-                         "coverage_target": "patient-balanced marginal observable-measurement coverage",
-                         "n_calibration_patients": int(conformal_patient_count),
-                         "n_test_patients": int(tst["id"].nunique()),
-                         "n_test": int(len(tst))}
-            calib_rows.append(calib_row)
-            cad_calib_rows.append(calib_row)
-            tst_eval = tst.copy()
-            tst_eval["conformal_covered"] = covered
-            tst_eval["raw_covered"] = raw_covered
-            tst_eval["interval_width"] = 2.0 * half_width
-            tst_eval["severity_band"] = pd.cut(
-                tst_eval["z_true"],
-                bins=[-np.inf, -0.5, 0.5, np.inf],
-                labels=["lower", "middle", "higher"],
-            )
-            conditional_specs = {
-                "instrument": tst_eval["anchor"].astype(str),
-                "gap": tst_eval["gap_bin"].astype(str),
-                "cold_start": tst_eval["cold_start"].map({True: "fewer_than_2_prior_anchors", False: "2_or_more_prior_anchors"}),
-                "prior_anchor_count": tst_eval["prior_anchor_band"].astype(str),
-                "severity": tst_eval["severity_band"].astype(str),
-                "treatment_week": tst_eval["treatment_week"].astype(str),
-                "sex": tst_eval["sex"].astype(str),
-                "age": tst_eval["age_band"].astype(str),
-                "clinic": tst_eval["clinic"].astype(str),
-            }
-            for stratum_type, stratum_values in conditional_specs.items():
-                tst_eval["_stratum"] = stratum_values
-                for stratum, group in tst_eval.groupby("_stratum", sort=True):
-                    if not len(group):
-                        continue
-                    conditional_calibration_rows.append({
-                        "cadence": cad,
-                        "stratum_type": stratum_type,
-                        "stratum": str(stratum),
-                        "coverage": float(group.groupby("id")["conformal_covered"].mean().mean()),
-                        "measurement_coverage": float(group["conformal_covered"].mean()),
-                        "raw_model_coverage": float(group.groupby("id")["raw_covered"].mean().mean()),
-                        "mean_width": float(group["interval_width"].mean()),
-                        "n": int(len(group)),
-                        "n_patients": int(group["id"].nunique()),
-                    })
-            for width_threshold in (0.5, 0.75, 1.0, 1.5):
-                request = tst_eval["interval_width"].to_numpy(dtype=float) > float(width_threshold)
-                accepted = ~request
-                accepted_error = (
-                    tst_eval.loc[accepted, "ball"] - tst_eval.loc[accepted, "z_true"]
-                ) ** 2
-                accepted_patient = accepted_error.groupby(tst_eval.loc[accepted, "id"]).mean()
-                uncertainty_workload_rows.append(
-                    {
+            tst_eval_parts = []
+            for instrument, cal_instrument in cal.groupby("anchor", sort=True):
+                tst_instrument = tst[tst["anchor"].eq(instrument)].copy()
+                if cal_instrument.empty or tst_instrument.empty:
+                    continue
+                cal_scale = np.maximum(
+                    cal_instrument["ball_sd"].to_numpy(dtype=float), eps
+                )
+                cal_scores = cal_instrument.assign(
+                    normalized_score=(
+                        np.abs(cal_instrument["ball"] - cal_instrument["z_true"])
+                        / cal_scale
+                    )
+                )
+                q, conformal_patient_count = _patient_balanced_conformal_quantile(
+                    cal_scores[["id", "normalized_score"]],
+                    alpha=CONFORMAL_ALPHA,
+                )
+                cluster_q, cluster_patient_count = _patient_max_conformal_quantile(
+                    cal_scores[["id", "normalized_score"]],
+                    alpha=CONFORMAL_ALPHA,
+                )
+                half_range = float(tst_instrument["scale_half_range"].iloc[0])
+                legal_min = 0.0
+                legal_max = 2.0 * half_range
+                legal_range = legal_max - legal_min
+                calibration_native_error = (
+                    np.abs(cal_instrument["ball"] - cal_instrument["z_true"])
+                    * cal_instrument["scale_half_range"]
+                )
+                constant_scores = cal_instrument.assign(
+                    normalized_score=calibration_native_error
+                )
+                constant_half_width_native, _ = _patient_balanced_conformal_quantile(
+                    constant_scores[["id", "normalized_score"]],
+                    alpha=CONFORMAL_ALPHA,
+                )
+
+                test_scale = np.maximum(
+                    tst_instrument["ball_sd"].to_numpy(dtype=float), eps
+                )
+                point_native = tst_instrument["ball_native"].to_numpy(dtype=float)
+                truth_native = tst_instrument["raw_true"].to_numpy(dtype=float)
+                conformal_half_native = q * test_scale * half_range
+                cluster_half_native = cluster_q * test_scale * half_range
+                raw_half_native = 1.96 * test_scale * half_range
+
+                raw_lower = point_native - conformal_half_native
+                raw_upper = point_native + conformal_half_native
+                clipped_lower = np.clip(raw_lower, legal_min, legal_max)
+                clipped_upper = np.clip(raw_upper, legal_min, legal_max)
+                covered = (truth_native >= raw_lower) & (truth_native <= raw_upper)
+                clipped_covered = (
+                    (truth_native >= clipped_lower) & (truth_native <= clipped_upper)
+                )
+                raw_model_covered = (
+                    (truth_native >= point_native - raw_half_native)
+                    & (truth_native <= point_native + raw_half_native)
+                )
+                cluster_covered = (
+                    (truth_native >= point_native - cluster_half_native)
+                    & (truth_native <= point_native + cluster_half_native)
+                )
+                constant_lower = np.clip(
+                    point_native - constant_half_width_native, legal_min, legal_max
+                )
+                constant_upper = np.clip(
+                    point_native + constant_half_width_native, legal_min, legal_max
+                )
+                constant_covered = (
+                    (truth_native >= constant_lower) & (truth_native <= constant_upper)
+                )
+
+                instrument_eval = tst_instrument.copy()
+                instrument_eval["conformal_covered"] = covered
+                instrument_eval["clipped_conformal_covered"] = clipped_covered
+                instrument_eval["raw_covered"] = raw_model_covered
+                instrument_eval["cluster_max_covered"] = cluster_covered
+                instrument_eval["constant_residual_covered"] = constant_covered
+                instrument_eval["interval_lower_native_raw"] = raw_lower
+                instrument_eval["interval_upper_native_raw"] = raw_upper
+                instrument_eval["interval_lower_native_clipped"] = clipped_lower
+                instrument_eval["interval_upper_native_clipped"] = clipped_upper
+                instrument_eval["interval_width_native_raw"] = raw_upper - raw_lower
+                instrument_eval["interval_width_native_clipped"] = clipped_upper - clipped_lower
+                instrument_eval["interval_width_fraction_of_legal_range"] = (
+                    (clipped_upper - clipped_lower) / legal_range
+                )
+                instrument_eval["constant_interval_width_native_clipped"] = (
+                    constant_upper - constant_lower
+                )
+                instrument_eval["cluster_max_interval_width_native_clipped"] = (
+                    np.clip(point_native + cluster_half_native, legal_min, legal_max)
+                    - np.clip(point_native - cluster_half_native, legal_min, legal_max)
+                )
+                tst_eval_parts.append(instrument_eval)
+
+                per_patient = instrument_eval.groupby("id")["clipped_conformal_covered"].mean()
+                per_patient_raw = instrument_eval.groupby("id")["raw_covered"].mean()
+                patient_all = instrument_eval.groupby("id")["clipped_conformal_covered"].all()
+                calibration_row = {
+                    "cadence": int(cad),
+                    "instrument": str(instrument),
+                    "conformal_q": float(q),
+                    "patient_max_q": float(cluster_q),
+                    "constant_residual_half_width_native": float(constant_half_width_native),
+                    "coverage": float(per_patient.mean()),
+                    "measurement_coverage": float(instrument_eval["clipped_conformal_covered"].mean()),
+                    "unclipped_measurement_coverage": float(instrument_eval["conformal_covered"].mean()),
+                    "patient_all_measurements_coverage": float(patient_all.mean()),
+                    "raw_model_coverage": float(per_patient_raw.mean()),
+                    "patient_max_cluster_coverage": float(
+                        instrument_eval.groupby("id")["cluster_max_covered"].all().mean()
+                    ),
+                    "constant_residual_coverage": float(
+                        instrument_eval.groupby("id")["constant_residual_covered"].mean().mean()
+                    ),
+                    "mean_width_native_raw": float(instrument_eval["interval_width_native_raw"].mean()),
+                    "mean_width_native_clipped": float(instrument_eval["interval_width_native_clipped"].mean()),
+                    "median_width_native_clipped": float(instrument_eval["interval_width_native_clipped"].median()),
+                    "mean_width_fraction_of_legal_range": float(
+                        instrument_eval["interval_width_fraction_of_legal_range"].mean()
+                    ),
+                    "constant_mean_width_native_clipped": float(
+                        instrument_eval["constant_interval_width_native_clipped"].mean()
+                    ),
+                    "cluster_max_mean_width_native_clipped": float(
+                        instrument_eval["cluster_max_interval_width_native_clipped"].mean()
+                    ),
+                    "score_unit": "patient-balanced absolute residual divided by BALL predictive standard deviation",
+                    "coverage_target": "patient-balanced marginal observable-measurement coverage",
+                    "n_calibration_patients": int(conformal_patient_count),
+                    "n_cluster_score_patients": int(cluster_patient_count),
+                    "n_test_patients": int(instrument_eval["id"].nunique()),
+                    "n_test": int(len(instrument_eval)),
+                }
+                calib_rows.append(calibration_row)
+                cad_calib_rows.append(calibration_row)
+
+            if tst_eval_parts:
+                tst_eval = pd.concat(tst_eval_parts, ignore_index=False).sort_index()
+                tst_eval["severity_band"] = pd.cut(
+                    tst_eval["z_true"],
+                    bins=[-np.inf, -0.5, 0.5, np.inf],
+                    labels=["lower", "middle", "higher"],
+                )
+                conditional_specs = {
+                    "instrument": tst_eval["anchor"].astype(str),
+                    "gap": tst_eval["gap_bin"].astype(str),
+                    "cold_start": tst_eval["cold_start"].map({True: "fewer_than_2_prior_anchors", False: "2_or_more_prior_anchors"}),
+                    "prior_anchor_count": tst_eval["prior_anchor_band"].astype(str),
+                    "severity": tst_eval["severity_band"].astype(str),
+                    "treatment_week": tst_eval["treatment_week"].astype(str),
+                    "sex": tst_eval["sex"].astype(str),
+                    "age": tst_eval["age_band"].astype(str),
+                    "clinic": tst_eval["clinic"].astype(str),
+                }
+                for stratum_type, stratum_values in conditional_specs.items():
+                    tst_eval["_stratum"] = stratum_values
+                    for stratum, group in tst_eval.groupby("_stratum", sort=True):
+                        if not len(group):
+                            continue
+                        conditional_calibration_rows.append({
+                            "cadence": cad,
+                            "stratum_type": stratum_type,
+                            "stratum": str(stratum),
+                            "coverage": float(group.groupby("id")["clipped_conformal_covered"].mean().mean()),
+                            "measurement_coverage": float(group["clipped_conformal_covered"].mean()),
+                            "raw_model_coverage": float(group.groupby("id")["raw_covered"].mean().mean()),
+                            "mean_width_native_clipped": float(group["interval_width_native_clipped"].mean()),
+                            "mean_width_fraction_of_legal_range": float(group["interval_width_fraction_of_legal_range"].mean()),
+                            "n": int(len(group)),
+                            "n_patients": int(group["id"].nunique()),
+                        })
+                for width_threshold in (0.10, 0.20, 0.30, 0.40, 0.50):
+                    request = (
+                        tst_eval["interval_width_fraction_of_legal_range"].to_numpy(dtype=float)
+                        > float(width_threshold)
+                    )
+                    accepted = ~request
+                    accepted_error = _development_scaled_squared_error(
+                        tst_eval.loc[accepted], "ball"
+                    )
+                    accepted_patient = accepted_error.groupby(
+                        tst_eval.loc[accepted, "id"]
+                    ).mean()
+                    uncertainty_workload_rows.append({
                         "cadence": int(cad),
-                        "interval_width_threshold": float(width_threshold),
+                        "interval_width_fraction_threshold": float(width_threshold),
                         "additional_measurement_fraction": float(np.mean(request)),
                         "predictions_retained_fraction": float(np.mean(accepted)),
-                        "rmse_when_prediction_retained": (
+                        "rmse_when_prediction_retained_development_sd_units": (
                             float(np.sqrt(accepted_patient.mean())) if len(accepted_patient) else float("nan")
                         ),
                         "coverage_when_prediction_retained": (
-                            float(tst_eval.loc[accepted].groupby("id")["conformal_covered"].mean().mean())
+                            float(tst_eval.loc[accepted].groupby("id")["clipped_conformal_covered"].mean().mean())
                             if accepted.any() else float("nan")
                         ),
                         "n_retained": int(accepted.sum()),
                         "n_requested": int(request.sum()),
                         "n_patients": int(tst_eval["id"].nunique()),
-                    }
+                    })
+                prediction_export = ev_all.copy()
+                interval_columns = [
+                    column for column in tst_eval.columns
+                    if column not in prediction_export.columns or column.startswith("interval_")
+                    or column.endswith("_covered")
+                ]
+                prediction_export = prediction_export.join(
+                    tst_eval[interval_columns], how="left"
                 )
+                prediction_export.insert(0, "cadence", int(cad))
+                prediction_row_frames.append(prediction_export)
         print(
             f"cadence {cad}d: {len(ev)} final held-out evaluations across "
             f"{ev['id'].nunique()} patients after {calibration_ev['id'].nunique()} calibration patients",
@@ -13467,7 +15013,7 @@ def main() -> None:
         import gc as _gc
         import torch as _torch
         del student_result, teacher_result, direct_causal_result, no_dense_ehr_result, ball_anchor_only_result
-        del s0_pred, markov_pred, gp_causal_pred, ode_rnn_result
+        del s0_pred, markov_pred, gp_causal_pred, ode_rnn_result, focused_14d_results
         del neural_predictions, session_days, ev_all, calibration_ev
         _gc.collect()
         if _torch.cuda.is_available():
@@ -13482,7 +15028,7 @@ def main() -> None:
             sessions_full,
             sessions,
             comorbidity_sessions,
-            _standardizers(anchors_14),
+            measurement_calibration,
             args,
         )
 
@@ -13494,6 +15040,17 @@ def main() -> None:
                 flush=True,
             )
     final_output_dir = OUT if args.publish_top_level else run_dir
+    if transition_frames:
+        transition_audit = pd.concat(transition_frames, ignore_index=True)
+        transition_ids = set(transition_audit["id"].astype(int))
+        if not transition_ids.issubset(primary_heldout_ids):
+            raise AssertionError(
+                "The empirical RDoC transition analysis contains a patient outside the six held-out clinics."
+            )
+        if len(transition_ids) > 345:
+            raise AssertionError(
+                "The empirical RDoC transition analysis exceeds the 345 patients available in the six held-out clinics."
+            )
     overall, strata, calib, boot, transitions, transition_summary, transition_coef = _write_fit_tables(
         final_output_dir, all_overall, all_strata, calib_rows, boot_rows, transition_frames
     )
@@ -13571,6 +15128,12 @@ def main() -> None:
     leakage_audit.to_csv(run_dir / "empirical_leakage_audit_complete.csv", index=False)
     cohort_characteristics.to_csv(final_output_dir / "empirical_cohort_characteristics.csv", index=False)
     cohort_characteristics.to_csv(run_dir / "empirical_cohort_characteristics_complete.csv", index=False)
+    hyperparameter_selection.to_csv(
+        final_output_dir / "empirical_hyperparameter_selection.csv", index=False
+    )
+    hyperparameter_selection.to_csv(
+        run_dir / "empirical_hyperparameter_selection_complete.csv", index=False
+    )
     _write_fit_tables(run_dir, all_overall, all_strata, calib_rows, boot_rows, transition_frames, suffix="_complete")
     _write_fit_run_manifest(
         run_dir,
@@ -13622,11 +15185,21 @@ FIGOUT.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({"font.family": "serif", "font.size": 9, "savefig.dpi": 200})
 
-METHODS = ["ball", "markov", "interpolation", "locf", "anchor_only"]
-LABELS = {"ball": "BALL", "markov": "Markov", "interpolation": "interpolation",
-          "locf": "LOCF", "anchor_only": "anchor-only"}
-COLORS = {"ball": "#37b", "markov": "#a05", "interpolation": "#e73",
-          "locf": "#999", "anchor_only": "#3b7"}
+METHODS = ["ball", "ball_direct_causal", "gp_causal_filter", "exponential_decay_gru", "locf"]
+LABELS = {
+    "ball": "BALL",
+    "ball_direct_causal": "direct causal transformer",
+    "gp_causal_filter": "causal Gaussian process",
+    "exponential_decay_gru": "exponential-decay GRU",
+    "locf": "last observation carried forward",
+}
+COLORS = {
+    "ball": "#3377bb",
+    "ball_direct_causal": "#8844aa",
+    "gp_causal_filter": "#22aa77",
+    "exponential_decay_gru": "#dd9900",
+    "locf": "#777777",
+}
 
 
 def main() -> None:
@@ -13655,7 +15228,7 @@ def main() -> None:
     cad = max(cads)
     sub = strata[strata.cadence == cad]
     gaps = [g for g in ["0-1", "1-2", "2-4", "4-7", "7+"] if g in set(sub["gap_bin"])]
-    for m in ["ball", "markov", "interpolation", "anchor_only"]:
+    for m in METHODS:
         vals = [sub[(sub.gap_bin == g) & (sub.method == m)]["rmse"].iloc[0]
                 if len(sub[(sub.gap_bin == g) & (sub.method == m)]) else np.nan for g in gaps]
         ax.plot(range(len(gaps)), vals, "o-", label=LABELS[m], color=COLORS[m])
@@ -13666,13 +15239,17 @@ def main() -> None:
 
     # Panel C. BALL conformal calibration by cadence.
     ax = axes[2]
-    ax.plot(calib["cadence"], calib["coverage"], "o-", color="#37b", label="coverage")
+    calibration_summary = calib.groupby("cadence", as_index=False).agg(
+        coverage=("coverage", "mean"),
+        width_fraction=("mean_width_fraction_of_legal_range", "mean"),
+    )
+    ax.plot(calibration_summary["cadence"], calibration_summary["coverage"], "o-", color="#37b", label="coverage")
     ax.axhline(0.95, ls="--", c="k", lw=0.8)
     ax.set_ylim(0.85, 1.0); ax.set_xlabel("Anchor cadence (days)"); ax.set_ylabel("Coverage")
     ax2 = ax.twinx()
-    ax2.plot(calib["cadence"], calib["rel_width"], "s--", color="#e73", label="rel width")
-    ax2.set_ylabel("Relative width (latent SD)")
-    ax.set_title("C. Anchor-conformal calibration")
+    ax2.plot(calibration_summary["cadence"], calibration_summary["width_fraction"], "s--", color="#e73", label="width")
+    ax2.set_ylabel("Clipped width / legal score range")
+    ax.set_title("C. Patient-balanced calibration")
 
     fig.tight_layout()
     fig.savefig(FIGOUT / "figureS5_empirical.png", bbox_inches="tight")

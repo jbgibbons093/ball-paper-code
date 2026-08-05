@@ -20,6 +20,7 @@ $primary = Join-Path $taskRoot 'validation\outputs\direct_rdoc_gaussian_publicat
 $irt = Join-Path $taskRoot 'validation\outputs\direct_rdoc_irt_publication_20260805_matched_heldout_v3'
 $adaptive = Join-Path $taskRoot 'validation\outputs\direct_rdoc_adaptive_publication_20260805_matched_heldout_v3'
 $controls = Join-Path $taskRoot 'validation\outputs\direct_rdoc_negative_controls_publication_20260805_matched_heldout_v3'
+$parameterSensitivity = Join-Path $taskRoot 'validation\outputs\focused_parameter_sensitivities_publication_20260805_v1'
 
 function Assert-SimulationOutput {
     param(
@@ -68,10 +69,16 @@ function Invoke-PythonStep {
 }
 
 Set-Location -LiteralPath $taskRoot
-Assert-SimulationOutput -Directory $primary -ExpectedRows 700 -ExpectedMethods 7
-Assert-SimulationOutput -Directory $irt -ExpectedRows 700 -ExpectedMethods 7
-Assert-SimulationOutput -Directory $adaptive -ExpectedRows 500 -ExpectedMethods 5
+Assert-SimulationOutput -Directory $primary -ExpectedRows 1100 -ExpectedMethods 11
+Assert-SimulationOutput -Directory $irt -ExpectedRows 1100 -ExpectedMethods 11
+Assert-SimulationOutput -Directory $adaptive -ExpectedRows 900 -ExpectedMethods 9
 Assert-SimulationOutput -Directory $controls -ExpectedRows 200 -ExpectedMethods 5
+foreach ($name in @('persistence_per_run.csv', 'persistence_development_selected.csv', 'anchor_weight_per_run.csv', 'manifest.json')) {
+    $path = Join-Path $parameterSensitivity $name
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        throw "Focused parameter sensitivity output is incomplete: $path"
+    }
+}
 
 if (-not (Test-Path -LiteralPath $comorbidityFeatures -PathType Leaf)) {
     throw "Protected comorbidity feature file is absent: $comorbidityFeatures"
@@ -100,6 +107,8 @@ $empiricalArgs = @(
     '--ode-hidden', '96',
     '--ode-epochs', '120',
     '--ode-members', '5',
+    '--selection-epochs', '120',
+    '--selection-members', '1',
     '--device', 'cuda',
     '--comorbidity-features', $comorbidityFeatures,
     '--direct-causal-ablation',
@@ -109,6 +118,10 @@ $empiricalArgs = @(
     '--ode-rnn-benchmark',
     '--generalization-sensitivity',
     '--rdoc-transition-analysis',
+    '--select-core-hyperparameters',
+    '--distillation-decomposition',
+    '--compute-matched-direct',
+    '--session-balanced-anchors',
     '--no-publish-top-level'
 )
 Invoke-PythonStep -Name 'Empirical benchmark and ablation suite' -Arguments $empiricalArgs -Stdout (Join-Path $protectedRun 'empirical_stdout.log') -Stderr (Join-Path $protectedRun 'empirical_stderr.log')

@@ -1081,9 +1081,6 @@ def _ode_rnn_tensors(data, ids: list[int], device: torch.device):
         action = causal_encoder_action_array(ci) + 1
         action = np.clip(action, 0, n_actions - 1)
         action_onehot = np.eye(n_actions, dtype=np.float32)[action]
-        recent, burden = observed_treatment_history_arrays(
-            ci.reset_index(), di.reset_index(), data.config
-        )
         ain = np.zeros((t_count, 2), dtype=np.float32)
         aflag = np.zeros((t_count, 2), dtype=np.float32)
         for anchor in anchors_by.get(int(pid), pd.DataFrame()).itertuples(index=False):
@@ -1138,8 +1135,6 @@ def _ode_rnn_tensors(data, ids: list[int], device: torch.device):
                     masks.to_numpy(dtype=np.float32),
                     b_imputed,
                     action_onehot,
-                    recent[:, None].astype(np.float32),
-                    burden[:, None].astype(np.float32),
                     ain,
                     aflag,
                 ],

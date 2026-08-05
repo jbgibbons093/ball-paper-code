@@ -111,6 +111,45 @@ def test_ode_rnn_uses_previous_gap_and_causal_treatment_context() -> None:
         comp_i["encoder_a"].to_numpy(dtype=int),
     )
     assert x.shape[1] == len(ordered_index)
+    expected_feature_count = (
+        2 * int(data.config.p_daily)
+        + int(data.config.q)
+        + int(data.config.n_treatment_types) + 1
+        + 2  # lagged questionnaire values
+        + 2  # lagged questionnaire availability indicators
+    )
+    assert x.shape[2] == expected_feature_count
+
+
+def test_ode_rnn_inputs_ignore_withheld_targets_and_stored_latent_truth() -> None:
+    data = make_data(_args(), 1729, 0.25, "linear")
+    ids = sorted(data.individuals["id"].astype(int).tolist())
+    original, original_gaps, original_rows, _, _ = _ode_rnn_tensors(
+        data, ids, torch.device("cpu")
+    )
+
+    altered_anchors = data.anchors.copy(deep=True)
+    withheld = altered_anchors["measurement_eval"].astype(bool)
+    altered_anchors.loc[withheld, "value"] = (
+        altered_anchors.loc[withheld, "value"].astype(float) + 10_000.0
+    )
+    altered_components = data.components.copy(deep=True)
+    for column in ("z_d", "z_p", "L", "S_joint", "delta", "delta_d", "delta_p"):
+        if column in altered_components:
+            altered_components[column] = altered_components[column].astype(float) + 10_000.0
+    altered_data = dataclasses.replace(
+        data,
+        anchors=altered_anchors,
+        components=altered_components,
+    )
+    altered, altered_gaps, altered_rows, _, _ = _ode_rnn_tensors(
+        altered_data, ids, torch.device("cpu")
+    )
+
+    assert int(withheld.sum()) > 0
+    assert torch.equal(original, altered)
+    assert torch.equal(original_gaps, altered_gaps)
+    assert len(original_rows) == len(altered_rows)
 
 
 def test_gp_filter_excludes_future_questionnaires() -> None:

@@ -76,8 +76,8 @@ class ClinicExclusivePartitionTests(unittest.TestCase):
             [
                 {"id": 1, "split": "train", "date": "2024-01-01"},
                 {"id": 1, "split": "train", "date": "2024-12-31"},
-                {"id": 2, "split": "test", "date": "2025-01-01"},
-                {"id": 2, "split": "test", "date": "2025-02-01"},
+                {"id": 2, "split": "val", "date": "2025-01-01"},
+                {"id": 2, "split": "val", "date": "2025-02-01"},
                 {"id": 3, "split": "train", "date": "2024-12-15"},
                 {"id": 3, "split": "train", "date": "2025-01-15"},
             ]

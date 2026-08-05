@@ -9,7 +9,7 @@ table, and figure code for the manuscript.
 
 ## Layout
 
-`BALL.py` is the canonical single-file codebase. It holds 37 modules and package stubs as embedded
+`BALL.py` is the canonical single-file codebase. It holds the modules and package stubs as embedded
 source blocks and installs them at import time as a virtual `simulations.*` and
 `empirical.*` package, so the file is self-contained and needs no accompanying
 package directory. It covers the data-generating process, the anchor and
@@ -18,8 +18,8 @@ the simulation runners, and the empirical pipeline.
 
 The method implementations inside `BALL.py` include the BALL teacher and causal
 student, a forward-only transformer trained directly on the measurements, a
-causal Gaussian-process filter, a causal ordinary differential equation recurrent
-neural network, linear-Gaussian and Markov statistical comparators, and the
+causal Gaussian-process filter, an exponential-decay gated recurrent unit,
+linear-Gaussian and Markov statistical comparators, and the
 questionnaire-history baselines.
 
 `simulations/config/` holds the simulation parameters. `default.yml` defines the
@@ -71,7 +71,7 @@ The analyses ran on Python 3.13. The code contains no syntax newer than Python
 python BALL.py
 ```
 
-That prints 19 commands. The simulation entry point is `pipeline`, the
+That prints the available commands. The simulation entry point is `pipeline`, the
 replicate-parallel runner is `pilot-batch`, and the empirical pipeline runs
 through the `empirical-*` commands. The `paper-*` commands regenerate the
 manuscript tables and figures from completed runs.
@@ -82,8 +82,8 @@ The `validation/` scripts run directly, for example:
 python validation/direct_rdoc_benchmark.py --help
 ```
 
-The empirical commands and the empirical validation scripts require the data
-inputs described above, so they will not run against a fresh clone.
+The empirical commands and empirical validation scripts require locally supplied
+inputs, so they will not run against a fresh clone.
 
 The empirical comorbidity builder is `empirical-build-comorbidities`. It reads
 the protected SAS extracts and writes a numeric session-level feature table to

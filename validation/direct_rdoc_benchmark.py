@@ -9,7 +9,7 @@ estimand. For each generated dataset, it fits:
   - Direct LGSSM: explicit classical linear-Gaussian transition beta.
   - Markov direct transition: explicit beta plus observed-pattern Markov terms.
   - Causal Gaussian-process estimator with two time scales.
-  - Causal ODE-RNN: neural evolution over elapsed time.
+  - Causal exponential-decay GRU: learned decay over elapsed time.
 
 All methods see the same observed anchors, daily covariates, treatments, and
 observed/noisy RDoC proxy B. Every trajectory estimator is scored against the
@@ -44,6 +44,7 @@ from direct_rdoc_fair_comparator import (  # noqa: E402
     causal_encoder_action_array,
     fit_daily_readout,
     fit_direct_map,
+    fit_two_channel_direct_map,
     init_irt_state,
     irt_anchor_pseudo_observation,
     irt_holdout_metrics,
@@ -58,6 +59,7 @@ _ssm = sys.modules["simulations.src.methods.ball_ssm"]
 SSMConfig = _ssm.SSMConfig
 fit_ball_ssm = _ssm.fit_ball_ssm
 fit_ball_ssm_direct_causal = _ssm.fit_ball_ssm_direct_causal
+fit_ball_ssm_distillation_decomposition = _ssm.fit_ball_ssm_distillation_decomposition
 _anchors = sys.modules["simulations.src.anchors"]
 generate_anchors = _anchors.generate_anchors
 
@@ -70,8 +72,12 @@ METRICS = [
     "beta_hat_norm",
     "beta_hat_norm_trait",
     "latent_rmse",
+    "depression_latent_rmse",
+    "anxiety_latent_rmse",
     "latent_rmse_trait",
     "val_anchor_rmse",
+    "y1_measurement_rmse",
+    "y2_measurement_rmse",
     "irt_item_nll",
     "irt_expected_total_rmse",
     "elapsed_seconds",
@@ -85,16 +91,25 @@ REQUIRED_METHODS = {
     "ball_teacher_smoother",
     "ball_student_causal",
     "ball_direct_causal",
+    "ball_direct_causal_compute_matched",
+    "ball_inherited_dynamics_only",
+    "ball_teacher_matching_only",
+    "ball_full_decomposition",
+    "ball_student_transition_only",
+    "ball_student_transition_only_strict",
     "gp_causal_filter",
-    "ode_rnn_causal",
+    "exponential_decay_gru",
 }
 
 COMPARATOR_LABELS = {
     "ball_direct_causal": "direct",
+    "ball_direct_causal_compute_matched": "direct_compute_matched",
+    "ball_inherited_dynamics_only": "inherited_dynamics",
+    "ball_teacher_matching_only": "teacher_matching",
     "s0_direct_lgssm": "s0",
     "markov_direct_transition": "markov",
     "gp_causal_filter": "gp_causal",
-    "ode_rnn_causal": "ode_rnn",
+    "exponential_decay_gru": "decay_gru",
 }
 
 
@@ -310,7 +325,12 @@ def _apply_measurement_evaluation_mask(data):
     return dataclasses.replace(data, anchors=anchors, metadata=metadata)
 
 
-def _measurement_anchor_rmse(data, preds: pd.DataFrame) -> float:
+def _measurement_anchor_rmse(
+    data,
+    preds: pd.DataFrame,
+    *,
+    anchor_name: str | None = None,
+) -> float:
     """RMSE for questionnaire anchors hidden from every fitted estimator."""
 
     if "measurement_eval" not in data.anchors.columns:
@@ -328,6 +348,8 @@ def _measurement_anchor_rmse(data, preds: pd.DataFrame) -> float:
     }
     residuals: list[float] = []
     for row in data.anchors.loc[data.anchors["measurement_eval"].astype(bool)].itertuples(index=False):
+        if anchor_name is not None and str(getattr(row, "anchor")) != str(anchor_name):
+            continue
         value = float(getattr(row, "value", np.nan))
         loading = float(getattr(row, "loading", np.nan))
         if not np.isfinite(value) or not np.isfinite(loading):
@@ -344,6 +366,22 @@ def _measurement_anchor_rmse(data, preds: pd.DataFrame) -> float:
             continue
         residuals.append(value - loading * float(window.mean()))
     return float(np.sqrt(np.mean(np.square(residuals)))) if residuals else float("nan")
+
+
+def _channel_latent_rmse(data, preds: pd.DataFrame, prediction: str, truth: str) -> float:
+    test_ids = set(
+        data.individuals.loc[data.individuals["split"].eq(H.EVAL_SPLIT), "id"].astype(int)
+    )
+    merged = preds.loc[preds["id"].astype(int).isin(test_ids), ["id", "t", prediction]].merge(
+        data.components[["id", "t", truth]],
+        on=["id", "t"],
+        how="inner",
+        validate="many_to_one",
+    )
+    if merged.empty:
+        return float("nan")
+    patient_error = ((merged[prediction] - merged[truth]) ** 2).groupby(merged["id"]).mean()
+    return float(np.sqrt(patient_error.mean()))
 
 
 def make_data(args, seed: int, share: float, cell: str):
@@ -373,6 +411,7 @@ def ball_config(args, seed: int) -> "SSMConfig":
         rdoc_drift_adaptive_gamma=getattr(args, "rdoc_drift_adaptive_gamma", 1.0),
         rdoc_drift_adaptive_eps=getattr(args, "rdoc_drift_adaptive_eps", 1e-3),
         delta_phi=args.delta_phi,
+        anchor_weight=args.anchor_weight,
         max_individuals=args.n,
         rdoc_drift_head=True,
         use_alpha_slow=False,
@@ -385,6 +424,12 @@ def score(data, preds: pd.DataFrame, beta_hat: np.ndarray, *, method: str, cell:
     active_k = int(data.metadata.get("rdoc_drift_active_dims", args.rdoc_active_dims))
     irt = str(getattr(data.config, "anchor_observation", "gaussian")).lower() == "irt"
     latent_raw = H.latent_rmse(preds, data.components, data.individuals, H.EVAL_SPLIT)
+    depression_latent_rmse = _channel_latent_rmse(
+        data, preds, "z_d_hat", "z_d"
+    )
+    anxiety_latent_rmse = _channel_latent_rmse(
+        data, preds, "z_p_hat", "z_p"
+    )
     if irt:
         # Held-out fit goes through the calibrated link; latent RMSE and beta magnitude
         # are also reported on the declared trait scale (trait = (latent - loc) / scale,
@@ -397,6 +442,12 @@ def score(data, preds: pd.DataFrame, beta_hat: np.ndarray, *, method: str, cell:
     else:
         item_nll = etot_rmse = latent_trait = beta_norm_trait = float("nan")
         val_anchor = _measurement_anchor_rmse(data, preds)
+    y1_measurement_rmse = (
+        float("nan") if irt else _measurement_anchor_rmse(data, preds, anchor_name="Y1")
+    )
+    y2_measurement_rmse = (
+        float("nan") if irt else _measurement_anchor_rmse(data, preds, anchor_name="Y2")
+    )
     return {
         "share": float(share),
         "cell": cell,
@@ -405,8 +456,12 @@ def score(data, preds: pd.DataFrame, beta_hat: np.ndarray, *, method: str, cell:
         "n": int(args.n),
         "t": int(args.t),
         "latent_rmse": latent_raw,
+        "depression_latent_rmse": depression_latent_rmse,
+        "anxiety_latent_rmse": anxiety_latent_rmse,
         "latent_rmse_trait": latent_trait,
         "val_anchor_rmse": val_anchor,
+        "y1_measurement_rmse": y1_measurement_rmse,
+        "y2_measurement_rmse": y2_measurement_rmse,
         "irt_item_nll": item_nll,
         "irt_expected_total_rmse": etot_rmse,
         "beta_hat_norm_trait": beta_norm_trait,
@@ -581,74 +636,17 @@ def solve_markov_person(
 
 
 def fit_markov_direct(data, args, *, basis: str) -> tuple[pd.DataFrame, np.ndarray, int]:
-    """Fit a direct-RDoC Markov/pattern comparator with native beta recovery."""
+    """Fit two channel-specific pattern-mixture trajectories with one shared beta."""
 
-    train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
-    ids = sorted(data.individuals["id"].astype(int).tolist())
-    daily_readout = fit_daily_readout(data, train_ids, ridge=args.daily_ridge)
-    init_args = argparse.Namespace(**vars(args))
-    init_args.s0_basis = basis
-    init_preds, base_theta = fit_direct_map(data, init_args)
-    n_base = int(len(base_theta))
-    n_strata = max(1, int(args.markov_strata))
-    strata = _anchor_pattern_strata(data, n_strata)
-    theta = np.zeros(n_base + 2 * n_strata, dtype=float)
-    theta[:n_base] = base_theta
-    pred_by_pid = {int(pid): frame.sort_values("t").reset_index(drop=True) for pid, frame in init_preds.groupby("id", sort=True)}
-    irt_state = init_irt_state(data, args)
-
-    for _ in range(max(1, int(args.markov_iters))):
-        x_rows, y_rows = [], []
-        for pid in ids:
-            if pid not in train_ids or pid not in pred_by_pid:
-                continue
-            comp_i, _, b, _, _, _, action, recent, burden = person_arrays(data, pid, daily_readout)
-            subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
-            base_feats = transition_features(
-                b,
-                action,
-                recent,
-                burden,
-                data.config.n_treatment_types,
-                basis=basis,
-                subtype=subtype,
-                n_subtypes=data.config.n_subtypes,
-            )
-            l_hat = pred_by_pid[pid]["L_hat"].to_numpy(dtype=float)
-            gaps = (
-                pd.to_numeric(comp_i["dt"], errors="coerce").fillna(1.0).clip(lower=0.0).to_numpy(dtype=float)
-                if "dt" in comp_i.columns
-                else np.ones(len(comp_i), dtype=float)
-            )
-            x, y = _markov_design(base_feats, l_hat, gaps, strata[pid], n_strata)
-            if len(y):
-                x_rows.append(x)
-                y_rows.append(y)
-        if not x_rows:
-            break
-        x = np.vstack(x_rows)
-        y = np.concatenate(y_rows)
-        penalty = float(args.markov_ridge) * np.eye(theta.size)
-        penalty[0, 0] = 0.0
-        theta = np.linalg.solve(x.T @ x + penalty, x.T @ y)
-        theta[n_base + n_strata :] = np.clip(theta[n_base + n_strata :], -0.95, 0.05)
-        pred_by_pid = {
-            pid: solve_markov_person(
-                data,
-                pid,
-                theta,
-                daily_readout,
-                args,
-                basis=basis,
-                stratum=strata[pid],
-                n_strata=n_strata,
-                irt_state=irt_state,
-            )
-            for pid in ids
-        }
-
-    preds = pd.concat([pred_by_pid[pid] for pid in ids], ignore_index=True)
-    return preds, theta, n_base
+    markov_args = argparse.Namespace(**vars(args))
+    markov_args.s0_basis = basis
+    markov_args.iters = max(int(args.iters), int(args.markov_iters))
+    predictions, theta = fit_two_channel_direct_map(
+        data,
+        markov_args,
+        pattern_mixture=True,
+    )
+    return predictions, theta, int(len(theta))
 
 
 def run_s0(data, args, cell: str, seed: int, share: float) -> dict:
@@ -683,12 +681,19 @@ def run_markov(data, args, cell: str, seed: int, share: float) -> dict:
     )
 
 
-def _sum_kernel(times: np.ndarray, variance: float) -> np.ndarray:
-    """Prespecified slow-RBF plus fast-Ornstein-Uhlenbeck covariance."""
+def _sum_kernel(
+    times: np.ndarray,
+    variance: float,
+    *,
+    slow_length: float = 28.0,
+    fast_length: float = 3.0,
+    slow_weight: float = 0.70,
+) -> np.ndarray:
+    """Slow radial-basis plus fast exponential covariance for one channel."""
 
     distance = np.abs(times[:, None] - times[None, :])
-    slow = 0.70 * variance * np.exp(-0.5 * np.square(distance / 28.0))
-    fast = 0.30 * variance * np.exp(-distance / 3.0)
+    slow = slow_weight * variance * np.exp(-0.5 * np.square(distance / slow_length))
+    fast = (1.0 - slow_weight) * variance * np.exp(-distance / fast_length)
     return slow + fast + 1e-6 * np.eye(len(times))
 
 
@@ -758,120 +763,236 @@ def _gp_conditioned_mean(
     return float(prior_mean[int(prediction_index)] + cross_covariance @ weights)
 
 
+def _gp_elapsed_times(comp_i: pd.DataFrame) -> np.ndarray:
+    """Convert the stored next-session gaps into elapsed calendar time."""
+
+    count = len(comp_i)
+    elapsed = np.zeros(count, dtype=float)
+    if count > 1:
+        next_gap = pd.to_numeric(
+            comp_i.get("dt", pd.Series(1.0, index=comp_i.index)), errors="coerce"
+        ).fillna(1.0).clip(lower=0.0).to_numpy(dtype=float)
+        elapsed[1:] = np.cumsum(next_gap[:-1])
+    return elapsed
+
+
+def _select_gp_time_lengths(
+    data,
+    train_ids: set[int],
+    anchor_name: str,
+    daily_readout,
+    auxiliary_center: np.ndarray,
+    auxiliary_scale: np.ndarray,
+    variance: float,
+) -> tuple[float, float]:
+    """Select channel-specific time kernels from training patients only."""
+
+    use_irt = str(getattr(data.config, "anchor_observation", "gaussian")).lower() == "irt"
+    best = (28.0, 3.0)
+    best_score = float("inf")
+    for slow_length in (14.0, 28.0, 56.0):
+        for fast_length in (1.0, 3.0, 7.0):
+            score = 0.0
+            event_count = 0
+            for pid in sorted(train_ids):
+                comp_i, anchors_i, b, daily_pred, _, _, _, recent, burden = person_arrays(
+                    data, pid, daily_readout, anchor_name=anchor_name
+                )
+                times = _gp_elapsed_times(comp_i)
+                count = len(times)
+                action = causal_encoder_action_array(comp_i)
+                auxiliary = _gp_auxiliary_design(
+                    b, action, recent, burden, int(data.config.n_treatment_types)
+                )
+                auxiliary = (auxiliary - auxiliary_center) / auxiliary_scale
+                distance = np.square(
+                    auxiliary[:, None, :] - auxiliary[None, :, :]
+                ).mean(axis=2)
+                kernel = _sum_kernel(
+                    times,
+                    0.85 * variance,
+                    slow_length=slow_length,
+                    fast_length=fast_length,
+                )
+                kernel += 0.15 * variance * np.exp(-0.5 * distance)
+                design_rows, targets, noise = [], [], []
+                for row in anchors_i.itertuples(index=False):
+                    if not bool(getattr(row, "observed", False)):
+                        continue
+                    start = max(0, int(getattr(row, "window_start")))
+                    end = min(count - 1, int(getattr(row, "window_end")))
+                    if end < start:
+                        continue
+                    h = np.zeros(count, dtype=float)
+                    if use_irt:
+                        summary = irt_anchor_pseudo_observation(row, data)
+                        if summary is None:
+                            continue
+                        target, anchor_sd = summary
+                        h[start : end + 1] = 1.0 / (end - start + 1)
+                    else:
+                        target = float(getattr(row, "value", np.nan))
+                        loading = float(getattr(row, "loading", np.nan))
+                        if not np.isfinite(target) or not np.isfinite(loading):
+                            continue
+                        h[start : end + 1] = loading / (end - start + 1)
+                        spec = data.config.y1 if anchor_name == "Y1" else data.config.y2
+                        serial_rho = data.config.rho_serial_y1 if anchor_name == "Y1" else data.config.rho_serial_y2
+                        anchor_sd = marginal_anchor_sd(spec, serial_rho)
+                    design_rows.append(h)
+                    targets.append(float(target))
+                    noise.append(float(anchor_sd) ** 2)
+                if not design_rows:
+                    continue
+                design = np.vstack(design_rows)
+                residual = np.asarray(targets) - design @ np.asarray(daily_pred, dtype=float)
+                covariance = design @ kernel @ design.T + np.diag(noise)
+                try:
+                    factor = cho_factor(covariance, lower=True, check_finite=False)
+                    quadratic = float(residual @ cho_solve(factor, residual, check_finite=False))
+                    logdet = 2.0 * float(np.log(np.diag(factor[0])).sum())
+                except np.linalg.LinAlgError:
+                    continue
+                score += 0.5 * (quadratic + logdet + len(residual) * np.log(2.0 * np.pi))
+                event_count += len(residual)
+            if event_count and score / event_count < best_score:
+                best_score = score / event_count
+                best = (slow_length, fast_length)
+    return best
+
+
 def fit_gp_causal_filter(data, args) -> pd.DataFrame:
-    """Fit a Gaussian-process filter using information available at each time."""
+    """Fit separate causal Gaussian-process filters for depression and anxiety."""
 
     train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
-    daily_readout = fit_daily_readout(data, train_ids, ridge=args.daily_ridge)
+    daily_readouts = {
+        anchor_name: fit_daily_readout(
+            data,
+            train_ids,
+            ridge=args.daily_ridge,
+            anchor_name=anchor_name,
+        )
+        for anchor_name in ("Y1", "Y2")
+    }
     auxiliary_center, auxiliary_scale = _fit_gp_auxiliary_scaler(
-        data, train_ids, daily_readout
+        data, train_ids, daily_readouts["Y1"]
     )
-    train_anchors = data.anchors.loc[
-        data.anchors["observed"].astype(bool) & data.anchors["id"].astype(int).isin(train_ids)
-    ].copy()
     use_irt = str(getattr(data.config, "anchor_observation", "gaussian")).lower() == "irt"
-    if use_irt:
-        anchor_scale_values = []
-        for row in train_anchors.itertuples(index=False):
-            summary = irt_anchor_pseudo_observation(row, data)
-            if summary is not None:
-                anchor_scale_values.append(summary[0])
-        variance_source = np.asarray(anchor_scale_values, dtype=float)
-    else:
-        scaled = pd.to_numeric(train_anchors["value"], errors="coerce") / pd.to_numeric(
-            train_anchors["loading"], errors="coerce"
-        ).replace(0.0, np.nan)
-        variance_source = scaled.to_numpy(dtype=float)
-    finite_variance_source = variance_source[np.isfinite(variance_source)]
-    variance = max(float(np.var(finite_variance_source)) if len(finite_variance_source) else 0.25, 0.25)
-
-    predictions = []
-    for pid in sorted(data.individuals["id"].astype(int).tolist()):
-        comp_i, anchors_i, b, daily_pred, _, _, _, recent, burden = person_arrays(
-            data, pid, daily_readout
-        )
-        action = causal_encoder_action_array(comp_i)
-        times = comp_i["t"].to_numpy(dtype=float)
-        t_count = len(times)
-        auxiliary = _gp_auxiliary_design(
-            b,
-            action,
-            recent,
-            burden,
-            int(data.config.n_treatment_types),
-        )
-        auxiliary = (auxiliary - auxiliary_center) / auxiliary_scale
-        auxiliary_distance = np.square(
-            auxiliary[:, None, :] - auxiliary[None, :, :]
-        ).mean(axis=2)
-        kernel = _sum_kernel(times, 0.85 * variance)
-        kernel += 0.15 * variance * np.exp(-0.5 * auxiliary_distance)
-        design_rows: list[np.ndarray] = []
-        targets: list[float] = []
-        noise_var: list[float] = []
-        availability_times: list[int] = []
-
-        for row in anchors_i.itertuples(index=False):
-            if not bool(getattr(row, "observed", False)):
-                continue
-            start = max(0, int(getattr(row, "window_start")))
-            end = min(t_count - 1, int(getattr(row, "window_end")))
-            if end < start:
-                continue
-            h = np.zeros(t_count, dtype=float)
-            if use_irt:
-                summary = irt_anchor_pseudo_observation(row, data)
-                if summary is None:
-                    continue
-                target, anchor_sd = summary
-                h[start : end + 1] = 1.0 / (end - start + 1)
-            else:
-                value = float(getattr(row, "value", np.nan))
-                loading = float(getattr(row, "loading", np.nan))
-                if not np.isfinite(value) or not np.isfinite(loading):
-                    continue
-                target = value
-                h[start : end + 1] = loading / (end - start + 1)
-                spec = data.config.y1 if getattr(row, "anchor") == "Y1" else data.config.y2
-                rho = data.config.rho_serial_y1 if getattr(row, "anchor") == "Y1" else data.config.rho_serial_y2
-                anchor_sd = marginal_anchor_sd(spec, rho)
-            design_rows.append(h)
-            targets.append(float(target))
-            noise_var.append(float(anchor_sd) ** 2)
-            availability_times.append(int(getattr(row, "t", end)))
-
-        if design_rows:
-            hmat = np.vstack(design_rows)
-            y = np.asarray(targets, dtype=float)
-            noise = np.asarray(noise_var, dtype=float)
-            available = np.asarray(availability_times, dtype=int)
-            mean = np.asarray(daily_pred, dtype=float).copy()
-            for index, current_time in enumerate(times):
-                observed = available <= int(current_time)
-                if not np.any(observed):
-                    continue
-                mean[index] = _gp_conditioned_mean(
-                    np.asarray(daily_pred, dtype=float),
-                    kernel,
-                    hmat[observed],
-                    y[observed],
-                    noise[observed],
-                    prediction_index=index,
-                )
+    channel_frames = []
+    for anchor_name, output_column in (("Y1", "z_d_hat"), ("Y2", "z_p_hat")):
+        train_anchors = data.anchors.loc[
+            data.anchors["observed"].astype(bool)
+            & data.anchors["id"].astype(int).isin(train_ids)
+            & data.anchors["anchor"].astype(str).eq(anchor_name)
+        ].copy()
+        if use_irt:
+            variance_source = np.asarray([
+                summary[0]
+                for row in train_anchors.itertuples(index=False)
+                for summary in [irt_anchor_pseudo_observation(row, data)]
+                if summary is not None
+            ], dtype=float)
         else:
-            mean = np.asarray(daily_pred, dtype=float).copy()
-        predictions.append(
-            pd.DataFrame(
-                {
-                    "id": int(pid),
-                    "t": comp_i["t"].to_numpy(dtype=int),
-                    "L_hat": mean,
-                    "z_d_hat": mean,
-                    "z_p_hat": mean,
-                }
-            )
+            variance_source = (
+                pd.to_numeric(train_anchors["value"], errors="coerce")
+                / pd.to_numeric(train_anchors["loading"], errors="coerce").replace(0.0, np.nan)
+            ).to_numpy(dtype=float)
+        finite_source = variance_source[np.isfinite(variance_source)]
+        variance = max(
+            float(np.var(finite_source)) if len(finite_source) else 0.25,
+            0.25,
         )
-    return pd.concat(predictions, ignore_index=True)
+        slow_length, fast_length = _select_gp_time_lengths(
+            data,
+            train_ids,
+            anchor_name,
+            daily_readouts[anchor_name],
+            auxiliary_center,
+            auxiliary_scale,
+            variance,
+        )
+        predictions = []
+        for pid in sorted(data.individuals["id"].astype(int).tolist()):
+            comp_i, anchors_i, b, daily_pred, _, _, _, recent, burden = person_arrays(
+                data,
+                pid,
+                daily_readouts[anchor_name],
+                anchor_name=anchor_name,
+            )
+            action = causal_encoder_action_array(comp_i)
+            times = _gp_elapsed_times(comp_i)
+            t_count = len(times)
+            auxiliary = _gp_auxiliary_design(
+                b, action, recent, burden, int(data.config.n_treatment_types)
+            )
+            auxiliary = (auxiliary - auxiliary_center) / auxiliary_scale
+            auxiliary_distance = np.square(
+                auxiliary[:, None, :] - auxiliary[None, :, :]
+            ).mean(axis=2)
+            kernel = _sum_kernel(
+                times,
+                0.85 * variance,
+                slow_length=slow_length,
+                fast_length=fast_length,
+            )
+            kernel += 0.15 * variance * np.exp(-0.5 * auxiliary_distance)
+            design_rows: list[np.ndarray] = []
+            targets: list[float] = []
+            noise_variance: list[float] = []
+            availability_times: list[int] = []
+            for row in anchors_i.itertuples(index=False):
+                if not bool(getattr(row, "observed", False)):
+                    continue
+                start = max(0, int(getattr(row, "window_start")))
+                end = min(t_count - 1, int(getattr(row, "window_end")))
+                if end < start:
+                    continue
+                design_row = np.zeros(t_count, dtype=float)
+                if use_irt:
+                    summary = irt_anchor_pseudo_observation(row, data)
+                    if summary is None:
+                        continue
+                    target, anchor_sd = summary
+                    design_row[start : end + 1] = 1.0 / (end - start + 1)
+                else:
+                    target = float(getattr(row, "value", np.nan))
+                    loading = float(getattr(row, "loading", np.nan))
+                    if not np.isfinite(target) or not np.isfinite(loading):
+                        continue
+                    design_row[start : end + 1] = loading / (end - start + 1)
+                    spec = data.config.y1 if anchor_name == "Y1" else data.config.y2
+                    serial_rho = data.config.rho_serial_y1 if anchor_name == "Y1" else data.config.rho_serial_y2
+                    anchor_sd = marginal_anchor_sd(spec, serial_rho)
+                design_rows.append(design_row)
+                targets.append(float(target))
+                noise_variance.append(float(anchor_sd) ** 2)
+                availability_times.append(int(getattr(row, "t", end)))
+            mean = np.asarray(daily_pred, dtype=float).copy()
+            if design_rows:
+                design_matrix = np.vstack(design_rows)
+                target_vector = np.asarray(targets, dtype=float)
+                noise = np.asarray(noise_variance, dtype=float)
+                available = np.asarray(availability_times, dtype=int)
+                for index, _current_time in enumerate(times):
+                    observed = available < int(comp_i.iloc[index]["t"])
+                    if observed.any():
+                        mean[index] = _gp_conditioned_mean(
+                            np.asarray(daily_pred, dtype=float),
+                            kernel,
+                            design_matrix[observed],
+                            target_vector[observed],
+                            noise[observed],
+                            prediction_index=index,
+                        )
+            predictions.append(pd.DataFrame({
+                "id": int(pid),
+                "t": comp_i["t"].to_numpy(dtype=int),
+                output_column: mean,
+            }))
+        channel_frames.append(pd.concat(predictions, ignore_index=True))
+    combined = channel_frames[0].merge(channel_frames[1], on=["id", "t"], validate="one_to_one")
+    combined["L_hat"] = 0.5 * (combined["z_d_hat"] + combined["z_p_hat"])
+    return combined
 
 
 def run_gp(data, args, cell: str, seed: int, share: float) -> dict:
@@ -898,7 +1019,7 @@ def run_gp(data, args, cell: str, seed: int, share: float) -> dict:
 
 
 class _CausalODERNN(torch.nn.Module):
-    """Forward filter with an exact diagonal linear-ODE flow between updates."""
+    """Forward GRU with an exact diagonal exponential decay between updates."""
 
     def __init__(self, input_dim: int, hidden_dim: int) -> None:
         super().__init__()
@@ -987,11 +1108,15 @@ def _ode_rnn_tensors(data, ids: list[int], device: torch.device):
                     continue
                 encoder_value = value
                 loss_items = None
-            if aflag[pos, channel] > 0:
-                ain[pos, channel] = 0.5 * (ain[pos, channel] + encoder_value)
-            else:
-                ain[pos, channel] = encoder_value
-            aflag[pos, channel] = 1.0
+            input_pos = pos + 1
+            if input_pos < t_count:
+                if aflag[input_pos, channel] > 0:
+                    ain[input_pos, channel] = 0.5 * (
+                        ain[input_pos, channel] + encoder_value
+                    )
+                else:
+                    ain[input_pos, channel] = encoder_value
+                aflag[input_pos, channel] = 1.0
             start = max(0, int(getattr(anchor, "window_start")))
             end = min(t_count - 1, int(getattr(anchor, "window_end")))
             if end >= start:
@@ -1049,7 +1174,7 @@ def _pack_ode_anchor_rows(
     device: torch.device,
 ):
     if not rows:
-        raise ValueError("ODE-RNN comparator has no observed training anchors")
+        raise ValueError("Exponential-decay GRU comparator has no observed training anchors")
     array = np.asarray([row[:6] for row in rows], dtype=float)
     item_rows = [row[6] for row in rows]
     if all(items is not None for items in item_rows):
@@ -1057,7 +1182,7 @@ def _pack_ode_anchor_rows(
     elif all(items is None for items in item_rows):
         items = None
     else:
-        raise ValueError("ODE-RNN anchor rows mix Gaussian and item-response targets")
+        raise ValueError("Exponential-decay GRU anchor rows mix Gaussian and item-response targets")
     return {
         "row": torch.as_tensor(array[:, 0], dtype=torch.long, device=device),
         "channel": torch.as_tensor(array[:, 1], dtype=torch.long, device=device),
@@ -1167,7 +1292,7 @@ def run_ode_rnn(data, args, cell: str, seed: int, share: float) -> dict:
         data,
         preds,
         np.zeros(data.config.q, dtype=float),
-        method="ode_rnn_causal",
+        method="exponential_decay_gru",
         cell=cell,
         seed=seed,
         share=share,
@@ -1288,6 +1413,151 @@ def run_ball_direct_causal(data, args, cell: str, seed: int, share: float) -> di
     )
 
 
+def run_ball_direct_causal_compute_matched(
+    data, args, cell: str, seed: int, share: float
+) -> dict:
+    """Train the direct causal model for the teacher-plus-student update budget."""
+
+    start = perf_counter()
+    config = ball_config(args, seed)
+    config = dataclasses.replace(
+        config,
+        teacher_epochs=int(config.teacher_epochs + config.student_epochs),
+    )
+    result = fit_ball_ssm_direct_causal(
+        data,
+        config,
+        device=args.device,
+        prediction_split=None,
+    )
+    elapsed = perf_counter() - start
+    row = _score_ball_result(
+        data,
+        result,
+        method="ball_direct_causal_compute_matched",
+        cell=cell,
+        seed=seed,
+        share=share,
+        elapsed=elapsed,
+        args=args,
+    )
+    row["optimizer_update_budget"] = "teacher plus student epoch count"
+    return row
+
+
+def run_distillation_decomposition(
+    data, args, cell: str, seed: int, share: float
+) -> list[dict]:
+    """Compare inherited dynamics, teacher matching, and re-anchored BALL."""
+
+    start = perf_counter()
+    results = fit_ball_ssm_distillation_decomposition(
+        data,
+        ball_config(args, seed),
+        device=args.device,
+        prediction_split=None,
+    )
+    elapsed = perf_counter() - start
+    method_names = {
+        "inherited_dynamics_only": "ball_inherited_dynamics_only",
+        "teacher_matching_only": "ball_teacher_matching_only",
+        "full_ball": "ball_full_decomposition",
+    }
+    return [
+        _score_ball_result(
+            data,
+            result,
+            method=method_names[arm],
+            cell=cell,
+            seed=seed,
+            share=share,
+            elapsed=elapsed,
+            args=args,
+        )
+        for arm, result in results.items()
+    ]
+
+
+def run_ball_transition_only(
+    data, args, cell: str, seed: int, share: float
+) -> dict:
+    """Remove the observed RDoC profile from the encoder while retaining correlated proxies."""
+
+    start = perf_counter()
+    config = dataclasses.replace(ball_config(args, seed), encoder_use_rdoc=False)
+    student = fit_ball_ssm(
+        data,
+        config,
+        device=args.device,
+        causal=True,
+        prediction_split=None,
+        return_teacher=False,
+    )
+    elapsed = perf_counter() - start
+    return _score_ball_result(
+        data,
+        student,
+        method="ball_student_transition_only",
+        cell=cell,
+        seed=seed,
+        share=share,
+        elapsed=elapsed,
+        args=args,
+    )
+
+
+def run_ball_transition_only_strict(
+    data, args, cell: str, seed: int, share: float
+) -> dict:
+    """Reserve RDoC information for the explicit transition coefficient only."""
+
+    strict_daily = data.daily.copy()
+    proxy_columns = [f"X{index}" for index in range(8, 12)]
+    for column in proxy_columns:
+        if column in strict_daily:
+            strict_daily[column] = 0.0
+        for prefix in ("input_", "obs_"):
+            flag = f"{prefix}{column}"
+            if flag in strict_daily:
+                strict_daily[flag] = False
+    strict_data = type(data)(
+        config=data.config,
+        individuals=data.individuals.copy(),
+        daily=strict_daily,
+        anchors=data.anchors.copy(),
+        treatments=data.treatments.copy(),
+        components=data.components.copy(),
+        metadata={
+            **data.metadata,
+            "transition_identification_arm": "strict",
+            "encoder_observed_rdoc_profile": False,
+            "encoder_rdoc_proxy_columns": [],
+            "removed_proxy_columns": proxy_columns,
+        },
+    )
+    start = perf_counter()
+    config = dataclasses.replace(ball_config(args, seed), encoder_use_rdoc=False)
+    student = fit_ball_ssm(
+        strict_data,
+        config,
+        device=args.device,
+        causal=True,
+        prediction_split=None,
+        return_teacher=False,
+    )
+    elapsed = perf_counter() - start
+    return _score_ball_result(
+        data,
+        student,
+        method="ball_student_transition_only_strict",
+        cell=cell,
+        seed=seed,
+        share=share,
+        elapsed=elapsed,
+        args=args,
+    )
+
+
 def aggregate(per: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for keys, group in per.groupby(["cell", "share", "method"], sort=True):
@@ -1376,14 +1646,21 @@ def main() -> None:
     )
     parser.add_argument("--skip-markov", action="store_true", help="Skip the native direct-transition Markov comparator")
     parser.add_argument("--skip-gp", action="store_true", help="Skip the slow-plus-fast sum-of-kernels Gaussian-process comparator")
-    parser.add_argument("--skip-ode-rnn", action="store_true", help="Skip the continuous-time causal ODE-RNN comparator")
+    parser.add_argument("--skip-ode-rnn", action="store_true", help="Skip the causal exponential-decay GRU comparator")
     parser.add_argument("--markov-strata", type=int, default=3)
     parser.add_argument("--markov-iters", type=int, default=4)
     parser.add_argument("--markov-ridge", type=float, default=10.0)
+    parser.add_argument(
+        "--classical-persistence-grid",
+        type=float,
+        nargs="+",
+        default=[0.1, 0.3, 0.6, 0.9],
+        help="Development-selected daily persistence candidates for each classical latent channel.",
+    )
 
     parser.add_argument("--teacher-epochs", type=int, default=240)
     parser.add_argument("--student-epochs", type=int, default=240)
-    parser.add_argument("--ode-epochs", type=int, default=None, help="ODE-RNN epochs; defaults to --teacher-epochs")
+    parser.add_argument("--ode-epochs", type=int, default=None, help="Exponential-decay GRU epochs; defaults to --teacher-epochs")
     parser.add_argument("--ode-hidden", type=int, default=96)
     parser.add_argument("--ode-lr", type=float, default=1e-3)
     parser.add_argument("--ode-smoothness", type=float, default=0.01)
@@ -1402,12 +1679,16 @@ def main() -> None:
     parser.add_argument("--irt-n-items", type=int, default=9)
     parser.add_argument("--irt-discrimination", type=float, default=1.5)
     parser.add_argument("--delta-phi", type=float, default=0.3)
+    parser.add_argument("--anchor-weight", type=float, default=40.0)
     parser.add_argument("--ball-no-ehr-drift", action="store_true")
     parser.add_argument(
         "--skip-direct-causal",
         action="store_true",
         help="Skip the forward-only student architecture trained directly on anchors.",
     )
+    parser.add_argument("--skip-compute-matched-direct", action="store_true")
+    parser.add_argument("--skip-distillation-decomposition", action="store_true")
+    parser.add_argument("--skip-transition-identification", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--out", default=None)
     parser.add_argument("--resume", action="store_true",
@@ -1441,9 +1722,20 @@ def main() -> None:
                 if args.skip_gp:
                     required.discard("gp_causal_filter")
                 if args.skip_ode_rnn:
-                    required.discard("ode_rnn_causal")
+                    required.discard("exponential_decay_gru")
                 if args.skip_direct_causal:
                     required.discard("ball_direct_causal")
+                if args.skip_compute_matched_direct:
+                    required.discard("ball_direct_causal_compute_matched")
+                if args.skip_distillation_decomposition:
+                    required.difference_update({
+                        "ball_inherited_dynamics_only",
+                        "ball_teacher_matching_only",
+                        "ball_full_decomposition",
+                    })
+                if args.skip_transition_identification:
+                    required.discard("ball_student_transition_only")
+                    required.discard("ball_student_transition_only_strict")
                 if required.issubset(have):
                     print(f"cell={cell} share={share:.2f} seed={seed} already complete; skipping")
                     continue
@@ -1458,8 +1750,8 @@ def main() -> None:
                 if not args.skip_gp and "gp_causal_filter" not in have:
                     print("  gp_causal_filter")
                     rows.append(run_gp(data, args, cell, seed, share))
-                if not args.skip_ode_rnn and "ode_rnn_causal" not in have:
-                    print("  ode_rnn_causal")
+                if not args.skip_ode_rnn and "exponential_decay_gru" not in have:
+                    print("  exponential_decay_gru")
                     rows.append(run_ode_rnn(data, args, cell, seed, share))
                 if not {"ball_teacher_smoother", "ball_student_causal"}.issubset(have):
                     print("  ball_teacher_student")
@@ -1467,6 +1759,39 @@ def main() -> None:
                 if not args.skip_direct_causal and "ball_direct_causal" not in have:
                     print("  ball_direct_causal")
                     rows.append(run_ball_direct_causal(data, args, cell, seed, share))
+                if (
+                    not args.skip_compute_matched_direct
+                    and "ball_direct_causal_compute_matched" not in have
+                ):
+                    print("  ball_direct_causal_compute_matched")
+                    rows.append(
+                        run_ball_direct_causal_compute_matched(
+                            data, args, cell, seed, share
+                        )
+                    )
+                decomposition_methods = {
+                    "ball_inherited_dynamics_only",
+                    "ball_teacher_matching_only",
+                    "ball_full_decomposition",
+                }
+                if (
+                    not args.skip_distillation_decomposition
+                    and not decomposition_methods.issubset(have)
+                ):
+                    print("  distillation_mechanistic_decomposition")
+                    rows.extend(run_distillation_decomposition(data, args, cell, seed, share))
+                if (
+                    not args.skip_transition_identification
+                    and "ball_student_transition_only" not in have
+                ):
+                    print("  ball_student_transition_only")
+                    rows.append(run_ball_transition_only(data, args, cell, seed, share))
+                if (
+                    not args.skip_transition_identification
+                    and "ball_student_transition_only_strict" not in have
+                ):
+                    print("  ball_student_transition_only_strict")
+                    rows.append(run_ball_transition_only_strict(data, args, cell, seed, share))
                 pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
 
     per = pd.DataFrame(rows)
@@ -1512,14 +1837,20 @@ def main() -> None:
                     "ball_teacher_smoother": "BALL bidirectional transformer teacher smoother with rdoc_drift_head=True and use_alpha_slow=False",
                     "ball_student_causal": "BALL causal transformer student distilled from the teacher, with rdoc_drift_head=True and use_alpha_slow=False",
                     "ball_direct_causal": "Forward-only student architecture trained directly on anchors",
+                    "ball_direct_causal_compute_matched": "Direct causal transformer trained for the combined teacher-plus-student optimizer-update budget",
+                    "ball_inherited_dynamics_only": "Causal encoder with frozen teacher-fitted dynamics and measurement model, trained through the causal variational and questionnaire objectives",
+                    "ball_teacher_matching_only": "Causal encoder trained against teacher posterior distributions without questionnaire re-anchoring",
+                    "ball_full_decomposition": "Causal encoder trained with teacher-distribution matching and questionnaire re-anchoring against the same fitted teacher",
+                    "ball_student_transition_only": "BALL student with the observed RDoC profile removed from the inference encoder while correlated structured proxies remain",
+                    "ball_student_transition_only_strict": "BALL student with the observed RDoC profile and its four correlated structured proxies removed from the inference encoder and neural nuisance inputs while RDoC remains in the explicit transition",
                     "s0_direct_lgssm": f"Classical direct linear-Gaussian MAP smoother with {args.s0_basis} transition basis",
                     "markov_direct_transition": f"Classical direct Markov/pattern smoother with {args.s0_basis} transition basis and observed-pattern Markov terms",
                     "gp_causal_filter": (
                         "Causal Gaussian-process filter with 28-day radial-basis and 3-day Ornstein-Uhlenbeck time kernels, "
                         "a training-patient structured-input mean function, and only questionnaire measurements available by each estimation time"
                     ),
-                    "ode_rnn_causal": (
-                        "Forward-only ODE-RNN with exact diagonal linear-ODE flow, GRU updates, the same observed structured inputs, "
+                    "exponential_decay_gru": (
+                        "Forward-only exponential-decay GRU with an exact diagonal linear decay between sessions, GRU updates, the same observed structured inputs, "
                         "and the exact calibrated graded-response likelihood when IRT is active"
                     ),
                 },
@@ -1527,10 +1858,27 @@ def main() -> None:
                     "patient_partitions": "identical train, validation, calibration, and test patients",
                     "anchors": "identical observed questionnaire anchors and recall windows",
                     "structured_inputs": "daily covariates, daily observation indicators, observed RDoC proxies, treatment categories, observed treatment-history transforms, and elapsed time",
-                    "causal_estimators": ["ball_student_causal", "ball_direct_causal", "gp_causal_filter", "ode_rnn_causal"],
+                    "causal_estimators": [
+                        "ball_student_causal",
+                        "ball_direct_causal",
+                        "ball_direct_causal_compute_matched",
+                        "ball_inherited_dynamics_only",
+                        "ball_teacher_matching_only",
+                        "ball_full_decomposition",
+                        "ball_student_transition_only",
+                        "ball_student_transition_only_strict",
+                        "gp_causal_filter",
+                        "exponential_decay_gru",
+                    ],
                     "retrospective_smoothers": ["ball_teacher_smoother", "s0_direct_lgssm", "markov_direct_transition"],
                     "measurement_evaluation": "last observed validation anchor per patient and instrument, hidden with every overlapping recall window",
                     "latent_evaluation": "test-patient latent trajectories",
+                    "simulated_questionnaire_mapping": {
+                        "Y1": "depression channel with a 14-day recall window",
+                        "Y2": "anxiety channel with a 7-day recall window",
+                    },
+                    "measurement_parameters": "true simulated instrument loadings and observation variances frozen identically for every estimator",
+                    "prospective_questionnaire_timing": "causal encoders receive each questionnaire beginning at the next recorded session",
                 },
                 "note": (
                     "Direct-transition benchmark on identical generated datasets. "

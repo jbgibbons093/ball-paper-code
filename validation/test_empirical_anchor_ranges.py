@@ -38,3 +38,35 @@ def test_out_of_range_questionnaire_totals_are_excluded() -> None:
     anchors = _build_anchor_set(frame, masks, cadence_days=14)
     assert set(anchors["value"].astype(float)) == {21.0, 27.0, 63.0}
     assert set(anchors["anchor"]) == {"PHQ9", "GAD7", "BDI"}
+
+
+def test_sparsification_and_event_accounting_are_instrument_specific() -> None:
+    frame = pd.DataFrame(
+        {
+            "PatientFID": [1, 1],
+            "session": [0, 1],
+            "ServiceDate": pd.to_datetime(["2025-01-01", "2025-01-20"]),
+            "day": [0, 19],
+            "phq9": [12.0, 11.0],
+            "phq9_is_imputed": [0, 0],
+            "phq9_is_interpolated": [0, 0],
+            "gad_filled": [8.0, 7.0],
+            "gad_measured": [1, 1],
+            "bdi_filled": [24.0, 22.0],
+            "bdi_measured": [1, 1],
+        }
+    )
+    anchors = _build_anchor_set(frame, _genuine_masks(frame), cadence_days=28)
+    first_session = anchors[anchors["session"].eq(0)]
+    assert set(first_session.loc[first_session["role"].eq("anchor"), "anchor"]) == {
+        "PHQ9",
+        "GAD7",
+        "BDI",
+    }
+    counts = anchors["evaluation_role"].value_counts()
+    assert len(anchors) == int(
+        counts.get("retained", 0)
+        + counts.get("withheld_eligible", 0)
+        + counts.get("withheld_ineligible_overlap", 0)
+    )
+    assert not anchors.duplicated(["id", "session", "anchor"]).any()

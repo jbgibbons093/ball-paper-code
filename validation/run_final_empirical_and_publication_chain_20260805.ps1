@@ -8,19 +8,19 @@ $ErrorActionPreference = 'Stop'
 
 $taskRoot = (Resolve-Path -LiteralPath $TaskRoot).Path
 $protectedRoot = (Resolve-Path -LiteralPath $ProtectedRoot).Path
-$protectedRun = Join-Path $protectedRoot 'publication_ready_20260805_v3'
-$stabilityOut = Join-Path $protectedRoot 'publication_stability_20260805_v3'
-$rdocScorerOut = Join-Path $protectedRoot 'rdoc_scorer_sensitivity_20260805_v3'
+$protectedRun = Join-Path $protectedRoot 'publication_ready_20260805_v4'
+$stabilityOut = Join-Path $protectedRoot 'publication_stability_20260805_v4'
+$rdocScorerOut = Join-Path $protectedRoot 'rdoc_scorer_sensitivity_20260805_v4'
 $comorbidityFeatures = Join-Path $protectedRoot 'session_comorbidity_features.csv'
-$publicationOut = Join-Path $taskRoot 'simulations\paper\outputs\publication_ready_20260805_v3'
-$calibration = Join-Path $taskRoot 'simulations\paper\outputs\publication_calibration_20260805_v3'
+$publicationOut = Join-Path $taskRoot 'simulations\paper\outputs\publication_ready_20260805_v4'
+$calibration = Join-Path $taskRoot 'simulations\paper\outputs\publication_calibration_20260805_v4'
 $pythonExe = $PythonExe
 
-$primary = Join-Path $taskRoot 'validation\outputs\direct_rdoc_gaussian_publication_20260805_matched_heldout_v3'
-$irt = Join-Path $taskRoot 'validation\outputs\direct_rdoc_irt_publication_20260805_matched_heldout_v3'
-$adaptive = Join-Path $taskRoot 'validation\outputs\direct_rdoc_adaptive_publication_20260805_matched_heldout_v3'
-$controls = Join-Path $taskRoot 'validation\outputs\direct_rdoc_negative_controls_publication_20260805_matched_heldout_v3'
-$parameterSensitivity = Join-Path $taskRoot 'validation\outputs\focused_parameter_sensitivities_publication_20260805_v1'
+$primary = Join-Path $taskRoot 'validation\outputs\direct_rdoc_gaussian_publication_20260805_matched_heldout_v4'
+$irt = Join-Path $taskRoot 'validation\outputs\direct_rdoc_irt_publication_20260805_matched_heldout_v4'
+$adaptive = Join-Path $taskRoot 'validation\outputs\direct_rdoc_adaptive_publication_20260805_matched_heldout_v4'
+$controls = Join-Path $taskRoot 'validation\outputs\direct_rdoc_negative_controls_publication_20260805_matched_heldout_v4'
+$parameterSensitivity = Join-Path $taskRoot 'validation\outputs\focused_parameter_sensitivities_publication_20260805_v2'
 
 function Assert-SimulationOutput {
     param(
@@ -69,9 +69,9 @@ function Invoke-PythonStep {
 }
 
 Set-Location -LiteralPath $taskRoot
-Assert-SimulationOutput -Directory $primary -ExpectedRows 1100 -ExpectedMethods 11
-Assert-SimulationOutput -Directory $irt -ExpectedRows 1100 -ExpectedMethods 11
-Assert-SimulationOutput -Directory $adaptive -ExpectedRows 900 -ExpectedMethods 9
+Assert-SimulationOutput -Directory $primary -ExpectedRows 1300 -ExpectedMethods 13
+Assert-SimulationOutput -Directory $irt -ExpectedRows 1300 -ExpectedMethods 13
+Assert-SimulationOutput -Directory $adaptive -ExpectedRows 1100 -ExpectedMethods 11
 Assert-SimulationOutput -Directory $controls -ExpectedRows 200 -ExpectedMethods 5
 foreach ($name in @('persistence_per_run.csv', 'persistence_development_selected.csv', 'anchor_weight_per_run.csv', 'manifest.json')) {
     $path = Join-Path $parameterSensitivity $name
@@ -90,9 +90,12 @@ foreach ($path in @($protectedRun, $stabilityOut, $rdocScorerOut, $publicationOu
 }
 New-Item -ItemType Directory -Path $protectedRun | Out-Null
 
+$anchorArgs = @('-u', 'BALL.py', 'empirical-build-anchors', '--sweep')
+Invoke-PythonStep -Name 'Instrument-specific questionnaire event inventory and sparsification' -Arguments $anchorArgs -Stdout (Join-Path $protectedRun 'anchor_build_stdout.log') -Stderr (Join-Path $protectedRun 'anchor_build_stderr.log')
+
 $empiricalArgs = @(
     '-u', 'BALL.py', 'empirical-fit',
-    '--run-label', 'publication_ready_20260805_v3',
+    '--run-label', 'publication_ready_20260805_v4',
     '--run-dir', $protectedRun,
     '--cadences', '14', '21', '28',
     '--teacher-epochs', '120',

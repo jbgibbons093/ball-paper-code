@@ -324,8 +324,14 @@ def observed_treatment_history_arrays(comp_i: pd.DataFrame, daily_i: pd.DataFram
     return recent, burden
 
 
-def fit_daily_readout(data, train_ids: set[int], ridge: float = 1.0):
-    """Train-only X -> anchor-interpolated latent readout."""
+def fit_daily_readout(
+    data,
+    train_ids: set[int],
+    ridge: float = 1.0,
+    *,
+    anchor_name: str | None = None,
+):
+    """Train-only daily-feature readout for one latent channel."""
 
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(data.config.p_daily)]
@@ -356,6 +362,8 @@ def fit_daily_readout(data, train_ids: set[int], ridge: float = 1.0):
         points_x, points_y = [], []
         for row in anc_i.itertuples(index=False):
             if not bool(getattr(row, "observed", False)):
+                continue
+            if anchor_name is not None and str(getattr(row, "anchor")) != str(anchor_name):
                 continue
             if _daily_irt is not None:
                 items = getattr(row, "irt_items")
@@ -408,10 +416,12 @@ def fit_daily_readout(data, train_ids: set[int], ridge: float = 1.0):
     return float(coef[0]), coef[1:].astype(float), means.astype(float), sigma
 
 
-def person_arrays(data, pid: int, daily_readout):
+def person_arrays(data, pid: int, daily_readout, *, anchor_name: str | None = None):
     comp_i = data.components[data.components["id"] == pid].sort_values("t").reset_index(drop=True)
     daily_i = data.daily[data.daily["id"] == pid].sort_values("t").reset_index(drop=True)
     anchors_i = data.anchors[data.anchors["id"] == pid].sort_values(["anchor", "t"]).reset_index(drop=True)
+    if anchor_name is not None:
+        anchors_i = anchors_i[anchors_i["anchor"].astype(str).eq(str(anchor_name))].copy()
     q = data.config.q
     b = impute_by_time(comp_i, [f"B{j}" for j in range(q)])
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
@@ -549,69 +559,287 @@ def solve_person(data, pid: int, theta: np.ndarray, daily_readout, args, irt_sta
     return pred, b, action, recent, burden, next_gaps
 
 
-def fit_direct_map(data, args):
-    train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
-    daily_readout = fit_daily_readout(data, train_ids, ridge=args.daily_ridge)
-    q = data.config.q
+def _classical_gap_factors(rho: float, gaps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Persistence and accumulated-drift factors for unequal elapsed days."""
+
+    gaps = np.asarray(gaps, dtype=float)
+    persistence = np.power(float(rho), gaps)
+    if abs(float(rho) - 1.0) < 1e-8:
+        drift = gaps.copy()
+    else:
+        drift = (1.0 - persistence) / (1.0 - float(rho))
+    return persistence, drift
+
+
+def _classical_pattern_strata(data, n_strata: int) -> dict[int, int]:
+    ids = sorted(data.individuals["id"].astype(int).tolist())
+    counts = data.anchors.loc[data.anchors["observed"].astype(bool)].groupby("id").size()
+    values = np.asarray([float(counts.get(pid, 0.0)) for pid in ids], dtype=float)
+    n_strata = max(1, int(n_strata))
+    if n_strata == 1 or len(np.unique(values)) <= 1:
+        return {pid: 0 for pid in ids}
+    edges = np.quantile(values, np.linspace(0.0, 1.0, n_strata + 1)[1:-1])
+    return {
+        pid: int(np.searchsorted(edges, values[index], side="right"))
+        for index, pid in enumerate(ids)
+    }
+
+
+def _solve_two_channel_person(
+    data,
+    pid: int,
+    theta: np.ndarray,
+    daily_readout,
+    args,
+    *,
+    anchor_name: str,
+    persistence: float,
+    innovation_sd: float,
+    stratum: int,
+    n_strata: int,
+    irt_state=None,
+):
+    comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden = person_arrays(
+        data, pid, daily_readout, anchor_name=anchor_name
+    )
+    t_count = len(comp_i)
+    if irt_state is not None:
+        irt_state["pid"] = pid
     basis = getattr(args, "s0_basis", "linear")
-    template_b = np.zeros((2, q), dtype=float)
-    template_action = np.zeros(2, dtype=int)
-    template_recent = np.zeros(2, dtype=float)
-    template_burden = np.zeros(2, dtype=float)
-    n_features = transition_features(
-        template_b,
-        template_action,
-        template_recent,
-        template_burden,
+    subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
+    base_features = transition_features(
+        b,
+        action,
+        recent,
+        burden,
         data.config.n_treatment_types,
         basis=basis,
+        subtype=subtype,
+        n_subtypes=data.config.n_subtypes,
+    )
+    transition_mean = base_features @ theta[: base_features.shape[1]]
+    if n_strata > 0:
+        transition_mean = transition_mean + float(theta[base_features.shape[1] + int(stratum)])
+
+    rows: list[np.ndarray] = []
+    targets: list[float] = []
+
+    def add(coefficients: list[tuple[int, float]], target: float, sd: float) -> None:
+        row = np.zeros(t_count, dtype=float)
+        for index, value in coefficients:
+            row[index] = value / max(float(sd), 1e-8)
+        rows.append(row)
+        targets.append(float(target) / max(float(sd), 1e-8))
+
+    add([(0, 1.0)], 0.0, args.prior_sd)
+    for row in anchors_i.itertuples(index=False):
+        constraint = anchor_constraint(row, t_count, data, args, irt_state)
+        if constraint is not None:
+            add(*constraint)
+    for index, observed in enumerate(any_daily):
+        if observed and np.isfinite(daily_pred[index]):
+            add([(index, 1.0)], float(daily_pred[index]), daily_sd)
+
+    gaps = (
+        pd.to_numeric(comp_i["dt"], errors="coerce").fillna(1.0).clip(lower=0.0).to_numpy(dtype=float)
+        if "dt" in comp_i.columns
+        else np.ones(t_count, dtype=float)
+    )
+    gap_persistence, drift_scale = _classical_gap_factors(persistence, gaps)
+    innovation_multiplier = np.sqrt(
+        np.maximum(
+            (1.0 - np.power(float(persistence), 2.0 * gaps))
+            / max(1.0 - float(persistence) ** 2, 1e-8),
+            0.0,
+        )
+    )
+    for index in range(1, t_count):
+        if gaps[index - 1] <= 0:
+            continue
+        add(
+            [(index, 1.0), (index - 1, -float(gap_persistence[index - 1]))],
+            float(transition_mean[index - 1]) * float(drift_scale[index - 1]),
+            float(innovation_sd) * float(innovation_multiplier[index - 1]),
+        )
+    design = np.vstack(rows)
+    target = np.asarray(targets, dtype=float)
+    solution = np.linalg.lstsq(design, target, rcond=None)[0]
+    update_irt_zbar(irt_state, anchors_i, solution, t_count)
+    return solution, b, action, recent, burden, gaps, base_features
+
+
+def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
+    """Fit two channel-specific trajectories with one shared RDoC coefficient."""
+
+    train_ids = set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
+    ids = sorted(data.individuals["id"].astype(int).tolist())
+    anchor_names = ("Y1", "Y2")
+    readouts = {
+        name: fit_daily_readout(data, train_ids, ridge=args.daily_ridge, anchor_name=name)
+        for name in anchor_names
+    }
+    q = int(data.config.q)
+    template_features = transition_features(
+        np.zeros((2, q), dtype=float),
+        np.zeros(2, dtype=int),
+        np.zeros(2, dtype=float),
+        np.zeros(2, dtype=float),
+        data.config.n_treatment_types,
+        basis=getattr(args, "s0_basis", "linear"),
         subtype=0,
         n_subtypes=data.config.n_subtypes,
-    ).shape[1]
-    theta = np.zeros(n_features, dtype=float)
-    irt_state = init_irt_state(data, args)
+    )
+    base_count = int(template_features.shape[1])
+    n_strata = max(1, int(getattr(args, "markov_strata", 1))) if pattern_mixture else 0
+    strata = _classical_pattern_strata(data, n_strata) if n_strata else {pid: 0 for pid in ids}
+    theta = [np.zeros(base_count + n_strata), np.zeros(base_count + n_strata)]
+    persistence_grid = tuple(
+        float(value)
+        for value in getattr(args, "classical_persistence_grid", (0.1, 0.3, 0.6, 0.9))
+    )
+    if any(value <= 0.0 or value >= 1.0 for value in persistence_grid):
+        raise ValueError("Classical persistence candidates must lie strictly between zero and one.")
+    persistence = [0.6, 0.6]
+    innovation_sd = [float(args.transition_sd), float(args.transition_sd)]
+    irt_states = [init_irt_state(data, args), init_irt_state(data, args)]
+    fitted: dict[tuple[int, int], tuple] = {}
 
-    pred_by_pid: dict[int, pd.DataFrame] = {}
-    arrays_by_pid = {}
-    ids = sorted(data.individuals["id"].astype(int).tolist())
-    for _ in range(args.iters):
-        x_rows, y_rows = [], []
-        pred_by_pid.clear()
-        arrays_by_pid.clear()
-        for pid in ids:
-            pred, b, action, recent, burden, next_gaps = solve_person(
-                data, pid, theta, daily_readout, args, irt_state=irt_state
-            )
-            pred_by_pid[pid] = pred
-            arrays_by_pid[pid] = (b, action, recent, burden, next_gaps)
-            if pid not in train_ids:
-                continue
-            l = pred["L_hat"].to_numpy(dtype=float)
-            subtype = int(data.individuals.loc[data.individuals["id"] == pid, "subtype"].iloc[0])
-            feats = transition_features(
-                b,
-                action,
-                recent,
-                burden,
-                data.config.n_treatment_types,
-                basis=basis,
-                subtype=subtype,
-                n_subtypes=data.config.n_subtypes,
-            )
-            positive = np.asarray(next_gaps[: len(feats)], dtype=float) > 0
-            if positive.any():
-                x_rows.append(feats[positive])
-                y_rows.append(np.diff(l)[positive] / np.asarray(next_gaps[: len(feats)])[positive])
-        if not x_rows:
+    for _ in range(max(1, int(args.iters))):
+        fitted.clear()
+        for channel_index, anchor_name in enumerate(anchor_names):
+            for pid in ids:
+                fitted[(channel_index, pid)] = _solve_two_channel_person(
+                    data,
+                    pid,
+                    theta[channel_index],
+                    readouts[anchor_name],
+                    args,
+                    anchor_name=anchor_name,
+                    persistence=persistence[channel_index],
+                    innovation_sd=innovation_sd[channel_index],
+                    stratum=strata[pid],
+                    n_strata=n_strata,
+                    irt_state=irt_states[channel_index],
+                )
+
+        best = None
+        non_beta_indices = np.asarray(
+            [index for index in range(base_count + n_strata) if not 1 <= index < 1 + q],
+            dtype=int,
+        )
+        for rho_d in persistence_grid:
+            for rho_p in persistence_grid:
+                channel_designs = []
+                channel_targets = []
+                for channel_index, rho in enumerate((rho_d, rho_p)):
+                    design_blocks, target_blocks = [], []
+                    for pid in ids:
+                        if pid not in train_ids:
+                            continue
+                        solution, _, _, _, _, gaps, features = fitted[(channel_index, pid)]
+                        count = min(len(features), len(solution) - 1)
+                        if count <= 0:
+                            continue
+                        gaps_use = np.asarray(gaps[:count], dtype=float)
+                        valid = gaps_use > 0
+                        if not valid.any():
+                            continue
+                        gap_persistence, drift = _classical_gap_factors(rho, gaps_use)
+                        outcome = (
+                            solution[1 : count + 1]
+                            - gap_persistence * solution[:count]
+                        ) / np.maximum(drift, 1e-8)
+                        channel_features = features[:count]
+                        if n_strata:
+                            pattern = np.zeros((count, n_strata), dtype=float)
+                            pattern[:, strata[pid]] = 1.0
+                            channel_features = np.column_stack([channel_features, pattern])
+                        design_blocks.append(channel_features[valid])
+                        target_blocks.append(outcome[valid])
+                    channel_designs.append(np.vstack(design_blocks))
+                    channel_targets.append(np.concatenate(target_blocks))
+
+                rows = []
+                outcomes = []
+                for channel_index in range(2):
+                    base = channel_designs[channel_index]
+                    shared = base[:, 1 : 1 + q]
+                    own = base[:, non_beta_indices]
+                    zeros = np.zeros_like(own)
+                    rows.append(
+                        np.column_stack(
+                            [shared, own if channel_index == 0 else zeros, zeros if channel_index == 0 else own]
+                        )
+                    )
+                    outcomes.append(channel_targets[channel_index])
+                design = np.vstack(rows)
+                outcome = np.concatenate(outcomes)
+                penalty = float(args.beta_ridge) * np.eye(design.shape[1])
+                for position in (q, q + len(non_beta_indices)):
+                    penalty[position, position] = 0.0
+                coefficients = np.linalg.solve(
+                    design.T @ design + penalty,
+                    design.T @ outcome,
+                )
+                residual = outcome - design @ coefficients
+                objective = float(np.mean(residual ** 2))
+                if best is None or objective < best[0]:
+                    best = (objective, (rho_d, rho_p), coefficients, channel_designs, channel_targets)
+        if best is None:
             break
-        x = np.vstack(x_rows)
-        y = np.concatenate(y_rows)
-        penalty = args.beta_ridge * np.eye(n_features)
-        penalty[0, 0] = 0.0
-        theta = np.linalg.solve(x.T @ x + penalty, x.T @ y)
+        _, selected_rho, coefficients, channel_designs, channel_targets = best
+        persistence = [float(selected_rho[0]), float(selected_rho[1])]
+        shared_beta = coefficients[:q]
+        for channel_index in range(2):
+            start = q + channel_index * len(non_beta_indices)
+            channel_theta = np.zeros(base_count + n_strata, dtype=float)
+            channel_theta[1 : 1 + q] = shared_beta
+            channel_theta[non_beta_indices] = coefficients[start : start + len(non_beta_indices)]
+            theta[channel_index] = channel_theta
+            residual = channel_targets[channel_index] - channel_designs[channel_index] @ channel_theta
+            innovation_sd[channel_index] = max(float(np.std(residual, ddof=1)), 0.05)
 
-    preds = pd.concat([pred_by_pid[pid] for pid in ids], ignore_index=True)
-    return preds, theta
+    final_frames = []
+    for pid in ids:
+        channel_values = []
+        time_values = None
+        for channel_index, anchor_name in enumerate(anchor_names):
+            solution, *_ = _solve_two_channel_person(
+                data,
+                pid,
+                theta[channel_index],
+                readouts[anchor_name],
+                args,
+                anchor_name=anchor_name,
+                persistence=persistence[channel_index],
+                innovation_sd=innovation_sd[channel_index],
+                stratum=strata[pid],
+                n_strata=n_strata,
+                irt_state=irt_states[channel_index],
+            )
+            channel_values.append(solution)
+            if time_values is None:
+                time_values = data.components[data.components["id"].eq(pid)].sort_values("t")["t"].to_numpy(dtype=int)
+        final_frames.append(pd.DataFrame({
+            "id": int(pid),
+            "t": time_values,
+            "z_d_hat": channel_values[0],
+            "z_p_hat": channel_values[1],
+            "L_hat": 0.5 * (channel_values[0] + channel_values[1]),
+        }))
+    predictions = pd.concat(final_frames, ignore_index=True)
+    predictions.attrs["channel_persistence"] = {
+        "depression": float(persistence[0]), "anxiety": float(persistence[1])
+    }
+    predictions.attrs["channel_innovation_sd"] = {
+        "depression": float(innovation_sd[0]), "anxiety": float(innovation_sd[1])
+    }
+    predictions.attrs["shared_beta"] = theta[0][1 : 1 + q].copy()
+    return predictions, theta[0]
+
+
+def fit_direct_map(data, args):
+    return fit_two_channel_direct_map(data, args, pattern_mixture=False)
 
 
 def run_one(args, seed: int, share: float) -> dict:

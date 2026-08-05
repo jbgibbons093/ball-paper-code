@@ -15,13 +15,13 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_PRIMARY = ROOT / "validation" / "outputs" / "direct_rdoc_gaussian_publication_20260805_matched_heldout_v3"
-DEFAULT_CONTROLS = ROOT / "validation" / "outputs" / "direct_rdoc_negative_controls_publication_20260805_matched_heldout_v3"
-DEFAULT_ADAPTIVE = ROOT / "validation" / "outputs" / "direct_rdoc_adaptive_publication_20260805_matched_heldout_v3"
-DEFAULT_IRT = ROOT / "validation" / "outputs" / "direct_rdoc_irt_publication_20260805_matched_heldout_v3"
-DEFAULT_CALIBRATION = ROOT / "simulations" / "paper" / "outputs" / "publication_calibration_20260805_v3"
-DEFAULT_EMPIRICAL = ROOT / "empirical" / "derived_phi" / "empirical_fit_runs" / "publication_ready_20260805_v3"
-DEFAULT_OUT = ROOT / "simulations" / "paper" / "outputs" / "publication_ready_20260805_v3"
+DEFAULT_PRIMARY = ROOT / "validation" / "outputs" / "direct_rdoc_gaussian_publication_20260805_matched_heldout_v4"
+DEFAULT_CONTROLS = ROOT / "validation" / "outputs" / "direct_rdoc_negative_controls_publication_20260805_matched_heldout_v4"
+DEFAULT_ADAPTIVE = ROOT / "validation" / "outputs" / "direct_rdoc_adaptive_publication_20260805_matched_heldout_v4"
+DEFAULT_IRT = ROOT / "validation" / "outputs" / "direct_rdoc_irt_publication_20260805_matched_heldout_v4"
+DEFAULT_CALIBRATION = ROOT / "simulations" / "paper" / "outputs" / "publication_calibration_20260805_v4"
+DEFAULT_EMPIRICAL = ROOT / "empirical" / "derived_phi" / "empirical_fit_runs" / "publication_ready_20260805_v4"
+DEFAULT_OUT = ROOT / "simulations" / "paper" / "outputs" / "publication_ready_20260805_v4"
 
 METHOD_LABELS = {
     "ball_student_causal": "BALL causal student",
@@ -36,7 +36,8 @@ METHOD_LABELS = {
     "ball_inherited_dynamics_only": "Inherited dynamics and questionnaires",
     "ball_teacher_matching_only": "Teacher matching only",
     "ball_full_decomposition": "Full BALL decomposition arm",
-    "ball_student_transition_only": "BALL with RDoC restricted to the transition",
+    "ball_student_transition_only": "BALL with the observed RDoC profile restricted to the transition",
+    "ball_student_transition_only_strict": "BALL with RDoC and its correlated proxies restricted to the transition",
 }
 PRIMARY_BALL_METHOD = "ball_student_causal"
 TEACHER_METHOD = "ball_teacher_smoother"
@@ -323,6 +324,7 @@ def write_distillation_ablation(per_run: pd.DataFrame, out: Path) -> None:
         "ball_teacher_matching_only",
         "ball_full_decomposition",
         "ball_student_transition_only",
+        "ball_student_transition_only_strict",
     ]
     decomposition = per_run[per_run["method"].isin(decomposition_methods)].copy()
     if set(decomposition["method"]) != set(decomposition_methods):
@@ -351,6 +353,55 @@ def write_distillation_ablation(per_run: pd.DataFrame, out: Path) -> None:
     pd.DataFrame(decomposition_rows).to_csv(
         out / "supp_table1c_distillation_decomposition.csv", index=False
     )
+    pd.DataFrame(
+        [
+            {
+                "training_arm": "Direct causal transformer",
+                "teacher_parameters": "none",
+                "generative_model": "jointly fitted with the causal encoder",
+                "teacher_distribution_matching": "no",
+                "questionnaire_likelihood": "yes",
+                "updated_parameters": "causal encoder and generative model",
+                "optimizer_update_budget": "direct causal training schedule",
+            },
+            {
+                "training_arm": "Inherited dynamics and questionnaires",
+                "teacher_parameters": "frozen after teacher fitting",
+                "generative_model": "frozen teacher-fitted model",
+                "teacher_distribution_matching": "no",
+                "questionnaire_likelihood": "yes",
+                "updated_parameters": "causal encoder",
+                "optimizer_update_budget": "student training schedule",
+            },
+            {
+                "training_arm": "Teacher matching only",
+                "teacher_parameters": "frozen after teacher fitting",
+                "generative_model": "frozen teacher-fitted model",
+                "teacher_distribution_matching": "yes",
+                "questionnaire_likelihood": "no",
+                "updated_parameters": "causal encoder",
+                "optimizer_update_budget": "student training schedule",
+            },
+            {
+                "training_arm": "Full BALL student",
+                "teacher_parameters": "frozen after teacher fitting",
+                "generative_model": "frozen teacher-fitted model",
+                "teacher_distribution_matching": "yes",
+                "questionnaire_likelihood": "yes",
+                "updated_parameters": "causal encoder",
+                "optimizer_update_budget": "teacher training followed by student training",
+            },
+            {
+                "training_arm": "Compute-matched direct causal transformer",
+                "teacher_parameters": "none",
+                "generative_model": "jointly fitted with the causal encoder",
+                "teacher_distribution_matching": "no",
+                "questionnaire_likelihood": "yes",
+                "updated_parameters": "causal encoder and generative model",
+                "optimizer_update_budget": "combined teacher-plus-student variational-update count",
+            },
+        ]
+    ).to_csv(out / "supp_table1d_distillation_arm_specification.csv", index=False)
 
 
 def figure1(out: Path) -> None:
@@ -765,6 +816,8 @@ def empirical_outputs(
         "interpolation": "Interpolation",
         "locf": "Last observation carried forward",
         "causal_anchor_mean": "Prior-anchor mean",
+        "locf_reference_origin": "Last observation carried forward with reference-origin cold start",
+        "causal_anchor_mean_reference_origin": "Prior-anchor mean with reference-origin cold start",
         "ball_inherited_dynamics_only": "BALL inherited dynamics only",
         "ball_teacher_matching_only": "BALL teacher matching only",
         "ball_full_decomposition": "BALL full decomposition arm",
@@ -784,6 +837,8 @@ def empirical_outputs(
         "interpolation",
         "locf",
         "causal_anchor_mean",
+        "locf_reference_origin",
+        "causal_anchor_mean_reference_origin",
         "ball_inherited_dynamics_only",
         "ball_teacher_matching_only",
         "ball_full_decomposition",
@@ -1622,10 +1677,11 @@ def main() -> None:
         "ball_teacher_matching_only",
         "ball_full_decomposition",
         "ball_student_transition_only",
+        "ball_student_transition_only_strict",
     }
-    if len(primary_per_run) != 1100 or set(primary_counts) != expected_primary_methods:
+    if len(primary_per_run) != 1300 or set(primary_counts) != expected_primary_methods:
         raise ValueError(
-            f"Expected 1,100 rows from eleven primary methods; found {len(primary_per_run)} rows and "
+            f"Expected 1,300 rows from thirteen primary methods; found {len(primary_per_run)} rows and "
             f"methods {sorted(primary_counts)}"
         )
     bad_counts = {method: count for method, count in primary_counts.items() if int(count) != 100}
@@ -1652,7 +1708,7 @@ def main() -> None:
     aggregate_counts = agg.groupby("method").size().to_dict()
     if set(aggregate_counts) != expected_primary_methods or any(int(count) != 10 for count in aggregate_counts.values()):
         raise ValueError(
-            "Primary aggregate must contain ten matched scenario panels for each of eleven methods; "
+            "Primary aggregate must contain ten matched scenario panels for each of thirteen methods; "
             f"found {aggregate_counts}"
         )
     if len(delta) != 10:
@@ -1695,6 +1751,7 @@ def main() -> None:
             "supp_table1_direct_rdoc_cells.csv",
             "supp_table1b_distillation_ablation.csv",
             "supp_table1c_distillation_decomposition.csv",
+            "supp_table1d_distillation_arm_specification.csv",
             "supp_table2a_empirical_cohort.csv",
             "supp_table2b_empirical_comorbidity_features.csv",
             "supp_table2c_empirical_feature_dictionary.csv",

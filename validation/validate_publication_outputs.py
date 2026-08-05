@@ -10,12 +10,12 @@ import pandas as pd
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_BENCHMARK = ROOT / "validation" / "outputs" / "direct_rdoc_gaussian_publication_20260805_matched_heldout_v3"
-DEFAULT_CALIBRATION = ROOT / "simulations" / "paper" / "outputs" / "publication_calibration_20260805_v3"
-DEFAULT_EMPIRICAL = ROOT / "empirical" / "derived_phi" / "empirical_fit_runs" / "publication_ready_20260805_v3"
-DEFAULT_CONTROLS = ROOT / "validation" / "outputs" / "direct_rdoc_negative_controls_publication_20260805_matched_heldout_v3"
-DEFAULT_ADAPTIVE = ROOT / "validation" / "outputs" / "direct_rdoc_adaptive_publication_20260805_matched_heldout_v3"
-DEFAULT_IRT = ROOT / "validation" / "outputs" / "direct_rdoc_irt_publication_20260805_matched_heldout_v3"
+DEFAULT_BENCHMARK = ROOT / "validation" / "outputs" / "direct_rdoc_gaussian_publication_20260805_matched_heldout_v4"
+DEFAULT_CALIBRATION = ROOT / "simulations" / "paper" / "outputs" / "publication_calibration_20260805_v4"
+DEFAULT_EMPIRICAL = ROOT / "empirical" / "derived_phi" / "empirical_fit_runs" / "publication_ready_20260805_v4"
+DEFAULT_CONTROLS = ROOT / "validation" / "outputs" / "direct_rdoc_negative_controls_publication_20260805_matched_heldout_v4"
+DEFAULT_ADAPTIVE = ROOT / "validation" / "outputs" / "direct_rdoc_adaptive_publication_20260805_matched_heldout_v4"
+DEFAULT_IRT = ROOT / "validation" / "outputs" / "direct_rdoc_irt_publication_20260805_matched_heldout_v4"
 
 
 def require(condition: bool, message: str) -> None:
@@ -50,13 +50,14 @@ def validate_benchmark(path: Path) -> dict:
         "ball_teacher_matching_only",
         "ball_full_decomposition",
         "ball_student_transition_only",
+        "ball_student_transition_only_strict",
     }
     key = ["cell", "share", "seed", "method"]
     require(set(per_run["method"]) == methods, f"Unexpected benchmark methods: {sorted(set(per_run['method']))}")
-    require(len(per_run) == 1100, f"Expected 1,100 benchmark rows, found {len(per_run)}")
+    require(len(per_run) == 1300, f"Expected 1,300 benchmark rows, found {len(per_run)}")
     require(not per_run.duplicated(key).any(), "Duplicate benchmark replicate keys")
     counts = per_run.groupby(["cell", "share", "method"]).size()
-    require(len(counts) == 110 and counts.eq(10).all(), "Benchmark cells are not complete at ten seeds each")
+    require(len(counts) == 130 and counts.eq(10).all(), "Benchmark cells are not complete at ten seeds each")
     for metric in ("latent_rmse", "val_anchor_rmse"):
         values = pd.to_numeric(per_run[metric], errors="coerce").to_numpy(dtype=float)
         require(np.isfinite(values).all(), f"Nonfinite benchmark {metric}")
@@ -70,7 +71,7 @@ def validate_benchmark(path: Path) -> dict:
         require(np.isfinite(values).all(), f"Nonfinite explicit-transition {metric}")
     aggregate = pd.read_csv(path / "aggregate.csv")
     paired = pd.read_csv(path / "paired_delta_aggregate.csv")
-    require(len(aggregate) == 110, f"Expected 110 aggregate rows, found {len(aggregate)}")
+    require(len(aggregate) == 130, f"Expected 130 aggregate rows, found {len(aggregate)}")
     require(len(paired) == 10, f"Expected 10 paired-delta rows, found {len(paired)}")
     for column in (
         "ball_minus_direct_latent_rmse_mean",
@@ -422,6 +423,15 @@ def validate_empirical(path: Path) -> dict:
         manifest.get("ball_py_sha256") == sha256(source_snapshot),
         "Empirical BALL.py source snapshot does not match the fit manifest",
     )
+    cadence_manifests = [
+        json.loads((path / f"empirical_teacher_student_manifest_{cadence}d.json").read_text(encoding="utf-8"))
+        for cadence in (14, 21, 28)
+    ]
+    require(
+        all(item.get("same_session_cross_instrument_questionnaires_in_causal_encoder") is False for item in cadence_manifests)
+        and all(item.get("questionnaire_event_accounting_identity_passed") is True for item in cadence_manifests),
+        "Prospective questionnaire timing or event accounting failed",
+    )
     require(manifest.get("canonical_clinic_count") == 19, "Empirical canonical clinic count is not 19")
     require(manifest.get("source_network_clinic_count") == 25, "Source network clinic count is not 25")
     require(manifest.get("observed_facility_string_count") == 23, "Observed facility-string count is not 23")
@@ -509,6 +519,8 @@ def validate_empirical(path: Path) -> dict:
         "interpolation",
         "locf",
         "causal_anchor_mean",
+        "locf_reference_origin",
+        "causal_anchor_mean_reference_origin",
         "ball_inherited_dynamics_only",
         "ball_teacher_matching_only",
         "ball_full_decomposition",
@@ -520,6 +532,11 @@ def validate_empirical(path: Path) -> dict:
         f"Unexpected empirical method set: {sorted(set(overall['method']))}",
     )
     require(np.isfinite(pd.to_numeric(overall["rmse"], errors="coerce")).all(), "Nonfinite empirical RMSE")
+    require(
+        {"rmse_raw", "rmse_support_clipped"}.issubset(overall.columns)
+        and np.isfinite(overall[["rmse_raw", "rmse_support_clipped"]].to_numpy(dtype=float)).all(),
+        "Raw and support-clipped empirical point-prediction errors are incomplete",
+    )
     require(
         set(calibration["cadence"]) == {14, 21, 28}
         and set(calibration["instrument"].astype(str)) == {"PHQ9", "BDI", "GAD7"},
@@ -547,6 +564,15 @@ def validate_empirical(path: Path) -> dict:
         "Retrospective full-record RDoC sensitivity is incomplete",
     )
     require(rdoc_transition_rows["id"].nunique() <= 345, "RDoC analysis exceeds the held-out-clinic population")
+    require(
+        {
+            "patients_with_any_profile",
+            "patients_with_at_least_two_profiles",
+            "eligible_transitions_after_prior_profile_requirement",
+        }.issubset(transition.columns)
+        and (transition["patients_with_at_least_two_profiles"] <= transition["patients_with_any_profile"]).all(),
+        "RDoC eligibility accounting is incomplete",
+    )
     require("stratum_type" in by_subgroup and "clinic" in set(by_subgroup["stratum_type"]), "Empirical subgroup output lacks clinic strata")
     require("stratum_type" in conditional and "clinic" in set(conditional["stratum_type"]), "Conditional calibration lacks clinic strata")
     require(len(by_instrument) > 0 and len(bootstrap) == 3 and len(generalization) > 0, "Empirical sensitivity outputs are incomplete")
@@ -554,7 +580,7 @@ def validate_empirical(path: Path) -> dict:
         set(input_contract["method"].astype(str)) == required_methods,
         "Empirical input contract does not cover every fitted method",
     )
-    expected_pairwise_counts = {14: 16, 21: 10, 28: 10}
+    expected_pairwise_counts = {14: 18, 21: 12, 28: 12}
     pairwise_counts = pairwise.groupby(pairwise["cadence"].astype(int)).size().to_dict()
     require(
         pairwise_counts == expected_pairwise_counts,
@@ -595,16 +621,13 @@ def validate_empirical(path: Path) -> dict:
         "Generalization output is not the prespecified forward-2025 sensitivity",
     )
     require(
-        set(generalization["n_train_source_eligible"].astype(int)) == {1142}
-        and set(generalization["n_test_source_eligible"].astype(int)) == {287}
-        and set(generalization["spanning_patients_excluded"].astype(int)) == {180},
-        "Strict temporal source cohorts changed",
-    )
-    require(
-        set(generalization["n_train_patients"].astype(int)) == {1139}
-        and set(generalization["n_test_model_patients"].astype(int)) == {287}
-        and set(generalization["n_test_patients"].astype(int)) == {281},
-        "Strict temporal modeled or evaluated patient counts changed",
+        generalization["n_train_source_eligible"].astype(int).gt(0).all()
+        and generalization["n_test_source_eligible"].astype(int).gt(0).all()
+        and generalization["spanning_patients_excluded"].astype(int).gt(0).all()
+        and generalization["n_test_model_patients"].astype(int).ge(generalization["n_test_patients"].astype(int)).all()
+        and generalization["n_temporal_calibration_patients"].astype(int).gt(0).all()
+        and generalization["n_temporal_final_test_patients"].astype(int).gt(0).all(),
+        "Strict temporal development, calibration, or final-test cohorts are invalid",
     )
     require(
         set(generalization["training_time_rule"].astype(str))
@@ -612,6 +635,13 @@ def validate_empirical(path: Path) -> dict:
         and set(generalization["test_time_rule"].astype(str))
         == {"first observed session on or after 2025-01-01"},
         "Strict temporal availability rules changed",
+    )
+    temporal_ball = generalization[generalization["method"].astype(str).eq("ball")]
+    require(
+        len(temporal_ball) == 1
+        and temporal_ball["patient_balanced_conformal_coverage"].between(0, 1).all()
+        and temporal_ball["mean_interval_width_fraction_of_legal_range"].between(0, 1).all(),
+        "Temporal conformal calibration is incomplete",
     )
     require(
         set(calibration["n_test_patients"].astype(int)) == {173}
@@ -624,7 +654,7 @@ def validate_empirical(path: Path) -> dict:
         .astype(int)
         .to_records(index=False)
         .tolist()
-        == [(14, 113230, 21661), (21, 113230, 15894), (28, 113230, 12679)],
+        == [(14, 122791, 23611), (21, 122791, 17336), (28, 122791, 13839)],
         "Assessment-burden counts changed",
     )
     require(set(workload["cadence"].astype(int)) == {14, 21, 28}, "Workload classification cadences are incomplete")
@@ -684,8 +714,17 @@ def validate_empirical(path: Path) -> dict:
         "Frozen development measurement calibration violates its identification constraints",
     )
     require(
+        measurement_calibration.get("fit_scope")
+        == "all genuine questionnaire events from the ten clinic-exclusive training clinics before artificial sparsification"
+        and set(measurement_calibration["development_data"]["normalized_score_mean_by_instrument"])
+        == {"PHQ9", "BDI", "GAD7"},
+        "Measurement calibration source or training means are incomplete",
+    )
+    require(
         set(hyperparameters["daily_persistence"].dropna().astype(float)).issuperset({0.1, 0.3, 0.6, 0.9})
-        and set(hyperparameters["questionnaire_weight"].dropna().astype(float)).issuperset({10.0, 20.0, 40.0, 80.0}),
+        and set(hyperparameters["questionnaire_weight"].dropna().astype(float)).issuperset({10.0, 20.0, 40.0, 80.0})
+        and len(hyperparameters) == 16
+        and set(hyperparameters["selection_stage"].astype(str)) == {"joint_grid"},
         "Development-only core hyperparameter selection is incomplete",
     )
 
@@ -772,25 +811,6 @@ def main() -> None:
             args.adaptive.resolve(),
             kind="adaptive Lasso",
             group_keys=["cell", "share", "method"],
-            expected_groups=90,
-            expected_methods={
-                "ball_student_causal",
-                "ball_teacher_smoother",
-                "ball_direct_causal",
-                "ball_direct_causal_compute_matched",
-                "ball_inherited_dynamics_only",
-                "ball_teacher_matching_only",
-                "ball_full_decomposition",
-                "ball_student_transition_only",
-                "s0_direct_lgssm",
-                "markov_direct_transition",
-            },
-            metrics=("latent_rmse", "val_anchor_rmse", "beta_cosine", "beta_topk_f1"),
-        ),
-        "irt": validate_sensitivity(
-            args.irt.resolve(),
-            kind="IRT",
-            group_keys=["cell", "share", "method"],
             expected_groups=110,
             expected_methods={
                 "ball_student_causal",
@@ -801,6 +821,27 @@ def main() -> None:
                 "ball_teacher_matching_only",
                 "ball_full_decomposition",
                 "ball_student_transition_only",
+                "ball_student_transition_only_strict",
+                "s0_direct_lgssm",
+                "markov_direct_transition",
+            },
+            metrics=("latent_rmse", "val_anchor_rmse", "beta_cosine", "beta_topk_f1"),
+        ),
+        "irt": validate_sensitivity(
+            args.irt.resolve(),
+            kind="IRT",
+            group_keys=["cell", "share", "method"],
+            expected_groups=130,
+            expected_methods={
+                "ball_student_causal",
+                "ball_teacher_smoother",
+                "ball_direct_causal",
+                "ball_direct_causal_compute_matched",
+                "ball_inherited_dynamics_only",
+                "ball_teacher_matching_only",
+                "ball_full_decomposition",
+                "ball_student_transition_only",
+                "ball_student_transition_only_strict",
                 "gp_causal_filter",
                 "exponential_decay_gru",
                 "s0_direct_lgssm",

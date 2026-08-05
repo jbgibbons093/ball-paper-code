@@ -63,7 +63,7 @@ class ClusterWeightedConformalTests(unittest.TestCase):
         q_empirical, n_empirical = empirical_quantile(scores, alpha=0.5)
         self.assertEqual((q_empirical, n_empirical), (q_simulation, n_simulation))
 
-    def test_finite_sample_rank_can_return_infinite_interval(self) -> None:
+    def test_patient_count_rank_can_return_infinite_interval(self) -> None:
         q, n_patients = empirical_quantile(self._scores(), alpha=0.05)
         self.assertEqual(n_patients, 3)
         self.assertTrue(np.isinf(q))

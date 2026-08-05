@@ -67,7 +67,7 @@ $commonSources = @(
 $seeds = @('1729', '2027', '2028', '2029', '4242', '9001', '13', '71', '137', '311')
 $cells = @('linear', 'interaction', 'nonlinear', 'heterogeneous', 'missingness')
 
-$gaussianOut = Join-Path $outputRoot 'direct_rdoc_gaussian_publication_20260805_matched_heldout_v3'
+$gaussianOut = Join-Path $outputRoot 'direct_rdoc_gaussian_publication_20260805_matched_heldout_v4'
 $gaussianArgs = @(
     '-u', 'validation\direct_rdoc_benchmark.py',
     '--cells'
@@ -82,7 +82,7 @@ $gaussianArgs = @(
 )
 Invoke-SimulationStep -Name 'Gaussian benchmark' -OutputDirectory $gaussianOut -Arguments $gaussianArgs -SourceFiles $commonSources
 
-$parameterOut = Join-Path $outputRoot 'focused_parameter_sensitivities_publication_20260805_v1'
+$parameterOut = Join-Path $outputRoot 'focused_parameter_sensitivities_publication_20260805_v2'
 $parameterArgs = @(
     '-u', 'validation\run_focused_parameter_sensitivities.py',
     '--out', $parameterOut,
@@ -98,7 +98,7 @@ Invoke-SimulationStep -Name 'Focused parameter sensitivities' -OutputDirectory $
     'validation\run_focused_parameter_sensitivities.py'
 )
 
-$calibrationOut = Join-Path $taskRoot 'simulations\paper\outputs\publication_calibration_20260805_v3'
+$calibrationOut = Join-Path $taskRoot 'simulations\paper\outputs\publication_calibration_20260805_v4'
 $calibrationArgs = @(
     '-u', 'BALL.py', 'paper-fig3',
     '--replicates', '10', '--n', '1000', '--t', '84', '--base-seed', '60000',
@@ -108,7 +108,7 @@ $calibrationArgs = @(
 )
 Invoke-SimulationStep -Name 'Uncertainty calibration' -OutputDirectory $calibrationOut -Arguments $calibrationArgs -SourceFiles @('BALL.py')
 
-$irtOut = Join-Path $outputRoot 'direct_rdoc_irt_publication_20260805_matched_heldout_v3'
+$irtOut = Join-Path $outputRoot 'direct_rdoc_irt_publication_20260805_matched_heldout_v4'
 $irtArgs = @(
     '-u', 'validation\direct_rdoc_benchmark.py',
     '--cells'
@@ -124,7 +124,7 @@ $irtArgs = @(
 )
 Invoke-SimulationStep -Name 'Item-response benchmark' -OutputDirectory $irtOut -Arguments $irtArgs -SourceFiles $commonSources
 
-$adaptiveOut = Join-Path $outputRoot 'direct_rdoc_adaptive_publication_20260805_matched_heldout_v3'
+$adaptiveOut = Join-Path $outputRoot 'direct_rdoc_adaptive_publication_20260805_matched_heldout_v4'
 $adaptiveArgs = @(
     '-u', 'validation\direct_rdoc_benchmark.py',
     '--cells'
@@ -142,7 +142,7 @@ $adaptiveArgs = @(
 )
 Invoke-SimulationStep -Name 'Adaptive coefficient sensitivity' -OutputDirectory $adaptiveOut -Arguments $adaptiveArgs -SourceFiles $commonSources
 
-$controlsOut = Join-Path $outputRoot 'direct_rdoc_negative_controls_publication_20260805_matched_heldout_v3'
+$controlsOut = Join-Path $outputRoot 'direct_rdoc_negative_controls_publication_20260805_matched_heldout_v4'
 $controlSources = $commonSources + @('validation\direct_rdoc_negative_controls.py')
 $controlsArgs = @(
     '-u', 'validation\direct_rdoc_negative_controls.py',

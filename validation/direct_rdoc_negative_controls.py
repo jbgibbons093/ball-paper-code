@@ -48,10 +48,8 @@ def _break_proxy(data, seed: int, control: str):
     cols = [f"B{j}" for j in range(q)]
     rng = np.random.default_rng(int(seed) + 918273)
     if control == "permuted_proxy":
-        for col in cols:
-            vals = comp[col].to_numpy(dtype=float).copy()
-            rng.shuffle(vals)
-            comp[col] = vals
+        permutation = rng.permutation(len(comp))
+        comp.loc[:, cols] = comp[cols].to_numpy(dtype=float)[permutation]
     elif control == "noise_proxy":
         for col in cols:
             comp[col] = rng.normal(0.0, 1.0, size=len(comp))
@@ -59,6 +57,9 @@ def _break_proxy(data, seed: int, control: str):
         raise ValueError(f"Unknown proxy control: {control}")
     metadata = dict(data.metadata)
     metadata["direct_rdoc_negative_control"] = control
+    metadata["rdoc_permutation_unit"] = (
+        "six-dimensional profile vector" if control == "permuted_proxy" else None
+    )
     metadata["direct_rdoc_negative_control_note"] = (
         "Latent trajectory and anchors retain the generated direct signal, but "
         "the observed RDoC proxy supplied to all fitted methods is broken."

@@ -3306,8 +3306,8 @@ def conformal_calibrate_structural_posterior(
     Observable recall-windowed anchor residuals are divided by the model-derived
     predictive standard deviation for the same recalled quantity. Every
     calibration patient contributes total weight one, divided equally among that
-    patient's measurements. The finite-sample rank is defined on the number of
-    patient clusters. The resulting multiplier acts on each session's
+    patient's measurements. The weighted quantile uses the number of independent
+    patient clusters to set its rank, and the resulting multiplier acts on each session's
     ensemble-plus-Laplace standard deviation, so interval width remains patient-
     and session-specific. This targets patient-balanced marginal measurement
     coverage rather than simultaneous coverage of every measurement within a
@@ -4375,6 +4375,7 @@ def build_ssm_batch(
     feature_stats: tuple[np.ndarray, np.ndarray] | None = None,
     causal_impute: bool = False,
     include_rdoc_in_encoder: bool = True,
+    strict_prior_questionnaire_inputs: bool | None = None,
 ) -> tuple[SSMBatch, tuple[np.ndarray, np.ndarray]]:
     q = data.config.q
     p = data.config.p_daily
@@ -4485,11 +4486,28 @@ def build_ssm_batch(
                 win_start[row, k, instrument_position] = max(0, t_index.get(int(arow.window_start), 0))
                 win_end[row, k, instrument_position] = t_index.get(int(arow.window_end), k)
 
+    # Prospective encoders receive questionnaire events beginning at the next
+    # recorded session. The event likelihood remains at the true session, so a
+    # same-session questionnaire can supervise training without becoming an
+    # input to another questionnaire prediction from that encounter.
+    if strict_prior_questionnaire_inputs is None:
+        strict_prior_questionnaire_inputs = bool(causal_impute)
+    encoder_anchor_value = anchor_value.copy()
+    encoder_anchor_obs = anchor_obs.copy()
+    if strict_prior_questionnaire_inputs:
+        encoder_anchor_value[:, 1:, :] = anchor_value[:, :-1, :]
+        encoder_anchor_obs[:, 1:, :] = anchor_obs[:, :-1, :]
+        encoder_anchor_value[:, 0, :] = 0.0
+        encoder_anchor_obs[:, 0, :] = 0.0
+
     # Encoder features: standardized [EHR | EHR availability masks | RDoC |
-    # anchor value*obs | obs flags] +
+    # strictly prior anchor value*obs | strictly prior obs flags] +
     # the action is added as a learned embedding inside the encoder.
     encoder_rdoc = rdoc if include_rdoc_in_encoder else np.zeros_like(rdoc)
-    raw = np.concatenate([ehr, x_input, encoder_rdoc, anchor_value * anchor_obs, anchor_obs], axis=-1)
+    raw = np.concatenate(
+        [ehr, x_input, encoder_rdoc, encoder_anchor_value * encoder_anchor_obs, encoder_anchor_obs],
+        axis=-1,
+    )
     no_encoder_scaling = data.metadata.get("encoder_feature_scaling") == "none"
     if no_encoder_scaling:
         feature_stats = (
@@ -5822,10 +5840,11 @@ def fit_ball_ssm_direct_causal(
 ) -> MethodResult:
     """Fit the causal transformer directly, without a bidirectional teacher.
 
-    This is the critical distillation ablation. It uses the same causal inputs,
-    generative transition model, tempered variational objective, architecture,
-    ensemble size and uncertainty construction as the deployable BALL student.
-    The only removed component is smoothing-to-filtering distillation.
+    This comparator tests the complete teacher-student training strategy while
+    holding the prospective input history, encoder architecture, ensemble size,
+    and uncertainty construction constant. The mechanistic decomposition then
+    separates inherited dynamics, teacher-distribution matching, questionnaire
+    re-anchoring, and additional optimization.
     """
 
     config = config or SSMConfig()
@@ -6629,6 +6648,7 @@ from simulations.src.methods.ball_structural import (
 from simulations.src.methods.ball_ssm import (
     InferenceTransformer,
     SSMConfig,
+    _anchor_measurement_spec,
     build_ssm_batch,
     _impute as _ssm_impute,
 )
@@ -6866,6 +6886,7 @@ def _check_slow_decomposition_consistency() -> None:
 def _check_causal_anchor_token_no_future_leak() -> None:
     data_config = SimulationConfig(n=30, t=28, seed=6060, double_anchor_latents=True)
     data = generate_dataset(data_config)
+    data.metadata = {**data.metadata, "encoder_feature_scaling": "none"}
     torch_config = SSMConfig(
         d_model=16,
         n_heads=4,
@@ -6881,6 +6902,14 @@ def _check_causal_anchor_token_no_future_leak() -> None:
         max_individuals=torch_config.max_individuals,
         causal_impute=True,
     )
+    instrument_count = len(_anchor_measurement_spec(data)["names"])
+    encoder_anchor_flags = batch.enc_features[:, :, -instrument_count:]
+    expected_flags = torch.zeros_like(batch.anchor_obs)
+    expected_flags[:, 1:, :] = batch.anchor_obs[:, :-1, :]
+    if not torch.equal(encoder_anchor_flags, expected_flags):
+        raise AssertionError(
+            "A causal encoder received a questionnaire at its recorded session instead of the next session."
+        )
     torch.manual_seed(torch_config.seed)
     action_embed = torch.nn.Embedding(data.config.n_treatment_types + 1, torch_config.action_embed_dim)
     model = InferenceTransformer(
@@ -9561,7 +9590,7 @@ def _value(df: pd.DataFrame, scale: str) -> pd.Series:
 
 
 def _sparsify(df: pd.DataFrame, genuine: pd.Series, cadence_days: int) -> pd.Series:
-    """First genuine measurement in each within-patient cadence-day bin = anchor.
+    """Retain the first genuine instrument event in each patient cadence interval.
 
     Returns a role Series over the genuine rows ('anchor' / 'heldout_eval');
     non-genuine rows are NaN. The held-out genuine measurements at finer
@@ -9603,7 +9632,34 @@ def _build_anchor_set(df: pd.DataFrame, masks: dict[str, pd.Series], cadence_day
                     "cadence_days": int(cadence_days),
                 }
             )
-    return pd.DataFrame(rows).sort_values(["id", "day", "anchor"]).reset_index(drop=True)
+    anchors = pd.DataFrame(rows).sort_values(["id", "day", "session", "anchor"]).reset_index(drop=True)
+    if anchors.duplicated(["id", "session", "anchor"]).any():
+        raise AssertionError("Questionnaire events must be unique by patient, session, and instrument.")
+    channel = anchors["anchor"].map({"PHQ9": "depression", "BDI": "depression", "GAD7": "anxiety"})
+    anchors["channel"] = channel
+    anchors["evaluation_role"] = ""
+    anchors.loc[anchors["role"].eq("anchor"), "evaluation_role"] = "retained"
+    for (patient_id, latent_channel), group in anchors.groupby(["id", "channel"], sort=False):
+        retained = group[group["role"].eq("anchor")]
+        retained_windows = list(zip(retained["window_start_day"], retained["window_end_day"]))
+        for index, row in group[group["role"].eq("heldout_eval")].iterrows():
+            overlaps = any(
+                int(start) <= int(row["window_end_day"])
+                and int(row["window_start_day"]) <= int(end)
+                for start, end in retained_windows
+            )
+            anchors.at[index, "evaluation_role"] = (
+                "withheld_ineligible_overlap" if overlaps else "withheld_eligible"
+            )
+    if anchors["evaluation_role"].eq("").any():
+        raise AssertionError("Every genuine questionnaire event must receive an explicit analysis role.")
+    n_input = int(len(anchors))
+    n_retained = int(anchors["evaluation_role"].eq("retained").sum())
+    n_withheld = int(anchors["evaluation_role"].eq("withheld_eligible").sum())
+    n_ineligible = int(anchors["evaluation_role"].eq("withheld_ineligible_overlap").sum())
+    if n_input != n_retained + n_withheld + n_ineligible:
+        raise AssertionError("Questionnaire event accounting failed.")
+    return anchors
 
 
 def _anchor_counts(anchors: pd.DataFrame, n_patients: int) -> dict:
@@ -9614,6 +9670,10 @@ def _anchor_counts(anchors: pd.DataFrame, n_patients: int) -> dict:
         out[scale] = {
             "anchor": n_anchor,
             "heldout_eval": int((s["role"] == "heldout_eval").sum()),
+            "withheld_eligible": int((s["evaluation_role"] == "withheld_eligible").sum()),
+            "withheld_ineligible_overlap": int(
+                (s["evaluation_role"] == "withheld_ineligible_overlap").sum()
+            ),
             "mean_anchors_per_patient": round(n_anchor / max(n_patients, 1), 2),
         }
     return out
@@ -9652,7 +9712,9 @@ def main() -> None:
         "n_sessions": int(len(df)),
         "date_range": [str(df["ServiceDate"].min()), str(df["ServiceDate"].max())],
         "sessions_per_patient_median": float(df.groupby("PatientFID").size().median()),
-        "sparsification_rule": "first genuine measurement per within-patient cadence-day bin = anchor; rest = heldout_eval",
+        "sparsification_rule": "first genuine questionnaire event per patient, instrument, and cadence interval is retained",
+        "event_accounting_identity": "input events = retained events + eligible withheld events + recall-overlap-ineligible events",
+        "recall_window_eligibility": "a target is eligible only when its recall window has an empty intersection with every retained questionnaire window in the same latent channel",
         "recall_windows_days": RECALL_WINDOW_DAYS,
         "value_ranges": VALUE_RANGE,
         "measurements_excluded_outside_instrument_range": {
@@ -9662,6 +9724,13 @@ def main() -> None:
         "notes_rdoc_proxy": "McCoy/Perlis-style LLM RDoC 6-dim profile from clinical notes -> direct-transition proxy B(t)",
         "cadences": {},
     }
+    all_events = _build_anchor_set(df, masks, int(cadences[0]))[
+        ["id", "anchor", "channel", "session", "date", "day", "value", "window_start_day", "window_end_day"]
+    ].copy()
+    if all_events.duplicated(["id", "session", "anchor"]).any():
+        raise AssertionError("The all-event questionnaire inventory contains a duplicate event.")
+    all_events.to_csv(OUT / "questionnaire_events_all.csv", index=False)
+    manifest["all_genuine_questionnaire_events"] = int(len(all_events))
     for cadence in cadences:
         anchors = _build_anchor_set(df, masks, cadence)
         suffix = "" if (not args.sweep and cadence == DEFAULT_CADENCE) else f"_{cadence}d"
@@ -10580,6 +10649,10 @@ def _measurement_sequences(
             instrument: float(group["normalized_value"].std(ddof=1))
             for instrument, group in events.groupby("anchor", sort=True)
         },
+        "normalized_score_mean_by_instrument": {
+            instrument: float(group["normalized_value"].mean())
+            for instrument, group in events.groupby("anchor", sort=True)
+        },
         "paired_phq9_bdi_patient_sessions": int(paired),
         "patient_id_hash": hashlib.sha256(
             "|".join(str(value) for value in sorted(events["id"].unique())).encode("utf-8")
@@ -10699,9 +10772,12 @@ def _fit_development_measurement_calibration(
     anx = np.asarray(anxiety_fit.x, dtype=float)
     transforms = _standardizers(anchors)
     calibration = {
-        "version": "development_joint_longitudinal_measurement_v1",
-        "fit_scope": "clinic-exclusive development patients",
+        "version": "training_clinic_joint_longitudinal_measurement_v2",
+        "fit_scope": "all genuine questionnaire events from the ten clinic-exclusive training clinics before artificial sparsification",
         "fit_once_across_cadences": True,
+        "paired_session_observations": "sequential conditionally independent likelihood contributions for each instrument event",
+        "bdi_loading_constraint": "positive through exponential parameterization",
+        "optimizer": "L-BFGS-B with fixed initialization, bounds, and convergence tolerances",
         "transforms": {
             instrument: {"midpoint": float(values[0]), "half_range": float(values[1])}
             for instrument, values in transforms.items()
@@ -11080,6 +11156,8 @@ def _empirical_neural_dataset(
             "anchor_representation": "one event per patient, session, and questionnaire instrument",
             "questionnaire_event_collisions": 0,
             "retained_questionnaire_event_count": expected_event_count,
+            "causal_questionnaire_input_timing": "available to the encoder from the next recorded session",
+            "same_session_cross_instrument_substitution": False,
             "feature_names": EMPIRICAL_FEATURE_NAMES,
             "feature_timing": "Diagnosis records and encoder treatment history are strictly earlier than the modeled session.",
             "time_encoding": "Raw treatment session number as context; raw inter-session days enter the transition interval dt.",
@@ -11120,8 +11198,10 @@ def _empirical_selection_score(
 
     depression = _prediction_lookup(result.predictions, "z_d_hat")
     anxiety = _prediction_lookup(result.predictions, "z_p_hat")
+    if "evaluation_role" not in anchors.columns:
+        raise ValueError("Hyperparameter selection requires explicit questionnaire event eligibility.")
     rows = anchors[
-        anchors["role"].eq("heldout_eval")
+        anchors["evaluation_role"].eq("withheld_eligible")
         & anchors["id"].astype(int).isin(validation_ids)
     ]
     errors: list[dict[str, float | int]] = []
@@ -11215,7 +11295,7 @@ def _select_empirical_ball_hyperparameters(
     )
     records: list[dict[str, float | str]] = []
 
-    def evaluate(phi: float, weight: float, stage: str) -> float:
+    def evaluate(phi: float, weight: float) -> float:
         config = _dataclasses.replace(base, delta_phi=float(phi), anchor_weight=float(weight))
         result = fit_ball_ssm(
             data,
@@ -11234,29 +11314,36 @@ def _select_empirical_ball_hyperparameters(
         )
         records.append(
             {
-                "selection_stage": stage,
+                "selection_stage": "joint_grid",
                 "daily_persistence": float(phi),
                 "questionnaire_weight": float(weight),
                 "validation_rmse_development_sd_units": float(rmse),
                 "n_validation_patients": int(len(validation_ids)),
+                "fit_scope": "ten clinic-exclusive training clinics",
+                "scoring_scope": "three clinic-exclusive model-selection clinics",
+                "selection_cadence_days": 14,
+                "criterion": "patient-balanced RMSE over recall-window-eligible questionnaire events",
+                "shared_between_latent_channels": True,
+                "shared_across_empirical_cadences": True,
             }
         )
         return rmse
 
-    persistence_scores = {
-        phi: evaluate(phi, 40.0, "daily_persistence")
+    candidates = [
+        (float(phi), float(weight))
         for phi in (0.1, 0.3, 0.6, 0.9)
-    }
-    selected_phi = min(persistence_scores, key=persistence_scores.get)
-    weight_scores = {
-        weight: evaluate(selected_phi, weight, "questionnaire_weight")
         for weight in (10.0, 20.0, 40.0, 80.0)
-    }
-    selected_weight = min(weight_scores, key=weight_scores.get)
+    ]
+    scores = {(phi, weight): evaluate(phi, weight) for phi, weight in candidates}
+    selected_phi, selected_weight = min(
+        candidates,
+        key=lambda candidate: (scores[candidate], candidate[0], candidate[1]),
+    )
     selection_table = pd.DataFrame(records)
     selection_table["selected_daily_persistence"] = float(selected_phi)
     selection_table["selected_questionnaire_weight"] = float(selected_weight)
-    selection_table["selection_scope"] = "source training and validation clinics only"
+    selection_table["tie_break"] = "lower persistence followed by lower questionnaire weight"
+    selection_table["final_refit_scope"] = "all thirteen development clinics"
     return float(selected_phi), float(selected_weight), selection_table
 
 
@@ -11496,6 +11583,8 @@ def _fit_empirical_teacher_student(
         "global_parameter_training_scope": "clinic-exclusive source training plus validation patients only",
         "prediction_scope": "clinic-exclusive patients from six held-out test clinics",
         "time_of_estimation": "immediately before the current symptom measurement",
+        "causal_questionnaire_input_rule": "questionnaire values and masks become encoder inputs at the next recorded session",
+        "same_session_cross_instrument_questionnaires_in_causal_encoder": False,
         "same_session_narrative_inputs": False,
         "same_session_treatment_in_causal_encoder": False,
         "causal_encoder_treatment_context": "previous-session treatment category only",
@@ -11516,6 +11605,17 @@ def _fit_empirical_teacher_student(
         ),
         "retained_questionnaire_event_count": int(
             data.metadata.get("retained_questionnaire_event_count", -1)
+        ),
+        "questionnaire_event_accounting": {
+            role: int(anchors["evaluation_role"].eq(role).sum())
+            for role in ("retained", "withheld_eligible", "withheld_ineligible_overlap")
+        },
+        "questionnaire_event_accounting_identity_passed": bool(
+            len(anchors)
+            == sum(
+                int(anchors["evaluation_role"].eq(role).sum())
+                for role in ("retained", "withheld_eligible", "withheld_ineligible_overlap")
+            )
         ),
         "anchor_instrument_names": list(data.config.anchor_instrument_names),
         "anchor_instrument_channels": list(data.config.anchor_instrument_channels),
@@ -11892,7 +11992,10 @@ def _fit_empirical_gp_channel(
         filtered = prior_mean.copy()
         measurement_positions = np.asarray(measurement_positions, dtype=int)
         for step in range(count):
-            eligible = measurement_positions <= step
+            # The strict prospective target is defined immediately before the
+            # questionnaire encounter, so only earlier recorded sessions can
+            # condition the filtered estimate at this step.
+            eligible = measurement_positions < step
             if eligible.any():
                 conditioned = _gp_conditioned_mean(
                     prior_mean,
@@ -11984,8 +12087,10 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
             value = float(anchor.value)
             if anchor_flag[position, instrument_position] > 0:
                 raise ValueError("Duplicate patient-session-instrument event entered the recurrent comparator.")
-            anchor_input[position, instrument_position] = value
-            anchor_flag[position, instrument_position] = 1.0
+            input_position = position + 1
+            if input_position < t_count and valid[input_position]:
+                anchor_input[input_position, instrument_position] = value
+                anchor_flag[input_position, instrument_position] = 1.0
             start = max(0, int(anchor.window_start))
             end = min(t_count - 1, int(anchor.window_end))
             if end >= start:
@@ -12638,7 +12743,9 @@ def _channel_eval(
         else:
             sess_days = np.sort(sess["day"].unique()).astype(int)
         retained = ach[ach["role"] == "anchor"]
-        heldout = ach[ach["role"] == "heldout_eval"]
+        if "evaluation_role" not in ach.columns:
+            raise ValueError("Prospective evaluation requires explicit questionnaire event eligibility.")
+        heldout = ach[ach["evaluation_role"] == "withheld_eligible"]
         if heldout.empty:
             continue
         # The deployed neural estimators and prospective anchor baselines do not
@@ -12652,7 +12759,9 @@ def _channel_eval(
             L, raw_sd = _solve_patient(sess_days, retained, stats)
             if L is None:
                 continue
+        retained = retained.sort_values(["session", "day", "anchor"], kind="mergesort")
         ret_days = retained["day"].to_numpy(dtype=float)
+        ret_sessions = retained["session"].to_numpy(dtype=int)
         ret_z_values = []
         for value, instrument in zip(retained["value"], retained["anchor"]):
             midpoint, half_range = stats[instrument]
@@ -12667,7 +12776,7 @@ def _channel_eval(
                 / float(parameters["loading"])
             )
         ret_z = np.asarray(ret_z_values, dtype=float)
-        order = np.argsort(ret_days)
+        order = np.argsort(ret_sessions, kind="stable")
         baseline_rows = (
             ach.sort_values(["day", "session"], kind="mergesort")
             .groupby("anchor", sort=False)
@@ -12679,7 +12788,7 @@ def _channel_eval(
         baseline_day_by_anchor = baseline_rows["day"].to_dict()
         patients.append({
             "id": int(pid), "sess_days": sess_days, "heldout": heldout, "L": L, "raw_sd": raw_sd,
-            "ret_days_s": ret_days[order], "ret_z_s": ret_z[order],
+            "ret_days_s": ret_days[order], "ret_sessions_s": ret_sessions[order], "ret_z_s": ret_z[order],
             "retained_windows": list(zip(retained["window_start_day"], retained["window_end_day"])),
             "baseline_by_anchor": baseline_by_anchor,
             "baseline_day_by_anchor": baseline_day_by_anchor,
@@ -12693,13 +12802,13 @@ def _channel_eval(
         sess_days = p["sess_days"]
         L = p["L"]
         raw_sd = p["raw_sd"]
-        ret_days_s, ret_z_s = p["ret_days_s"], p["ret_z_s"]
+        ret_days_s, ret_sessions_s, ret_z_s = p["ret_days_s"], p["ret_sessions_s"], p["ret_z_s"]
         retained_windows = p["retained_windows"]
         pid = p["id"]
         for h in p["heldout"].itertuples(index=False):
             w0, w1, day = int(h.window_start_day), int(h.window_end_day), int(h.day)
             if _overlaps_retained(w0, w1, retained_windows):
-                continue  # recall-window embargo
+                raise AssertionError("An eligible target violates the recall-window embargo.")
             mu, sd = stats[h.anchor]
             z_true = (float(h.value) - mu) / sd
             parameters = (
@@ -12729,7 +12838,8 @@ def _channel_eval(
             baseline_day = float(p["baseline_day_by_anchor"].get(h.anchor, np.nan))
             if np.isfinite(baseline_day) and baseline_day > day:
                 raise AssertionError("A clinical classification baseline occurs after its target.")
-            prior_mask = ret_days_s <= day
+            target_session = int(h.session)
+            prior_mask = ret_sessions_s < target_session
             prior_anchor_count = int(np.sum(prior_mask))
             # Gap means elapsed time since the most recent prior anchor. It must
             # never look ahead to a later retained measurement. Cold-start rows
@@ -12808,13 +12918,29 @@ def _channel_eval(
             markov = (to_measurement_scale(_predict_lookup_window(predictions["markov"], pid, sess_days, w0, w1, day))
                       if "markov" in predictions else float("nan"))
             interp = to_measurement_scale(float(np.interp(day, ret_days_s, ret_z_s))) if ret_days_s.size else float("nan")
-            # Both deployable anchor baselines use only measurements available by
-            # the day being estimated. Zero is the midpoint after each questionnaire
-            # is transformed using its published minimum and maximum totals. The cumulative anchor mean
-            # is distinct from LOCF and never falls back to interpolation.
+            # Both deployable anchor baselines use questionnaire events recorded
+            # before the target day. Their cold-start value is the frozen mean for
+            # the target instrument in the ten training clinics.
             prior_z = ret_z_s[prior_mask]
-            locf = to_measurement_scale(float(prior_z[-1]) if prior_z.size else 0.0)
-            causal_anchor_mean = to_measurement_scale(float(prior_z.mean()) if prior_z.size else 0.0)
+            development_mean_normalized = float(
+                measurement_calibration["development_data"]["normalized_score_mean_by_instrument"][h.anchor]
+                if measurement_calibration is not None else 0.0
+            )
+            development_mean_latent = (
+                development_mean_normalized - instrument_intercept
+            ) / instrument_loading
+            locf = to_measurement_scale(
+                float(prior_z[-1]) if prior_z.size else development_mean_latent
+            )
+            causal_anchor_mean = to_measurement_scale(
+                float(prior_z.mean()) if prior_z.size else development_mean_latent
+            )
+            locf_reference_origin = to_measurement_scale(
+                float(prior_z[-1]) if prior_z.size else 0.0
+            )
+            causal_anchor_mean_reference_origin = to_measurement_scale(
+                float(prior_z.mean()) if prior_z.size else 0.0
+            )
             ball_anchor_only = (
                 to_measurement_scale(
                     _predict_lookup_window(predictions["ball_anchor_only"], pid, sess_days, w0, w1, day)
@@ -12833,6 +12959,8 @@ def _channel_eval(
                 "exponential_decay_gru": ode_rnn,
                 "markov_direct_transition": markov, "interpolation": interp, "locf": locf,
                 "causal_anchor_mean": causal_anchor_mean,
+                "locf_reference_origin": locf_reference_origin,
+                "causal_anchor_mean_reference_origin": causal_anchor_mean_reference_origin,
                 "ball_anchor_only": ball_anchor_only,
                 "ball_sd": float(ball_sd),
                 **focused_predictions,
@@ -12948,13 +13076,21 @@ def _workload_classification_rows(
             if group_use.empty:
                 continue
             for method_index, method in enumerate(methods):
-                if method not in group_use or not np.isfinite(group_use[method]).all():
+                clipped_column = f"{method}_native_clipped"
+                if clipped_column not in group_use and method in group_use:
+                    native = (
+                        group_use[method].to_numpy(dtype=float)
+                        * group_use["scale_half_range"].to_numpy(dtype=float)
+                        + group_use["scale_center"].to_numpy(dtype=float)
+                    )
+                    group_use[clipped_column] = np.clip(
+                        native,
+                        0.0,
+                        2.0 * group_use["scale_half_range"].to_numpy(dtype=float),
+                    )
+                if clipped_column not in group_use or not np.isfinite(group_use[clipped_column]).all():
                     continue
-                predicted_raw = (
-                    group_use[method].to_numpy(dtype=float)
-                    * group_use["scale_half_range"].to_numpy(dtype=float)
-                    + group_use["scale_center"].to_numpy(dtype=float)
-                )
+                predicted_raw = group_use[clipped_column].to_numpy(dtype=float)
                 if outcome == "response":
                     prediction = predicted_raw <= (
                         0.5 * group_use["baseline_raw"].to_numpy(dtype=float)
@@ -12967,6 +13103,7 @@ def _workload_classification_rows(
                         "instrument": str(instrument),
                         "outcome": outcome,
                         "method": method,
+                        "point_prediction_support_clipped": True,
                         "n": int(len(group_use)),
                         "n_patients": int(group_use["id"].nunique()),
                         **_patient_balanced_binary_metrics(
@@ -13220,6 +13357,9 @@ def _transition_one_group(
 ) -> tuple[dict, list[dict]]:
     frame = frame.dropna(subset=["delta", *RDOC_NUISANCE_COLS, *RDOC_COLS]).copy()
     frame = frame.sort_values(["id", "day", "next_day"], kind="mergesort").reset_index(drop=True)
+    patients_with_any_profile = int(frame["id"].nunique())
+    profile_counts = frame.groupby("id", sort=False).size()
+    patients_with_two_profiles = int(profile_counts.ge(2).sum())
     if len(frame) < 25 or frame["id"].nunique() < 5:
         return {
             "cadence": cadence, "channel": channel, "n": int(len(frame)),
@@ -13227,6 +13367,11 @@ def _transition_one_group(
             "rmse_rdoc": float("nan"), "rmse_improvement": float("nan"),
             "incremental_r2": float("nan"), "beta_norm": float("nan"),
             "top_domain": "", "permutation_p": float("nan"),
+            "patients_with_any_profile": patients_with_any_profile,
+            "patients_with_at_least_two_profiles": patients_with_two_profiles,
+            "eligible_transitions_after_prior_profile_requirement": int(
+                np.maximum(profile_counts.to_numpy(dtype=int) - 1, 0).sum()
+            ),
         }, []
 
     # The primary decomposition uses the mean of strictly earlier profiles, so
@@ -13292,6 +13437,9 @@ def _transition_one_group(
         "channel": channel,
         "n": int(len(frame)),
         "n_patients": int(frame["id"].nunique()),
+        "patients_with_any_profile": patients_with_any_profile,
+        "patients_with_at_least_two_profiles": patients_with_two_profiles,
+        "eligible_transitions_after_prior_profile_requirement": int(len(frame)),
         "rmse_nuisance": base_rmse,
         "rmse_rdoc": full_rmse,
         "rmse_improvement": improvement,
@@ -13741,6 +13889,9 @@ def _generalization_split_maps(sessions_full: pd.DataFrame) -> dict[str, dict[in
     sessions = sessions_full.copy()
     if "split" not in sessions.columns or "date" not in sessions.columns:
         return {}
+    # The forward-time analysis stays within the thirteen development clinics,
+    # so it changes calendar period while holding the clinic network constant.
+    sessions = sessions[sessions["split"].astype(str).isin(["train", "val"])].copy()
     dates = pd.to_datetime(sessions["date"], errors="coerce")
     patient_dates = sessions.assign(_date=dates).groupby("id")["_date"].agg(
         first_date="min", last_date="max"
@@ -13758,9 +13909,7 @@ def _generalization_split_maps(sessions_full: pd.DataFrame) -> dict[str, dict[in
             if pd.notna(row["first_date"]) and row["first_date"] >= cutoff
         }
     )
-    # Clinic-held-out validation is now the primary empirical design. Retain only
-    # the orthogonal forward-time sensitivity here to avoid fitting a duplicate
-    # site model.
+    # Courses crossing the cutoff satisfy neither rule and are excluded.
     return {"forward_2025": temporal_split}
 
 
@@ -13779,7 +13928,10 @@ def _fit_generalization_sensitivities(
         if not train_ids or not test_ids:
             continue
         anchors_use = anchors
-        sessions_use = sessions_full
+        development_network_sessions = sessions_full[
+            sessions_full["split"].astype(str).isin(["train", "val"])
+        ].copy()
+        sessions_use = development_network_sessions
         comorbidity_use = comorbidity_sessions
         if args.max_patients is not None:
             n_train = max(2, int(args.max_patients) // 2)
@@ -13789,16 +13941,54 @@ def _fit_generalization_sensitivities(
             keep_ids = train_ids | test_ids
             patient_splits = {pid: patient_splits[pid] for pid in keep_ids}
             anchors_use = anchors[anchors["id"].astype(int).isin(keep_ids)].copy()
-            sessions_use = sessions_full[sessions_full["id"].astype(int).isin(keep_ids)].copy()
+            sessions_use = development_network_sessions[
+                development_network_sessions["id"].astype(int).isin(keep_ids)
+            ].copy()
             comorbidity_use = comorbidity_sessions[
                 comorbidity_sessions["id"].astype(int).isin(keep_ids)
             ].copy()
+        all_questionnaire_events = pd.read_csv(OUT / "questionnaire_events_all.csv")
+        pre_2025_training_ids = {
+            int(patient_id)
+            for patient_id in train_ids
+            if str(
+                development_network_sessions.loc[
+                    development_network_sessions["id"].astype(int).eq(int(patient_id)), "split"
+                ].iloc[0]
+            ) == "train"
+        }
+        temporal_measurement_map = {
+            int(patient_id): "train" for patient_id in pre_2025_training_ids
+        }
+        temporal_measurement_calibration = _fit_development_measurement_calibration(
+            all_questionnaire_events,
+            temporal_measurement_map,
+        )
+        temporal_args = argparse.Namespace(**vars(args))
+        if args.select_core_hyperparameters:
+            selection_sessions = development_network_sessions[
+                development_network_sessions["id"].astype(int).isin(train_ids)
+            ].copy()
+            selection_comorbidity = comorbidity_sessions[
+                comorbidity_sessions["id"].astype(int).isin(train_ids)
+            ].copy()
+            selection_map = {int(patient_id): "train" for patient_id in train_ids}
+            temporal_phi, temporal_weight, _ = _select_empirical_ball_hyperparameters(
+                anchors,
+                selection_sessions,
+                selection_comorbidity,
+                temporal_measurement_calibration,
+                selection_map,
+                temporal_args,
+            )
+            temporal_args.delta_phi = float(temporal_phi)
+            temporal_args.anchor_weight = float(temporal_weight)
         data, session_days = _empirical_neural_dataset(
             anchors_use,
             sessions_use,
             None,
             comorbidity_use,
-            measurement_calibration,
+            temporal_measurement_calibration,
             max_patients=None,
             patient_splits=patient_splits,
         )
@@ -13818,7 +14008,8 @@ def _fit_generalization_sensitivities(
             seed=EMPIRICAL_SEED + int(args.seed_offset) + (7000 if validation == "heldout_clinic" else 9000),
             rdoc_drift_head=False,
             use_alpha_slow=False,
-            delta_phi=args.delta_phi,
+            delta_phi=temporal_args.delta_phi,
+            anchor_weight=temporal_args.anchor_weight,
         )
         student = fit_ball_ssm(
             data, cfg, device=args.device, causal=True, prediction_split="test", return_teacher=False
@@ -13837,16 +14028,16 @@ def _fit_generalization_sensitivities(
             ].copy()
             ev = _channel_eval(
                 sub,
-                sessions,
+                _coerce_sessions(sessions_use),
                 {
                     instrument: (
                         float(values["midpoint"]), float(values["half_range"])
                     )
-                    for instrument, values in measurement_calibration["transforms"].items()
+                    for instrument, values in temporal_measurement_calibration["transforms"].items()
                 },
                 predictions,
                 session_days,
-                measurement_calibration=measurement_calibration,
+                measurement_calibration=temporal_measurement_calibration,
             )
             if not ev.empty:
                 ev["channel"] = channel
@@ -13854,23 +14045,90 @@ def _fit_generalization_sensitivities(
         if not frames:
             continue
         ev = pd.concat(frames, ignore_index=True)
+        rng = np.random.default_rng(20250101)
+        shuffled_test_ids = np.asarray(sorted(test_ids), dtype=int)
+        rng.shuffle(shuffled_test_ids)
+        n_temporal_calibration = len(shuffled_test_ids) // 2
+        temporal_calibration_ids = set(int(value) for value in shuffled_test_ids[:n_temporal_calibration])
+        temporal_test_ids = set(int(value) for value in shuffled_test_ids[n_temporal_calibration:])
+        ev["temporal_evaluation_role"] = np.where(
+            ev["id"].astype(int).isin(temporal_calibration_ids), "calibration", "test"
+        )
+        ev_calibration = ev[ev["temporal_evaluation_role"].eq("calibration")].copy()
+        ev_test = ev[ev["temporal_evaluation_role"].eq("test")].copy()
+        temporal_coverages, temporal_width_fractions = [], []
+        for instrument, calibration_instrument in ev_calibration.groupby("anchor", sort=True):
+            test_instrument = ev_test[ev_test["anchor"].eq(instrument)].copy()
+            if calibration_instrument.empty or test_instrument.empty:
+                continue
+            calibration_scores = calibration_instrument.assign(
+                normalized_score=(
+                    np.abs(calibration_instrument["ball"] - calibration_instrument["z_true"])
+                    / np.maximum(calibration_instrument["ball_sd"], 1e-3)
+                )
+            )
+            quantile, _ = _patient_balanced_conformal_quantile(
+                calibration_scores[["id", "normalized_score"]], alpha=CONFORMAL_ALPHA
+            )
+            half_range = test_instrument["scale_half_range"].to_numpy(dtype=float)
+            point_native = (
+                test_instrument["ball"].to_numpy(dtype=float) * half_range
+                + test_instrument["scale_center"].to_numpy(dtype=float)
+            )
+            half_width = quantile * test_instrument["ball_sd"].to_numpy(dtype=float) * half_range
+            lower = np.clip(point_native - half_width, 0.0, 2.0 * half_range)
+            upper = np.clip(point_native + half_width, 0.0, 2.0 * half_range)
+            truth = test_instrument["raw_true"].to_numpy(dtype=float)
+            test_instrument["covered"] = (truth >= lower) & (truth <= upper)
+            test_instrument["width_fraction"] = (upper - lower) / (2.0 * half_range)
+            temporal_coverages.append(
+                float(test_instrument.groupby("id")["covered"].mean().mean())
+            )
+            temporal_width_fractions.append(
+                float(test_instrument.groupby("id")["width_fraction"].mean().mean())
+            )
         for method in ("ball", "locf", "interpolation", "causal_anchor_mean"):
-            per_patient = _development_scaled_squared_error(ev, method).groupby(ev["id"]).mean()
+            per_patient = _development_scaled_squared_error(ev_test, method).groupby(ev_test["id"]).mean()
+            native = (
+                ev_test[method] * ev_test["scale_half_range"] + ev_test["scale_center"]
+            )
+            clipped = np.clip(native, 0.0, 2.0 * ev_test["scale_half_range"])
+            clipped_normalized = (clipped - ev_test["scale_center"]) / ev_test["scale_half_range"]
+            clipped_error = (
+                (clipped_normalized - ev_test["z_true"]) / ev_test["pooling_sd_normalized"]
+            ) ** 2
+            clipped_per_patient = clipped_error.groupby(ev_test["id"]).mean()
             rows.append({
                 "validation": validation,
                 "cadence": 14,
                 "method": method,
                 "rmse": float(np.sqrt(per_patient.mean())),
-                "n": int(len(ev)),
+                "rmse_raw": float(np.sqrt(per_patient.mean())),
+                "rmse_support_clipped": float(np.sqrt(clipped_per_patient.mean())),
+                "patient_balanced_conformal_coverage": (
+                    float(np.mean(temporal_coverages))
+                    if method == "ball" and temporal_coverages else float("nan")
+                ),
+                "mean_interval_width_fraction_of_legal_range": (
+                    float(np.mean(temporal_width_fractions))
+                    if method == "ball" and temporal_width_fractions else float("nan")
+                ),
+                "n": int(len(ev_test)),
                 "n_train_patients": n_train_modeled,
-                "n_test_patients": int(ev["id"].nunique()),
+                "n_test_patients": int(ev_test["id"].nunique()),
                 "n_train_source_eligible": int(len(train_ids)),
                 "n_test_source_eligible": int(len(test_ids)),
                 "n_test_model_patients": n_test_modeled,
+                "n_temporal_calibration_patients": int(len(temporal_calibration_ids)),
+                "n_temporal_final_test_patients": int(len(temporal_test_ids)),
+                "selected_daily_persistence": float(temporal_args.delta_phi),
+                "selected_questionnaire_weight": float(temporal_args.anchor_weight),
+                "measurement_calibration_scope": "all pre-2025 genuine questionnaire events from the ten training clinics",
+                "hyperparameter_selection_scope": "pre-2025 training clinics fitted and pre-2025 model-selection clinics scored",
                 "training_time_rule": "last observed session before 2025-01-01",
                 "test_time_rule": "first observed session on or after 2025-01-01",
                 "spanning_patients_excluded": int(
-                    sessions_full["id"].nunique() - len(patient_splits)
+                    development_network_sessions["id"].nunique() - len(patient_splits)
                 ),
             })
         del student, data, session_days
@@ -13892,23 +14150,25 @@ def _empirical_input_contract_table() -> pd.DataFrame:
         "target_embargo": "retained questionnaire recall windows are disjoint from the withheld recall window",
     }
     rows = [
-        ("ball", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ball_direct_causal", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("exponential_decay_gru", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("gp_causal_filter", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw calendar days"),
-        ("locf", "causal", "most recent retained anchor", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("causal_anchor_mean", "causal", "retained anchors through the current session", "questionnaire history", "questionnaire history", "raw calendar days"),
+        ("ball", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_direct_causal", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("exponential_decay_gru", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("gp_causal_filter", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw calendar days"),
+        ("locf", "causal", "most recent questionnaire from a strictly earlier recorded session", "questionnaire history", "questionnaire history", "raw calendar days"),
+        ("causal_anchor_mean", "causal", "questionnaire events from strictly earlier recorded sessions", "questionnaire history", "questionnaire history", "raw calendar days"),
+        ("locf_reference_origin", "causal sensitivity", "most recent questionnaire from a strictly earlier recorded session, with reference-origin cold start", "questionnaire history", "questionnaire history", "raw calendar days"),
+        ("causal_anchor_mean_reference_origin", "causal sensitivity", "questionnaire events from strictly earlier recorded sessions, with reference-origin cold start", "questionnaire history", "questionnaire history", "raw calendar days"),
         ("ball_teacher", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
         ("s0_direct_lgssm", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
         ("markov_direct_transition", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
         ("interpolation", "retrospective", "nearest retained anchors on both sides", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("ball_no_dense_ehr", "causal", "retained anchors through the current session", "raw session number", "previous-session treatment", "raw elapsed days"),
-        ("ball_anchor_only", "causal", "retained anchors through the current session", "questionnaire history", "questionnaire history", "raw elapsed days"),
-        ("ball_inherited_dynamics_only", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ball_teacher_matching_only", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ball_full_decomposition", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ball_direct_compute_matched", "causal", "retained anchors through the current session", "all structured features", "previous-session treatment", "raw elapsed days"),
-        ("ball_session_balanced", "causal", "retained anchors through the current session with total questionnaire weight balanced by session", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_no_dense_ehr", "causal", "questionnaire events from strictly earlier recorded sessions", "raw session number", "previous-session treatment", "raw elapsed days"),
+        ("ball_anchor_only", "causal", "questionnaire events from strictly earlier recorded sessions", "questionnaire history", "questionnaire history", "raw elapsed days"),
+        ("ball_inherited_dynamics_only", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_teacher_matching_only", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_full_decomposition", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_direct_compute_matched", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("ball_session_balanced", "causal", "questionnaire events from strictly earlier recorded sessions with total questionnaire weight balanced by session", "all structured features", "previous-session treatment", "raw elapsed days"),
     ]
     return pd.DataFrame(
         [
@@ -14220,7 +14480,11 @@ def main() -> None:
     )
     rdoc_sessions = _load_rdoc_sessions() if args.rdoc_transition_analysis else None
     comorbidity_sessions = _load_comorbidity_sessions(args.comorbidity_features)
-    methods = ["ball", "ball_teacher", "s0_direct_lgssm", "markov_direct_transition", "interpolation", "locf", "causal_anchor_mean"]
+    methods = [
+        "ball", "ball_teacher", "s0_direct_lgssm", "markov_direct_transition",
+        "interpolation", "locf", "causal_anchor_mean",
+        "locf_reference_origin", "causal_anchor_mean_reference_origin",
+    ]
     if args.direct_causal_ablation:
         methods.insert(1, "ball_direct_causal")
     if args.dense_ehr_ablation:
@@ -14259,14 +14523,22 @@ def main() -> None:
         sessions_full=sessions_full,
         rdoc_sessions=rdoc_sessions,
         comorbidity_sessions=comorbidity_sessions,
-        prediction_rows=prediction_rows,
     )
     print(f"clean empirical fit run directory: {run_dir}", flush=True)
 
-    calibration_source = pd.read_csv(OUT / "anchors_sparse_14d.csv")
+    calibration_source = pd.read_csv(OUT / "questionnaire_events_all.csv")
+    source_split_by_patient = (
+        sessions_full[sessions_full["id"].astype(int).isin(primary_model_splits)]
+        .groupby("id", sort=False)["split"]
+        .agg(lambda values: str(values.iloc[0]))
+    )
+    measurement_fit_splits = {
+        int(patient_id): ("train" if split == "train" else "excluded")
+        for patient_id, split in source_split_by_patient.items()
+    }
     measurement_calibration = _fit_development_measurement_calibration(
         calibration_source,
-        primary_model_splits,
+        measurement_fit_splits,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "measurement_calibration.json").write_text(
@@ -14527,11 +14799,14 @@ def main() -> None:
             ev_all[f"{method}_native"] = (
                 ev_all[method] * ev_all["scale_half_range"] + ev_all["scale_center"]
             )
-        ev_all["ball_native_clipped"] = np.clip(
-            ev_all["ball_native"],
-            0.0,
-            2.0 * ev_all["scale_half_range"],
-        )
+            ev_all[f"{method}_native_clipped"] = np.clip(
+                ev_all[f"{method}_native"],
+                0.0,
+                2.0 * ev_all["scale_half_range"],
+            )
+            ev_all[f"{method}_clipped"] = (
+                ev_all[f"{method}_native_clipped"] - ev_all["scale_center"]
+            ) / ev_all["scale_half_range"]
         calibration_ev = ev_all[ev_all["evaluation_role"] == "calibration"].copy()
         ev = ev_all[ev_all["evaluation_role"] == "test"].copy()
         if calibration_ev.empty or ev.empty:
@@ -14572,10 +14847,14 @@ def main() -> None:
         per_pt_se = {}
         for m in cadence_methods:
             err2 = _development_scaled_squared_error(ev, m)
+            clipped_err2 = _development_scaled_squared_error(ev, f"{m}_clipped")
             per_pt = err2.groupby(ev["id"]).mean()
+            clipped_per_pt = clipped_err2.groupby(ev["id"]).mean()
             per_pt_se[m] = per_pt
             row = {"cadence": cad, "method": m,
                    "rmse": float(np.sqrt(per_pt.mean())),
+                   "rmse_raw": float(np.sqrt(per_pt.mean())),
+                   "rmse_support_clipped": float(np.sqrt(clipped_per_pt.mean())),
                    "unit": "development-questionnaire standard deviations",
                    "pooling": "patient-balanced after instrument-specific development normalization",
                    "n": int(len(ev)),
@@ -14589,6 +14868,10 @@ def main() -> None:
                     * instrument_ev["scale_half_range"]
                 ) ** 2
                 instrument_pt = native_error.groupby(instrument_ev["id"]).mean()
+                clipped_native_error = (
+                    instrument_ev[f"{m}_native_clipped"] - instrument_ev["raw_true"]
+                ) ** 2
+                clipped_instrument_pt = clipped_native_error.groupby(instrument_ev["id"]).mean()
                 normalized_instrument_pt = _development_scaled_squared_error(
                     instrument_ev, m
                 ).groupby(instrument_ev["id"]).mean()
@@ -14598,6 +14881,9 @@ def main() -> None:
                     "method": m,
                     "rmse": float(np.sqrt(instrument_pt.mean())),
                     "rmse_native_points": float(np.sqrt(instrument_pt.mean())),
+                    "rmse_native_points_support_clipped": float(
+                        np.sqrt(clipped_instrument_pt.mean())
+                    ),
                     "rmse_development_sd_units": float(
                         np.sqrt(normalized_instrument_pt.mean())
                     ),

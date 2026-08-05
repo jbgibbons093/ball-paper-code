@@ -137,12 +137,12 @@ def test_gp_filter_excludes_future_questionnaires() -> None:
     causal_original = fit_gp_causal_filter(data, args)
     causal_altered = fit_gp_causal_filter(altered, args)
 
-    causal_before = causal_original.loc[
-        causal_original["id"].astype(int).eq(pid) & causal_original["t"].lt(available_at),
+    causal_before_altered = causal_altered.loc[
+        causal_altered["id"].astype(int).eq(pid) & causal_altered["t"].le(available_at),
         "L_hat",
     ].to_numpy(dtype=float)
-    causal_before_altered = causal_altered.loc[
-        causal_altered["id"].astype(int).eq(pid) & causal_altered["t"].lt(available_at),
+    causal_before = causal_original.loc[
+        causal_original["id"].astype(int).eq(pid) & causal_original["t"].le(available_at),
         "L_hat",
     ].to_numpy(dtype=float)
     assert np.allclose(causal_before, causal_before_altered, atol=1e-10, rtol=0.0)

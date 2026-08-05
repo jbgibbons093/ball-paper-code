@@ -8,22 +8,6 @@ can tell when the available information is insufficient.
 This repository contains the model, simulation, and empirical evaluation code
 for the manuscript. It contains no data.
 
-## No data and no protected health information
-
-This repository holds source code only. It carries no protected health
-information (PHI), no patient records, no clinical note text, no derived
-datasets, and no credentials. Every analysis input lives outside this
-repository on protected local storage.
-
-The scripts reference input paths such as `empirical/data/`,
-`empirical/derived/`, and `raw/`. Those directories are absent here by design.
-Running the empirical scripts requires supplying those inputs from an approved
-environment. The `.gitignore` blocks the corresponding paths and file types so
-that a data file cannot be committed by accident.
-
-One script sends clinical note text to a language model endpoint when it is run.
-Use only a HIPAA-compliant deployment, as the original analysis did.
-
 ## Layout
 
 `BALL.py` is the canonical single-file codebase. It holds 37 modules as embedded
@@ -72,8 +56,7 @@ Health Questionnaire.
 
 The analyses ran on Python 3.13. The code contains no syntax newer than Python
 3.10, but only 3.13 was tested. The dependencies are NumPy, pandas, SciPy,
-scikit-learn, PyTorch, PyYAML, and Matplotlib, plus the `openai` package for the
-language-model scoring command.
+scikit-learn, PyTorch, PyYAML, and Matplotlib.
 
 `BALL.py` dispatches by subcommand. List the available commands with:
 
@@ -81,7 +64,7 @@ language-model scoring command.
 python BALL.py
 ```
 
-That prints 19 commands. The simulation entry point is `pipeline`, the
+That prints 18 commands. The simulation entry point is `pipeline`, the
 replicate-parallel runner is `pilot-batch`, and the empirical pipeline runs
 through the `empirical-*` commands. The `paper-*` commands regenerate the
 manuscript tables and figures from completed runs.

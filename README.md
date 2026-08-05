@@ -1,12 +1,11 @@
 # BALL
 
-BALL means Bayesian Anchored Latent Learning. The method recovers an
-anchor-calibrated latent recovery index from sparse clinical anchors and dense,
-noisy longitudinal signals, and it reports calibrated uncertainty so that a user
-can tell when the available information is insufficient.
+BALL means Bayesian Anchored Latent Learning. The method estimates session-level
+latent trajectories from sparse validated measurements and longitudinal signals,
+then reports uncertainty for each estimate.
 
-This repository contains the model, simulation, and empirical evaluation code
-for the manuscript. It contains no data.
+This repository contains the model, simulation, empirical evaluation, validation,
+table, and figure code for the manuscript.
 
 ## Layout
 
@@ -17,9 +16,11 @@ package directory. It covers the data-generating process, the anchor and
 missingness models, the metrics and diagnostics, every method implementation,
 the simulation runners, and the empirical pipeline.
 
-The method implementations inside `BALL.py` are the BALL state-space model, the
-BALL structural posterior, the S0 linear-Gaussian smoother, the Markov
-pattern-mixture comparator, and the simple baselines.
+The method implementations inside `BALL.py` include the BALL teacher and causal
+student, a forward-only transformer trained directly on the measurements, a
+causal Gaussian-process filter, a causal ordinary differential equation recurrent
+neural network, linear-Gaussian and Markov statistical comparators, and the
+questionnaire-history baselines.
 
 `simulations/config/` holds the simulation parameters. `default.yml` defines the
 primary scenario and `scenario_grid.yml` defines the identifiability-critical and
@@ -45,6 +46,12 @@ empirical-check scripts that run against the model in `BALL.py`.
 | `irt_calibration.json` | Frozen IRT parameters from an independent synthetic calibration population |
 | `run_publication_sensitivities.py` | Runs the publication sensitivity analyses |
 | `analyze_rdoc_scorer_sensitivity.py` | Sensitivity of results to the RDoC scorer |
+| `analyze_empirical_stability.py` | Within-patient and between-patient stability analysis |
+| `build_direct_rdoc_manuscript_outputs.py` | Builds the aggregate manuscript tables and figures |
+| `validate_publication_outputs.py` | Validates all completed simulation and empirical outputs |
+| `validate_manuscript_output_package.py` | Checks the aggregate manuscript package for completeness and patient-level content |
+| `run_final_simulation_chain_20260805.ps1` | Runs the frozen simulation suite |
+| `run_final_empirical_and_publication_chain_20260805.ps1` | Runs the protected empirical suite and aggregate output build |
 | `empirical_phq_reversion.py` | Empirical PHQ-9 fast-residual reversion check |
 
 RDoC means Research Domain Criteria, the National Institute of Mental Health
@@ -55,8 +62,8 @@ Health Questionnaire.
 ## Running
 
 The analyses ran on Python 3.13. The code contains no syntax newer than Python
-3.10, but only 3.13 was tested. The dependencies are NumPy, pandas, SciPy,
-scikit-learn, PyTorch, PyYAML, and Matplotlib.
+3.10, but only 3.13 was tested. Exact tested package versions are listed in
+`requirements.txt`.
 
 `BALL.py` dispatches by subcommand. List the available commands with:
 

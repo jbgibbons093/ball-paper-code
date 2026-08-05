@@ -47,7 +47,12 @@ def test_dgp_items_and_missing():
     anc = data.anchors
     obs = anc[anc["observed"]]
     assert obs["irt_items"].apply(lambda x: x is not None and len(x) == N_ITEMS).all(), "items missing"
-    unobs = anc[~anc["observed"]]
+    naturally_unobserved = ~anc["observed"]
+    if "measurement_eval" in anc.columns:
+        naturally_unobserved &= ~anc["measurement_eval"].astype(bool)
+    if "measurement_embargo" in anc.columns:
+        naturally_unobserved &= ~anc["measurement_embargo"].astype(bool)
+    unobs = anc[naturally_unobserved]
     if len(unobs):
         assert unobs["irt_total"].isna().all(), "unobserved totals must be NaN"
         assert unobs["irt_items"].apply(lambda x: all(not np.isfinite(v) for v in x)).all(), "unobserved items must be NaN"

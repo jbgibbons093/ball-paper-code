@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -120,6 +121,37 @@ def _anchor_trait_mle(items, disc: np.ndarray, thresholds, iters: int = 6) -> fl
         score, info = _grm_score_info(z, items, disc, thresholds)
         z = float(np.clip(z + score / (info + 1.0), -4.0, 4.0))
     return z
+
+
+def irt_anchor_pseudo_observation(row, data) -> tuple[float, float] | None:
+    """Map one observed item-response anchor to the calibrated raw latent scale.
+
+    The point estimate is the unit-information-prior Fisher-scoring estimate on
+    the frozen trait scale.  The returned standard deviation uses the local
+    posterior information and is transformed through the frozen affine map.
+    This supplies an identical, prespecified item-response measurement bridge
+    to trajectory comparators that do not optimize the graded-response
+    likelihood directly.
+    """
+
+    items = getattr(row, "irt_items", None)
+    if items is None:
+        return None
+    item_values = np.asarray(items, dtype=float)
+    if item_values.size == 0 or not np.isfinite(item_values).any():
+        return None
+    cfg = data.config
+    disc = np.asarray(cfg.irt_item_discriminations, dtype=float)
+    thresholds = [np.asarray(b, dtype=float) for b in cfg.irt_item_thresholds]
+    if len(disc) != len(item_values) or len(thresholds) != len(item_values):
+        return None
+    trait = _anchor_trait_mle(item_values, disc, thresholds)
+    _, information = _grm_score_info(trait, item_values, disc, thresholds)
+    loc = float(cfg.irt_loc)
+    scale = float(cfg.irt_scale) or 1.0
+    raw_target = trait * scale + loc
+    raw_sd = scale / np.sqrt(max(information + 1.0, 1e-6))
+    return float(raw_target), float(raw_sd)
 
 
 def init_irt_state(data, args):
@@ -221,8 +253,14 @@ def irt_holdout_metrics(data, preds, split: str = "validation") -> tuple[float, 
     pred_p = preds.groupby(["id", "t"])[zcol_p].mean()
 
     nlls, tot_err = [], []
+    use_measurement_targets = "measurement_eval" in data.anchors.columns
     for row in data.anchors.itertuples(index=False):
-        if not bool(getattr(row, "observed", False)):
+        eligible = (
+            bool(getattr(row, "measurement_eval", False))
+            if use_measurement_targets
+            else bool(getattr(row, "observed", False))
+        )
+        if not eligible:
             continue
         items = getattr(row, "irt_items")
         total = getattr(row, "irt_total")
@@ -257,11 +295,41 @@ def impute_by_time(frame: pd.DataFrame, cols: list[str]) -> np.ndarray:
     return vals.to_numpy(dtype=float)
 
 
+def observed_treatment_history_arrays(comp_i: pd.DataFrame, daily_i: pd.DataFrame, config):
+    """Construct treatment-history features from inputs available to every model."""
+
+    action = pd.to_numeric(comp_i["a"], errors="coerce").fillna(-1).to_numpy(dtype=int)
+    treated = action >= 0
+    recent = np.zeros(len(action), dtype=float)
+    for index in range(len(action)):
+        recent[index] = float(np.any(treated[max(0, index - 6) : index + 1]))
+
+    burden_columns = [
+        column
+        for column in ("X18", "X19")
+        if column in daily_i.columns
+    ]
+    if burden_columns:
+        burden_values = daily_i[burden_columns].apply(pd.to_numeric, errors="coerce")
+        observed_columns = [f"obs_{column}" for column in burden_columns]
+        if all(column in daily_i.columns for column in observed_columns):
+            observed = daily_i[observed_columns].astype(bool).to_numpy()
+            values = burden_values.to_numpy(dtype=float)
+            values[~observed] = np.nan
+            burden = pd.DataFrame(values).mean(axis=1, skipna=True).ffill().fillna(0.0).to_numpy(dtype=float)
+        else:
+            burden = burden_values.mean(axis=1, skipna=True).ffill().fillna(0.0).to_numpy(dtype=float)
+    else:
+        burden = np.zeros(len(action), dtype=float)
+    return recent, burden
+
+
 def fit_daily_readout(data, train_ids: set[int], ridge: float = 1.0):
     """Train-only X -> anchor-interpolated latent readout."""
 
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(data.config.p_daily)]
+    input_cols = [f"input_X{j}" for j in range(data.config.p_daily)]
     daily_by = dict(tuple(data.daily.groupby("id", sort=True)))
     comp_by = dict(tuple(data.components.groupby("id", sort=True)))
     anc_by = dict(tuple(data.anchors.groupby("id", sort=True)))
@@ -312,7 +380,12 @@ def fit_daily_readout(data, train_ids: set[int], ridge: float = 1.0):
         if not set(x_cols).issubset(di.columns):
             continue
         x = di[x_cols].to_numpy(dtype=float)
-        obs = di[obs_cols].to_numpy(dtype=float) if set(obs_cols).issubset(di.columns) else np.isfinite(x).astype(float)
+        mask_cols = input_cols if set(input_cols).issubset(di.columns) else obs_cols
+        obs = (
+            di[mask_cols].to_numpy(dtype=float)
+            if set(mask_cols).issubset(di.columns)
+            else np.isfinite(x).astype(float)
+        )
         n = min(len(target), len(x))
         x_blocks.append(x[:n])
         o_blocks.append(obs[:n])
@@ -343,16 +416,33 @@ def person_arrays(data, pid: int, daily_readout):
     b = impute_by_time(comp_i, [f"B{j}" for j in range(q)])
     x_cols = [f"X{j}" for j in range(data.config.p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(data.config.p_daily)]
+    input_cols = [f"input_X{j}" for j in range(data.config.p_daily)]
     x = daily_i[x_cols].to_numpy(dtype=float)
-    obs = daily_i[obs_cols].to_numpy(dtype=float) if set(obs_cols).issubset(daily_i.columns) else np.isfinite(x).astype(float)
+    mask_cols = input_cols if set(input_cols).issubset(daily_i.columns) else obs_cols
+    obs = (
+        daily_i[mask_cols].to_numpy(dtype=float)
+        if set(mask_cols).issubset(daily_i.columns)
+        else np.isfinite(x).astype(float)
+    )
     intercept, x_beta, x_means, daily_sd = daily_readout
     x_imp = np.where(obs > 0.5, x, x_means[None, :])
     daily_pred = intercept + x_imp @ x_beta
     any_daily = (obs > 0.5).any(axis=1)
     action = comp_i["a"].to_numpy(dtype=int)
-    recent = comp_i["recent_treatment"].to_numpy(dtype=float)
-    burden = comp_i["treatment_burden"].to_numpy(dtype=float)
+    recent, burden = observed_treatment_history_arrays(comp_i, daily_i, data.config)
     return comp_i, anchors_i, b, daily_pred, any_daily, daily_sd, action, recent, burden
+
+
+def causal_encoder_action_array(comp_i: pd.DataFrame) -> np.ndarray:
+    """Treatment category available before each session-level prediction."""
+
+    if "encoder_a" in comp_i.columns:
+        return pd.to_numeric(comp_i["encoder_a"], errors="coerce").fillna(-1).to_numpy(dtype=int)
+    current = pd.to_numeric(comp_i["a"], errors="coerce").fillna(-1).to_numpy(dtype=int)
+    previous = np.full(len(current), -1, dtype=int)
+    if len(current) > 1:
+        previous[1:] = current[:-1]
+    return previous
 
 
 def transition_features(
@@ -428,8 +518,20 @@ def solve_person(data, pid: int, theta: np.ndarray, daily_readout, args, irt_sta
         if observed and np.isfinite(daily_pred[k]):
             add([(k, 1.0)], float(daily_pred[k]), daily_sd)
 
+    next_gaps = (
+        pd.to_numeric(comp_i["dt"], errors="coerce").fillna(1.0).clip(lower=0.0).to_numpy(dtype=float)
+        if "dt" in comp_i.columns
+        else np.ones(t_count, dtype=float)
+    )
     for k in range(1, t_count):
-        add([(k, 1.0), (k - 1, -1.0)], float(trans_mean[k - 1]), args.transition_sd)
+        gap = float(next_gaps[k - 1])
+        if gap <= 0:
+            continue
+        add(
+            [(k, 1.0), (k - 1, -1.0)],
+            float(trans_mean[k - 1]) * gap,
+            args.transition_sd * math.sqrt(gap),
+        )
 
     design = np.vstack(rows)
     target = np.asarray(targets, dtype=float)
@@ -444,7 +546,7 @@ def solve_person(data, pid: int, theta: np.ndarray, daily_readout, args, irt_sta
             "z_p_hat": sol,
         }
     )
-    return pred, b, action, recent, burden
+    return pred, b, action, recent, burden, next_gaps
 
 
 def fit_direct_map(data, args):
@@ -477,9 +579,11 @@ def fit_direct_map(data, args):
         pred_by_pid.clear()
         arrays_by_pid.clear()
         for pid in ids:
-            pred, b, action, recent, burden = solve_person(data, pid, theta, daily_readout, args, irt_state=irt_state)
+            pred, b, action, recent, burden, next_gaps = solve_person(
+                data, pid, theta, daily_readout, args, irt_state=irt_state
+            )
             pred_by_pid[pid] = pred
-            arrays_by_pid[pid] = (b, action, recent, burden)
+            arrays_by_pid[pid] = (b, action, recent, burden, next_gaps)
             if pid not in train_ids:
                 continue
             l = pred["L_hat"].to_numpy(dtype=float)
@@ -494,8 +598,10 @@ def fit_direct_map(data, args):
                 subtype=subtype,
                 n_subtypes=data.config.n_subtypes,
             )
-            x_rows.append(feats)
-            y_rows.append(np.diff(l))
+            positive = np.asarray(next_gaps[: len(feats)], dtype=float) > 0
+            if positive.any():
+                x_rows.append(feats[positive])
+                y_rows.append(np.diff(l)[positive] / np.asarray(next_gaps[: len(feats)])[positive])
         if not x_rows:
             break
         x = np.vstack(x_rows)

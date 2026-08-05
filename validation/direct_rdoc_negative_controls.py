@@ -28,6 +28,7 @@ from direct_rdoc_benchmark import (  # noqa: E402
     make_data,
     paired_deltas,
     run_ball,
+    run_ball_direct_causal,
     run_markov,
     run_s0,
 )
@@ -130,6 +131,7 @@ def main() -> None:
     parser.add_argument("--ball-no-ehr-drift", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if args.rdoc_drift_adaptive and args.rdoc_drift_l1 <= 0.0:
         parser.error("--rdoc-drift-adaptive requires --rdoc-drift-l1 > 0 (adaptive weights only act through the L1 penalty)")
@@ -138,18 +140,60 @@ def main() -> None:
     out_dir = Path(args.out) if args.out else H.REPO_ROOT / "validation" / "outputs" / f"direct_rdoc_negative_controls_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    checkpoint_path = out_dir / "per_run.csv"
     rows = []
+    completed: set[tuple[str, int, str]] = set()
+    if args.resume and checkpoint_path.exists():
+        prior = pd.read_csv(checkpoint_path)
+        rows = prior.to_dict("records")
+        completed = {
+            (str(row.control), int(row.seed), str(row.method))
+            for row in prior[["control", "seed", "method"]].itertuples(index=False)
+        }
+        print(f"resuming {len(completed)} completed control/seed/method fits")
     for control in args.controls:
         for seed in args.seeds:
+            required = {
+                "s0_direct_lgssm",
+                "markov_direct_transition",
+                "ball_teacher_smoother",
+                "ball_student_causal",
+                "ball_direct_causal",
+            }
+            have = {method for name, prior_seed, method in completed if name == control and prior_seed == seed}
+            if required.issubset(have):
+                print(f"control={control} seed={seed} already complete; skipping")
+                continue
             print(f"control={control} seed={seed} building data")
             data = make_control_data(args, seed, control)
-            for runner in (run_s0, run_markov, run_ball):
+            runner_specs = [
+                ("s0_direct_lgssm", run_s0),
+                ("markov_direct_transition", run_markov),
+                ("ball_teacher_student", run_ball),
+                ("ball_direct_causal", run_ball_direct_causal),
+            ]
+            for method_name, runner in runner_specs:
+                if method_name == "ball_teacher_student":
+                    if {"ball_teacher_smoother", "ball_student_causal"}.issubset(have):
+                        continue
+                elif method_name in have:
+                    continue
                 result = runner(data, args, control, seed, float(data.metadata.get("rdoc_drift_share", args.share)))
                 result_rows = result if isinstance(result, list) else [result]
                 for row in result_rows:
+                    if (control, seed, str(row["method"])) in completed:
+                        continue
                     row["control"] = control
                     row["control_label"] = CONTROL_LABELS[control]
+                    # In the null condition the true direct coefficient is zero,
+                    # so a cosine with the data-generating coefficient is
+                    # undefined. The reported directional and support metrics
+                    # intentionally compare estimates with the prespecified
+                    # positive-control coefficient template.
+                    row["coefficient_reference"] = "positive_control_coefficient_template"
+                    row["data_generating_direct_signal_present"] = bool(control != "null")
                     rows.append(row)
+            pd.DataFrame(rows).to_csv(checkpoint_path, index=False)
 
     per = pd.DataFrame(rows)
     agg = aggregate(per.rename(columns={"control": "_control"}))
@@ -170,10 +214,19 @@ def main() -> None:
                 "timestamp": datetime.now().isoformat(timespec="seconds"),
                 "command_line": " ".join(sys.argv),
                 "ball_py_sha256": H.file_sha256(H.BALL_PATH),
+                "runner_py_sha256": H.file_sha256(Path(__file__).resolve()),
+                "benchmark_py_sha256": H.file_sha256(
+                    Path(__file__).resolve().parent / "direct_rdoc_benchmark.py"
+                ),
                 "args": vars(args),
                 "irt_calibration": irt_calibration_provenance(args),
                 "controls": CONTROL_LABELS,
-                "note": "Direct-RDoC negative controls. Truth is used only for scoring; all fitted methods see the same controlled observed data.",
+                "note": (
+                    "Direct-RDoC negative controls. Truth is used only for scoring and all fitted methods "
+                    "see the same controlled observed data. Directional and support metrics are alignment "
+                    "with the prespecified positive-control coefficient template. They are not cosine or "
+                    "active-support recovery against a nonzero coefficient in the null data-generating process."
+                ),
             },
             indent=2,
             default=str,

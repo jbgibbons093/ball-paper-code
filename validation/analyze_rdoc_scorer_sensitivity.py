@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import re
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -10,14 +12,23 @@ import pandas as pd
 from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import cohen_kappa_score
 
+import ball_validation_harness as H
+
+
+EMPIRICAL = sys.modules["empirical.fit_empirical"]
+
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "raw" / "RDoC_LLM_scorer.csv"
 SESSIONS = ROOT / "empirical" / "data" / "rtms_paper_analytic_sessions.csv"
-TRANSITIONS = ROOT / "empirical" / "derived" / "empirical_rdoc_transition_rows.csv"
-ENSEMBLE_SUMMARY = ROOT / "empirical" / "derived" / "empirical_rdoc_transition.csv"
-ENSEMBLE_COEFS = ROOT / "empirical" / "derived" / "empirical_rdoc_transition_coefficients.csv"
-OUT = ROOT / "validation" / "outputs" / "rdoc_scorer_sensitivity_20260716"
+DEFAULT_RUN = (
+    ROOT
+    / "empirical"
+    / "derived"
+    / "empirical_fit_runs"
+    / "publication_ready_20260805_resume"
+)
+DEFAULT_OUT = ROOT / "validation" / "outputs" / "rdoc_scorer_sensitivity_publication_20260805"
 
 DOMAIN_SOURCES = {
     "negative valence": (
@@ -113,8 +124,15 @@ def load_retained_raw_rows() -> tuple[pd.DataFrame, pd.DataFrame]:
     raw["first_session_date"] = raw["PatientFID"].map(first_session)
     raw["day"] = (raw["ServiceDate"] - raw["first_session_date"]).dt.days.astype(int)
     for column in model_cols:
-        raw[column] = pd.to_numeric(raw[column], errors="coerce").clip(0.0, 1.0)
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
     raw = raw.dropna(subset=model_cols).copy()
+    invalid_scores = {
+        column: int((~raw[column].between(0.0, 1.0)).sum())
+        for column in model_cols
+        if (~raw[column].between(0.0, 1.0)).any()
+    }
+    if invalid_scores:
+        raise ValueError(f"RDoC scorer values fall outside the declared 0-to-1 scale: {invalid_scores}")
 
     session_axis = sessions.sort_values(["PatientFID", "ServiceDate"]).copy()
     session_axis["session"] = session_axis.groupby("PatientFID").cumcount()
@@ -167,25 +185,25 @@ def scorer_agreement(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def clinical_anchor_crosswalk() -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Map clinical bands through the prespecified, cohort-free transforms."""
+
     stats_rows: list[dict] = []
     crosswalk_rows: list[dict] = []
-    stats_by_cadence: dict[int, dict[str, tuple[float, float]]] = {}
+    fixed = {
+        "PHQ9": (13.5, 13.5),
+        "GAD7": (10.5, 10.5),
+        "BDI": (31.5, 31.5),
+    }
     for cadence in (14, 21, 28):
-        anchors = pd.read_csv(ROOT / "empirical" / "derived" / f"anchors_sparse_{cadence}d.csv")
-        retained = anchors[anchors["role"] == "anchor"].copy()
-        stats_by_cadence[cadence] = {}
-        for scale, values in retained.groupby("anchor")["value"]:
-            array = values.to_numpy(dtype=float)
-            mean = float(np.mean(array))
-            sd = float(np.std(array)) or 1.0
-            stats_by_cadence[cadence][str(scale)] = (mean, sd)
+        for scale, (center, scale_value) in fixed.items():
             stats_rows.append(
                 {
                     "cadence_days": cadence,
-                    "instrument": str(scale),
-                    "retained_anchors": int(len(array)),
-                    "mean": mean,
-                    "sd": sd,
+                    "instrument": scale,
+                    "retained_anchors": None,
+                    "mean": center,
+                    "sd": scale_value,
+                    "source": "prespecified instrument midpoint and half-range",
                 }
             )
 
@@ -193,16 +211,16 @@ def clinical_anchor_crosswalk() -> tuple[pd.DataFrame, pd.DataFrame]:
         channel = "Depression" if instrument in {"PHQ9", "BDI"} else "Anxiety"
         for severity, raw_low, raw_high in bands:
             row = {
-                "latent_channel": channel,
+                "anchor_channel": channel,
                 "severity_label": severity,
                 "instrument": instrument,
                 "raw_score_range": f"{raw_low}-{raw_high}",
             }
             for cadence in (14, 21, 28):
-                mean, sd = stats_by_cadence[cadence][instrument]
-                lower = (raw_low - mean) / sd
-                upper = (raw_high - mean) / sd
-                row[f"latent_z_range_{cadence}d"] = f"{lower:.2f} to {upper:.2f}"
+                center, scale_value = fixed[instrument]
+                lower = (raw_low - center) / scale_value
+                upper = (raw_high - center) / scale_value
+                row[f"transformed_anchor_range_{cadence}d"] = f"{lower:.2f} to {upper:.2f}"
             crosswalk_rows.append(row)
     return pd.DataFrame(crosswalk_rows), pd.DataFrame(stats_rows)
 
@@ -211,13 +229,19 @@ def build_session_proxy(raw: pd.DataFrame, session_axis: pd.DataFrame, scorer: s
     index = 0 if scorer == "Gemma" else 1
     score_frame = pd.DataFrame({"id": raw["PatientFID"].astype(int), "day": raw["day"].astype(int)})
     for j, (_, source_pair) in enumerate(DOMAIN_SOURCES.items()):
-        values = raw[source_pair[index]].astype(float)
-        score_frame[f"B{j}"] = (values - values.mean()) / (values.std() or 1.0)
+        score_frame[f"B{j}"] = raw[source_pair[index]].astype(float)
     notes = score_frame.groupby(["id", "day"], as_index=False)[B_COLS].mean()
     notes["note_day"] = notes["day"]
     notes = notes.sort_values("day").reset_index(drop=True)
     sessions = session_axis.sort_values("day").reset_index(drop=True)
-    merged = pd.merge_asof(sessions, notes, on="day", by="id", direction="backward")
+    merged = pd.merge_asof(
+        sessions,
+        notes,
+        on="day",
+        by="id",
+        direction="backward",
+        allow_exact_matches=False,
+    )
     merged["rdoc_observed"] = merged["note_day"].notna()
     merged["rdoc_days_stale"] = merged["day"] - merged["note_day"]
     for column in B_COLS:
@@ -288,82 +312,71 @@ def transition_sensitivity(
     for column in B_COLS:
         merged[column] = merged[f"{column}_new"]
 
-    summaries: list[dict] = []
-    coefficients: list[dict] = []
-    for (cadence, channel), frame in merged.groupby(["cadence", "channel"], sort=True):
-        frame = frame.dropna(subset=["delta_per_day", *NUISANCE, *B_COLS]).copy()
-        ids = frame["id"].to_numpy(dtype=int)
-        y = frame["delta_per_day"].to_numpy(dtype=float)
-        nuisance = frame[NUISANCE].to_numpy(dtype=float)
-        rdoc = frame[B_COLS].to_numpy(dtype=float)
-        folds = _folds(ids)
-        base_rmse, base_sse = _cv_error(ids, y, nuisance, folds)
-        full_x = np.column_stack([nuisance, rdoc])
-        full_rmse, full_sse = _cv_error(ids, y, full_x, folds)
-        improvement = base_rmse - full_rmse
-        incremental_r2 = 1.0 - full_sse / base_sse
-        _, coef = _ridge_fit_predict(full_x, y, full_x)
-        beta = coef[1 + len(NUISANCE) :]
+    # Use the exact primary empirical estimand and inference routine: raw total
+    # adjacent-session change, raw elapsed days as a nuisance covariate, Mundlak
+    # separation of patient means from within-patient deviations, patient-fold
+    # preprocessing, and within-patient circular time shifts.
+    summaries, coefficients = EMPIRICAL._summarize_rdoc_transitions(merged)
+    if summaries.empty:
+        return summaries, coefficients
+    summaries.insert(0, "scorer", scorer)
+    coefficients.insert(0, "scorer", scorer)
+    summaries["top_domain"] = summaries["top_domain"].map(
+        {f"B{i}": DOMAIN_NAMES[i] for i in range(6)}
+    )
+    coefficients["domain_code"] = coefficients["domain"]
+    coefficients["domain"] = coefficients["domain_code"].map(
+        {f"B{i}": DOMAIN_NAMES[i] for i in range(6)}
+    )
 
-        ensemble_group = ensemble_coef[
-            (ensemble_coef["cadence"] == int(cadence)) & (ensemble_coef["channel"] == str(channel))
+    cosines = []
+    for row in summaries.itertuples(index=False):
+        scorer_group = coefficients[
+            (coefficients["cadence"] == int(row.cadence))
+            & (coefficients["channel"] == str(row.channel))
         ]
-        ensemble_beta = np.array(
-            [
-                float(ensemble_group.loc[ensemble_group["domain"] == column, "coefficient"].iloc[0])
-                for column in B_COLS
-            ],
-            dtype=float,
-        )
+        ensemble_group = ensemble_coef[
+            (ensemble_coef["cadence"] == int(row.cadence))
+            & (ensemble_coef["channel"] == str(row.channel))
+        ]
+        beta = np.array([
+            float(scorer_group.loc[scorer_group["domain_code"] == f"B{i}", "coefficient"].iloc[0])
+            for i in range(6)
+        ])
+        ensemble_beta = np.array([
+            float(ensemble_group.loc[ensemble_group["domain"] == f"B{i}", "coefficient"].iloc[0])
+            for i in range(6)
+        ])
         denominator = np.linalg.norm(beta) * np.linalg.norm(ensemble_beta)
-        cosine = float(np.dot(beta, ensemble_beta) / denominator) if denominator > 0 else float("nan")
+        cosines.append(float(np.dot(beta, ensemble_beta) / denominator) if denominator > 0 else float("nan"))
+    summaries["beta_cosine_vs_ensemble"] = cosines
+    return summaries, coefficients
 
-        rng = np.random.default_rng(1100 + int(cadence) + (0 if channel == "depression" else 100))
-        perm_better = 0
-        for _ in range(PERMUTATIONS):
-            permuted = rdoc[rng.permutation(len(rdoc))]
-            perm_rmse, _ = _cv_error(ids, y, np.column_stack([nuisance, permuted]), folds)
-            if base_rmse - perm_rmse >= improvement:
-                perm_better += 1
-        permutation_p = (perm_better + 1.0) / (PERMUTATIONS + 1.0)
 
-        summaries.append(
-            {
-                "scorer": scorer,
-                "cadence": int(cadence),
-                "channel": str(channel),
-                "n": int(len(frame)),
-                "n_patients": int(frame["id"].nunique()),
-                "rmse_nuisance": base_rmse,
-                "rmse_rdoc": full_rmse,
-                "rmse_improvement": improvement,
-                "incremental_r2": incremental_r2,
-                "beta_norm": float(np.linalg.norm(beta)),
-                "top_domain": DOMAIN_NAMES[int(np.argmax(np.abs(beta)))],
-                "beta_cosine_vs_ensemble": cosine,
-                "permutation_p": permutation_p,
-            }
-        )
-        coefficients.extend(
-            {
-                "scorer": scorer,
-                "cadence": int(cadence),
-                "channel": str(channel),
-                "domain": DOMAIN_NAMES[j],
-                "coefficient": float(beta[j]),
-            }
-            for j in range(6)
-        )
-    return pd.DataFrame(summaries), pd.DataFrame(coefficients)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the empirical RDoC scorer sensitivity.")
+    parser.add_argument("--transitions", type=Path, default=DEFAULT_RUN / "empirical_rdoc_transition_rows_complete.csv")
+    parser.add_argument("--ensemble-summary", type=Path, default=DEFAULT_RUN / "empirical_rdoc_transition.csv")
+    parser.add_argument("--ensemble-coefficients", type=Path, default=DEFAULT_RUN / "empirical_rdoc_transition_coefficients.csv")
+    parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    return parser.parse_args()
 
 
 def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
+    args = parse_args()
+    transitions_path = args.transitions.resolve()
+    ensemble_summary_path = args.ensemble_summary.resolve()
+    ensemble_coefficients_path = args.ensemble_coefficients.resolve()
+    out = args.out.resolve()
+    for path in (transitions_path, ensemble_summary_path, ensemble_coefficients_path):
+        if not path.is_file():
+            raise FileNotFoundError(path)
+    out.mkdir(parents=True, exist_ok=True)
     raw, session_axis = load_retained_raw_rows()
     agreement, distribution = scorer_agreement(raw)
     crosswalk, anchor_stats = clinical_anchor_crosswalk()
-    transitions = pd.read_csv(TRANSITIONS, low_memory=False)
-    ensemble_coef = pd.read_csv(ENSEMBLE_COEFS)
+    transitions = pd.read_csv(transitions_path, low_memory=False)
+    ensemble_coef = pd.read_csv(ensemble_coefficients_path)
 
     sensitivity_frames: list[pd.DataFrame] = []
     coefficient_frames: list[pd.DataFrame] = []
@@ -383,24 +396,26 @@ def main() -> None:
 
     sensitivity = pd.concat(sensitivity_frames, ignore_index=True)
     coefficients = pd.concat(coefficient_frames, ignore_index=True)
-    agreement.to_csv(OUT / "scorer_agreement.csv", index=False)
-    distribution.to_csv(OUT / "ensemble_score_distribution.csv", index=False)
-    crosswalk.to_csv(OUT / "clinical_anchor_crosswalk.csv", index=False)
-    anchor_stats.to_csv(OUT / "clinical_anchor_standardizers.csv", index=False)
-    sensitivity.to_csv(OUT / "single_scorer_transition_sensitivity.csv", index=False)
-    coefficients.to_csv(OUT / "single_scorer_transition_coefficients.csv", index=False)
+    agreement.to_csv(out / "scorer_agreement.csv", index=False)
+    distribution.to_csv(out / "ensemble_score_distribution.csv", index=False)
+    crosswalk.to_csv(out / "clinical_anchor_crosswalk.csv", index=False)
+    anchor_stats.to_csv(out / "clinical_anchor_standardizers.csv", index=False)
+    sensitivity.to_csv(out / "single_scorer_transition_sensitivity.csv", index=False)
+    coefficients.to_csv(out / "single_scorer_transition_coefficients.csv", index=False)
 
-    ensemble = pd.read_csv(ENSEMBLE_SUMMARY).rename(columns={"n": "n"})
+    ensemble = pd.read_csv(ensemble_summary_path).rename(columns={"n": "n"})
     ensemble.insert(0, "scorer", "Ensemble")
     ensemble["top_domain"] = ensemble["top_domain"].map({f"B{i}": DOMAIN_NAMES[i] for i in range(6)})
     ensemble["beta_cosine_vs_ensemble"] = 1.0
     combined = pd.concat([ensemble, sensitivity], ignore_index=True, sort=False)
-    combined.to_csv(OUT / "supp_table_single_scorer_transition.csv", index=False)
+    combined.to_csv(out / "supp_table_single_scorer_transition.csv", index=False)
 
     manifest = {
         "analysis": "Exploratory scorer-robustness sensitivity requested during coauthor revision",
         "raw_source": str(RAW.relative_to(ROOT)),
-        "transition_source": str(TRANSITIONS.relative_to(ROOT)),
+        "transition_source": str(transitions_path),
+        "ensemble_summary_source": str(ensemble_summary_path),
+        "ensemble_coefficient_source": str(ensemble_coefficients_path),
         "retained_note_fields": int(len(raw)),
         "domains": DOMAIN_NAMES,
         "scorers": ["Gemma", "Qwen"],
@@ -408,6 +423,12 @@ def main() -> None:
         "ridge_penalty": RIDGE,
         "patient_folds": FOLDS,
         "permutations": PERMUTATIONS,
+        "permutation_scheme": "within-patient circular time shift",
+        "transition_outcome": "raw adjacent-session latent change; raw elapsed days included as a covariate",
+        "rdoc_estimand": "within-patient deviation adjusted for patient mean",
+        "same_day_notes_excluded": True,
+        "feature_scaling": "estimated in each training patient fold only",
+        "anchor_transform": "prespecified instrument midpoint and half-range; no cohort values",
         "proxy_summary": proxy_manifest,
         "outputs": [
             "scorer_agreement.csv",
@@ -419,13 +440,13 @@ def main() -> None:
             "supp_table_single_scorer_transition.csv",
         ],
     }
-    (OUT / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     print(agreement.to_string(index=False))
     print()
     print(crosswalk.to_string(index=False))
     print()
     print(sensitivity.to_string(index=False))
-    print(f"\nWrote sensitivity outputs to {OUT}")
+    print(f"\nWrote sensitivity outputs to {out}")
 
 
 if __name__ == "__main__":

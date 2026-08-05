@@ -68,11 +68,8 @@ class ComorbidityFeatureTests(unittest.TestCase):
 
         self.assertEqual(int(p101.loc[0, "dx_depression"]), 1)
         self.assertEqual(int(p101.loc[0, "dx_anxiety"]), 0)
-        # A diagnosis recorded on the session date is unavailable that day.
         self.assertEqual(int(p101.loc[1, "dx_anxiety"]), 0)
-        # It becomes available to the next later session and is carried forward.
         self.assertEqual(int(p101.loc[2, "dx_anxiety"]), 1)
-        # A diagnosis entered after the last session never moves backward in time.
         self.assertEqual(int(p101.loc[2, "dx_ptsd"]), 0)
         p202 = out[out["id"] == 202].iloc[0]
         self.assertEqual(int(p202["dx_history_available"]), 0)

@@ -4243,6 +4243,8 @@ def build_ssm_batch(
     ehr = np.zeros((B, T, p), dtype=np.float32)
     x_raw = np.zeros((B, T, p), dtype=np.float32)
     x_obs = np.zeros((B, T, p), dtype=np.float32)
+    x_input = np.zeros((B, T, p), dtype=np.float32)
+    dt = np.ones((B, T), dtype=np.float32)
     action = np.zeros((B, T), dtype=np.int64)
     z_truth = np.zeros((B, T, 2), dtype=np.float32)
     anchor_value = np.zeros((B, T, 2), dtype=np.float32)
@@ -4268,7 +4270,14 @@ def build_ssm_batch(
         obs_cols = [f"obs_X{j}" for j in range(p)]
         raw = di[x_cols].to_numpy(dtype=np.float32)
         x_obs[row] = di[obs_cols].to_numpy(dtype=np.float32) if obs_cols[0] in di.columns else np.isfinite(raw).astype(np.float32)
+        input_cols = [f"input_X{j}" for j in range(p)]
+        x_input[row] = (
+            di[input_cols].to_numpy(dtype=np.float32)
+            if input_cols[0] in di.columns else x_obs[row]
+        )
         x_raw[row] = np.nan_to_num(raw, nan=0.0)
+        if "dt" in ci.columns:
+            dt[row] = pd.to_numeric(ci["dt"], errors="coerce").fillna(1.0).clip(lower=1e-3).to_numpy(dtype=np.float32)
         action[row] = (ci["a"].to_numpy(dtype=int) + 1)  # -1 (none) -> 0
         z_truth[row, :, 0] = ci["z_d"].to_numpy(dtype=np.float32)
         z_truth[row, :, 1] = ci["z_p"].to_numpy(dtype=np.float32)
@@ -4300,16 +4309,34 @@ def build_ssm_batch(
                 win_start[row, k, ch] = max(0, t_index.get(int(arow.window_start), 0))
                 win_end[row, k, ch] = t_index.get(int(arow.window_end), k)
 
-    # Encoder features: standardized [EHR | RDoC | anchor value*obs | obs flags] +
+    # Encoder features: standardized [EHR | EHR availability masks | RDoC |
+    # anchor value*obs | obs flags] +
     # the action is added as a learned embedding inside the encoder.
-    raw = np.concatenate([ehr, rdoc, anchor_value * anchor_obs, anchor_obs], axis=-1)
-    if feature_stats is None:
+    raw = np.concatenate([ehr, x_input, rdoc, anchor_value * anchor_obs, anchor_obs], axis=-1)
+    no_encoder_scaling = data.metadata.get("encoder_feature_scaling") == "none"
+    if no_encoder_scaling:
+        feature_stats = (
+            np.zeros(raw.shape[-1], dtype=np.float32),
+            np.ones(raw.shape[-1], dtype=np.float32),
+        )
+    elif feature_stats is None:
         mean = raw.reshape(-1, raw.shape[-1]).mean(0)
         std = raw.reshape(-1, raw.shape[-1]).std(0)
         std = np.where(std > 1e-6, std, 1.0)
         feature_stats = (mean.astype(np.float32), std.astype(np.float32))
     mean, std = feature_stats
-    enc = ((raw - mean) / std).astype(np.float32)
+    enc = raw.astype(np.float32) if no_encoder_scaling else ((raw - mean) / std).astype(np.float32)
+    # Some empirical covariates are deliberately represented as raw continuous
+    # counts. Preserve those declared daily columns exactly in the encoder rather
+    # than silently standardizing them with a cohort-derived denominator.
+    unscaled_daily = data.metadata.get("encoder_unscaled_daily_indices", [])
+    for col_idx in unscaled_daily:
+        col_idx = int(col_idx)
+        if col_idx < 0 or col_idx >= p:
+            raise ValueError(f"Invalid unscaled daily feature index: {col_idx}")
+        enc[:, :, col_idx] = raw[:, :, col_idx].astype(np.float32)
+    if data.metadata.get("encoder_unscaled_daily_masks", False):
+        enc[:, :, p:2 * p] = raw[:, :, p:2 * p].astype(np.float32)
 
     to = lambda a: torch.as_tensor(a, device=device)
     batch = SSMBatch(
@@ -4321,7 +4348,7 @@ def build_ssm_batch(
         x_obs=to(x_obs),
         enc_features=to(enc),
         action=to(action),
-        dt=torch.ones(B, T, device=device),
+        dt=to(dt),
         anchor_value=to(anchor_value),
         anchor_obs=to(anchor_obs),
         anchor_total=to(anchor_total),
@@ -8396,6 +8423,7 @@ def main() -> None:
         "source": str(RAW_SCORES.relative_to(REPO)),
         "empirical_session_source": str(SESSION_DATA.relative_to(REPO)),
         "sole_rdoc_source_for_empirical_example": True,
+        "same_day_records_excluded": True,
         "excluded_field_names": "normalized FieldName is dx/dx_diagnosis or contains diagnosis",
         "excluded_field_name_counts": {str(k): int(v) for k, v in excluded_fields.items()},
         "raw_rows_read_for_empirical_patients": int(rows_after_patient_filter),
@@ -8430,7 +8458,7 @@ SRC_EMPIRICAL_BUILD_RDOC_PROXY = r'''
 """Carry RDoC note scores forward to a per-session six-dimensional proxy B(t).
 
 The RDoC scores live on the patient day-axis at the days notes were written.
-The proxy B(t) at a session day is the most recent note's RDoC profile at or
+The proxy B(t) at a session day is the most recent note's RDoC profile strictly
 before that day. This is a last-observation-carried-forward on the day-axis.
 Session days before a patient's first scored note receive the corpus mean
 (zero on the standardized scale) and are flagged as having no prior note.
@@ -8497,9 +8525,10 @@ def main() -> None:
     sess = _session_axis().sort_values("day").reset_index(drop=True)
 
     # Per-patient backward as-of merge: each session day takes the most recent
-    # note at or before it.
+    # note strictly before it. Same-day order is unavailable in the extract.
     merged = pd.merge_asof(
         sess, notes, on="day", by="id", direction="backward", suffixes=("", "_note"),
+        allow_exact_matches=False,
     )
     merged["rdoc_observed"] = merged["note_day"].notna()
     merged["rdoc_days_stale"] = (merged["day"] - merged["note_day"]).astype("float")
@@ -8528,7 +8557,7 @@ def main() -> None:
         "raw_score_source": "raw/RDoC_LLM_scorer.csv",
         "empirical_session_source": "empirical/data/rtms_paper_analytic_sessions.csv",
         "sole_rdoc_source_for_empirical_example": True,
-        "carry_forward": "most recent note RDoC profile at or before each session day; corpus mean (0) before first note",
+        "carry_forward": "most recent note RDoC profile strictly before each session day; corpus mean (0) before first note",
         "finding": "RDoC proxy uses only the LLM-constructed raw RDoC scorer output; empirical direct-transition coefficients remain descriptive and should be reported with the permutation control rather than interpreted as validated recovery of a true beta.",
     }
     (OUT / "rdoc_proxy_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
@@ -8743,6 +8772,315 @@ if __name__ == "__main__":
     main()
 '''
 
+# --- empirical.build_comorbidities (empirical/build_comorbidities.py) ---
+SRC_EMPIRICAL_BUILD_COMORBIDITIES = r'''
+"""Build strictly prior, session-level psychiatric diagnosis features.
+
+The input diagnosis text and the patient-level output are protected data. This
+command therefore refuses to write inside a Git working tree. It emits only
+numeric indicators and counts. It never writes diagnosis strings, ICD codes,
+calendar dates, appointment identifiers, or raw EHR field values.
+
+For a session on calendar date d, a diagnosis record contributes only when its
+recorded ServiceDate is strictly earlier than d. Same-day records are excluded
+because the available extracts do not contain a reliable within-day timestamp.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+DIAGNOSIS_FIELDS = ("DX_Diagnosis", "MH_diagnosis")
+CATEGORY_NAMES = (
+    "depression",
+    "anxiety",
+    "ptsd",
+    "bipolar",
+    "ocd",
+    "adhd",
+    "psychotic_spectrum",
+    "substance_use",
+    "eating_disorder",
+    "personality_disorder",
+    "autism_spectrum",
+    "sleep_disorder",
+)
+FEATURE_COLUMNS = (
+    "dx_history_available",
+    "dx_comorbidity_count",
+    *(f"dx_{name}" for name in CATEGORY_NAMES),
+)
+
+_CODE_RE = re.compile(r"(?i)(?<![A-Z0-9])([A-Z][0-9]{2}(?:\.[0-9A-Z]{1,4})?)(?![A-Z0-9])")
+_TEXT_PATTERNS = {
+    "depression": re.compile(r"(?i)\b(depress(?:ion|ive)?|major depressive|dysthymi\w*)\b"),
+    "anxiety": re.compile(r"(?i)\b(anxiety|anxious|generalized anxiety|panic disorder|social phobia)\b"),
+    "ptsd": re.compile(r"(?i)\b(ptsd|post[- ]traumatic stress)\b"),
+    "bipolar": re.compile(r"(?i)\b(bipolar|manic depression|mania)\b"),
+    "ocd": re.compile(r"(?i)\b(ocd|obsessive[- ]compulsive)\b"),
+    "adhd": re.compile(r"(?i)\b(adhd|attention[- ]deficit|attention deficit)\b"),
+    "psychotic_spectrum": re.compile(
+        r"(?i)\b(schizophren\w*|schizoaffective|psychotic disorder|unspecified psychosis)\b"
+    ),
+    "substance_use": re.compile(
+        r"(?i)\b(substance use|alcohol use disorder|opioid use disorder|cocaine use disorder|"
+        r"cannabis use disorder|stimulant use disorder|addiction)\b"
+    ),
+    "eating_disorder": re.compile(r"(?i)\b(eating disorder|anorexia|bulimia|binge eating)\b"),
+    "personality_disorder": re.compile(
+        r"(?i)\b(personality disorder|borderline personality|obsessive[- ]compulsive personality)\b"
+    ),
+    "autism_spectrum": re.compile(r"(?i)\b(autism|autistic|asperger)\b"),
+    "sleep_disorder": re.compile(r"(?i)\b(insomnia|sleep disorder|sleep apnea)\b"),
+}
+
+
+def _git_ancestor(path: Path) -> Path | None:
+    """Return the nearest Git working tree containing path, including worktrees."""
+
+    resolved = path.expanduser().resolve()
+    start = resolved if resolved.is_dir() else resolved.parent
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _assert_protected_output(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    git_root = _git_ancestor(resolved)
+    if git_root is not None:
+        raise ValueError(
+            "Refusing to write patient-level diagnosis features inside a Git working tree. "
+            "Choose a protected output directory outside the repository."
+        )
+    if resolved.suffix.lower() != ".csv":
+        raise ValueError("Protected comorbidity output must be a .csv file.")
+    return resolved
+
+
+def _session_axis(path: Path) -> pd.DataFrame:
+    sessions = pd.read_csv(path, low_memory=False)
+    required = {"PatientFID", "ServiceDate"}
+    missing = required.difference(sessions.columns)
+    if missing:
+        raise ValueError(f"Session file is missing required columns: {sorted(missing)}")
+    sessions = sessions[["PatientFID", "ServiceDate"]].copy()
+    sessions["PatientFID"] = pd.to_numeric(sessions["PatientFID"], errors="coerce")
+    sessions["ServiceDate"] = pd.to_datetime(sessions["ServiceDate"], errors="coerce").dt.normalize()
+    sessions = sessions.dropna(subset=["PatientFID", "ServiceDate"]).copy()
+    sessions["PatientFID"] = sessions["PatientFID"].astype(int)
+    sessions["_source_order"] = np.arange(len(sessions), dtype=int)
+    sessions = sessions.sort_values(
+        ["PatientFID", "ServiceDate", "_source_order"], kind="mergesort"
+    ).reset_index(drop=True)
+    sessions["session"] = sessions.groupby("PatientFID", sort=False).cumcount().astype(int)
+    first = sessions.groupby("PatientFID", sort=False)["ServiceDate"].transform("min")
+    sessions["day"] = (sessions["ServiceDate"] - first).dt.days.astype(int)
+    return sessions[["PatientFID", "session", "day", "ServiceDate"]]
+
+
+def _icd_categories(code: str) -> set[str]:
+    compact = code.upper().replace(".", "")
+    stem3 = compact[:3]
+    out: set[str] = set()
+    if stem3 in {"F32", "F33"} or compact.startswith(("F341", "F53", "F0631")):
+        out.add("depression")
+    if stem3 in {"F40", "F41"} or compact.startswith("F064"):
+        out.add("anxiety")
+    if compact.startswith("F431"):
+        out.add("ptsd")
+    if stem3 in {"F30", "F31"} or compact.startswith("F340"):
+        out.add("bipolar")
+    if stem3 == "F42":
+        out.add("ocd")
+    if stem3 == "F90":
+        out.add("adhd")
+    if len(stem3) == 3 and stem3[0] == "F" and stem3[1:].isdigit() and 20 <= int(stem3[1:]) <= 29:
+        out.add("psychotic_spectrum")
+    if len(stem3) == 3 and stem3[0] == "F" and stem3[1:].isdigit() and 10 <= int(stem3[1:]) <= 19:
+        out.add("substance_use")
+    if stem3 == "F50":
+        out.add("eating_disorder")
+    if stem3 in {"F60", "F61"}:
+        out.add("personality_disorder")
+    if stem3 == "F84":
+        out.add("autism_spectrum")
+    if stem3 in {"F51", "G47"}:
+        out.add("sleep_disorder")
+    return out
+
+
+def classify_diagnosis(value: object) -> set[str]:
+    """Map one protected diagnosis string to broad, nonexclusive categories."""
+
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return set()
+    text = str(value).strip()
+    if not text:
+        return set()
+    # Split exports that concatenate adjacent codes, such as F33.2F41.1.
+    code_text = re.sub(r"(?<=[0-9])(?=[A-Z][0-9]{2})", " ", text.upper())
+    out: set[str] = set()
+    for code in _CODE_RE.findall(code_text):
+        out.update(_icd_categories(code))
+    for name, pattern in _TEXT_PATTERNS.items():
+        if pattern.search(text):
+            out.add(name)
+    return out
+
+
+def _read_diagnosis_events(raw_dir: Path, patient_ids: set[int]) -> pd.DataFrame:
+    files = sorted(raw_dir.glob("amd*.sas7bdat"))
+    if not files:
+        raise FileNotFoundError("No amd*.sas7bdat files were found in the protected raw directory.")
+    frames: list[pd.DataFrame] = []
+    keep = ["FieldValue_UID", "FieldName", "PatientFID", "ServiceDate", "Value"]
+    for path in files:
+        raw = pd.read_sas(path, format="sas7bdat", encoding="latin1")
+        missing = set(keep).difference(raw.columns)
+        if missing:
+            raise ValueError(f"A raw SAS part is missing required columns: {sorted(missing)}")
+        part = raw.loc[raw["FieldName"].isin(DIAGNOSIS_FIELDS), keep].copy()
+        if part.empty:
+            continue
+        part["PatientFID"] = pd.to_numeric(part["PatientFID"], errors="coerce")
+        part = part[part["PatientFID"].isin(patient_ids)].copy()
+        if part.empty:
+            continue
+        part["PatientFID"] = part["PatientFID"].astype(int)
+        part["ServiceDate"] = pd.to_datetime(part["ServiceDate"], errors="coerce").dt.normalize()
+        part = part.dropna(subset=["ServiceDate", "Value"])
+        frames.append(part)
+    if not frames:
+        return pd.DataFrame(columns=keep)
+    events = pd.concat(frames, ignore_index=True)
+    # The raw export can repeat records across SAS parts. Prefer the stable field
+    # value identifier, then remove exact duplicate fallbacks.
+    uid_present = events["FieldValue_UID"].notna()
+    with_uid = events[uid_present].drop_duplicates("FieldValue_UID", keep="first")
+    without_uid = events[~uid_present].drop_duplicates(
+        ["PatientFID", "ServiceDate", "FieldName", "Value"], keep="first"
+    )
+    events = pd.concat([with_uid, without_uid], ignore_index=True)
+    events["categories"] = events["Value"].map(classify_diagnosis)
+    return events.sort_values(["PatientFID", "ServiceDate"], kind="mergesort").reset_index(drop=True)
+
+
+def construct_session_features(sessions: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+    """Construct cumulative features using only records strictly before a session."""
+
+    event_groups = {
+        int(pid): grp.sort_values("ServiceDate", kind="mergesort").reset_index(drop=True)
+        for pid, grp in events.groupby("PatientFID", sort=False)
+    }
+    rows: list[dict] = []
+    for pid, sess_group in sessions.groupby("PatientFID", sort=False):
+        pid = int(pid)
+        diagnoses = event_groups.get(pid, pd.DataFrame())
+        event_pos = 0
+        active_categories: set[str] = set()
+        record_count = 0
+        for session in sess_group.sort_values("session", kind="mergesort").itertuples(index=False):
+            # Strict inequality is intentional. Same-day records could have been
+            # entered after treatment and are therefore not available as features.
+            while event_pos < len(diagnoses) and diagnoses.iloc[event_pos]["ServiceDate"] < session.ServiceDate:
+                event = diagnoses.iloc[event_pos]
+                active_categories.update(event["categories"])
+                record_count += 1
+                event_pos += 1
+            observed = record_count > 0
+            comorbidity_count = len(active_categories.difference({"depression"}))
+            row = {
+                "id": pid,
+                "session": int(session.session),
+                "day": int(session.day),
+                "dx_history_available": int(observed),
+                "dx_comorbidity_count": int(comorbidity_count),
+            }
+            for category in CATEGORY_NAMES:
+                row[f"dx_{category}"] = int(category in active_categories)
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    expected = ["id", "session", "day", *FEATURE_COLUMNS]
+    out = out[expected].sort_values(["id", "session"], kind="mergesort").reset_index(drop=True)
+    forbidden = {"Value", "ServiceDate", "FieldValue_UID", "PatientFID", "AppointmentFID"}
+    if forbidden.intersection(out.columns):
+        raise RuntimeError("Protected raw fields reached the numeric feature output.")
+    return out
+
+
+def _aggregate_manifest(features: pd.DataFrame, raw_parts: int) -> dict:
+    observed = features["dx_history_available"] == 1
+    category_prevalence = {
+        category: {
+            "sessions": int(features[f"dx_{category}"].sum()),
+            "patients": int(features.loc[features[f"dx_{category}"] == 1, "id"].nunique()),
+        }
+        for category in CATEGORY_NAMES
+    }
+    return {
+        "rule": "diagnosis ServiceDate strictly earlier than session ServiceDate",
+        "same_day_records_excluded": True,
+        "carry_forward": "cumulative after first strictly prior diagnosis record",
+        "raw_fields_used": list(DIAGNOSIS_FIELDS),
+        "raw_sas_parts_read": int(raw_parts),
+        "n_sessions": int(len(features)),
+        "n_patients": int(features["id"].nunique()),
+        "sessions_with_prior_diagnosis_list": int(observed.sum()),
+        "patients_with_prior_diagnosis_list": int(features.loc[observed, "id"].nunique()),
+        "feature_columns": list(FEATURE_COLUMNS),
+        "category_prevalence": category_prevalence,
+        "contains_raw_text": False,
+        "contains_calendar_dates": False,
+        "contains_appointment_identifiers": False,
+        "patient_level_output_is_protected": True,
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Build strictly prior BALL comorbidity features.")
+    parser.add_argument("--raw-dir", type=Path, required=True, help="Protected directory containing amd*.sas7bdat.")
+    parser.add_argument("--sessions", type=Path, required=True, help="Protected rTMS session cohort CSV.")
+    parser.add_argument("--output", type=Path, required=True, help="Protected output CSV outside every Git working tree.")
+    parser.add_argument("--manifest", type=Path, default=None, help="Optional protected aggregate JSON manifest.")
+    args = parser.parse_args()
+
+    output = _assert_protected_output(args.output)
+    manifest_path = args.manifest.expanduser().resolve() if args.manifest else None
+    if manifest_path is not None:
+        if _git_ancestor(manifest_path) is not None:
+            raise ValueError("Refusing to write the comorbidity manifest inside a Git working tree.")
+        if manifest_path.suffix.lower() != ".json":
+            raise ValueError("Aggregate manifest must be a .json file.")
+    sessions = _session_axis(args.sessions.expanduser().resolve())
+    patient_ids = set(sessions["PatientFID"].astype(int))
+    events = _read_diagnosis_events(args.raw_dir.expanduser().resolve(), patient_ids)
+    features = construct_session_features(sessions, events)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    features.to_csv(output, index=False)
+    if args.manifest:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = _aggregate_manifest(features, len(list(args.raw_dir.glob("amd*.sas7bdat"))))
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"built {len(features)} protected session feature rows for "
+        f"{features['id'].nunique()} patients; no raw diagnosis text was written"
+    )
+
+
+if __name__ == "__main__":
+    main()
+'''
+
 # --- empirical.fit_empirical (empirical/fit_empirical.py) ---
 SRC_EMPIRICAL_FIT_EMPIRICAL = r'''
 """Empirical BALL held-out recovery analysis on the rTMS cohort.
@@ -8810,6 +9148,27 @@ RDOC_NUISANCE_COLS = ["L_current", "dt", "rdoc_days_stale"]
 RDOC_RIDGE = 1.0
 RDOC_FOLDS = 5
 RDOC_PERMUTATIONS = 200
+COMORBIDITY_CATEGORY_COLS = [
+    "dx_depression",
+    "dx_anxiety",
+    "dx_ptsd",
+    "dx_bipolar",
+    "dx_ocd",
+    "dx_adhd",
+    "dx_psychotic_spectrum",
+    "dx_substance_use",
+    "dx_eating_disorder",
+    "dx_personality_disorder",
+    "dx_autism_spectrum",
+    "dx_sleep_disorder",
+]
+COMORBIDITY_TABLE_COLS = [
+    "dx_history_available",
+    "dx_comorbidity_count",
+    *COMORBIDITY_CATEGORY_COLS,
+]
+COMORBIDITY_FEATURE_COLS = ["dx_comorbidity_count", *COMORBIDITY_CATEGORY_COLS]
+EMPIRICAL_FEATURE_NAMES = ["treatment_session_number", *COMORBIDITY_FEATURE_COLS]
 
 # Markov pattern-mixture comparator (classical statistics arm). A finite mixture
 # of linear-Gaussian Markov trajectory classes is pooled across patients within a
@@ -9074,14 +9433,18 @@ def _conformal_quantile(scores: np.ndarray, alpha: float, default: float = float
 
 
 def _standardizers(anchors: pd.DataFrame) -> dict:
-    """Per-scale mean and sd from retained anchors pooled over the cohort."""
+    """Prespecified scale transforms that use no cohort or future values."""
 
-    stats = {}
-    ret = anchors[anchors["role"] == "anchor"]
-    for scale in ret["anchor"].unique():
-        v = ret.loc[ret["anchor"] == scale, "value"].to_numpy(dtype=float)
-        stats[scale] = (float(np.mean(v)), float(np.std(v)) or 1.0)
-    return stats
+    fixed = {
+        "PHQ9": (13.5, 13.5),
+        "GAD7": (10.5, 10.5),
+        "BDI": (31.5, 31.5),
+    }
+    observed = set(anchors["anchor"].dropna().astype(str).unique())
+    unknown = observed.difference(fixed)
+    if unknown:
+        raise ValueError(f"No prespecified scale transform for anchors: {sorted(unknown)}")
+    return {scale: fixed[scale] for scale in observed}
 
 
 def _coerce_sessions(sessions_full: pd.DataFrame) -> pd.DataFrame:
@@ -9096,10 +9459,61 @@ def _coerce_sessions(sessions_full: pd.DataFrame) -> pd.DataFrame:
     return sessions.sort_values(["id", "session", "day"]).reset_index(drop=True)
 
 
+def _git_ancestor(path: Path) -> Path | None:
+    resolved = path.expanduser().resolve()
+    start = resolved if resolved.is_dir() else resolved.parent
+    for candidate in (start, *start.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
+def _load_comorbidity_sessions(path_value: str | Path) -> pd.DataFrame:
+    """Load the protected numeric feature table without exposing its location."""
+
+    path = Path(path_value).expanduser().resolve()
+    if _git_ancestor(path) is not None:
+        raise ValueError(
+            "The comorbidity feature table must remain outside every Git working tree."
+        )
+    if not path.exists():
+        raise FileNotFoundError("The protected comorbidity feature table was not found.")
+    features = pd.read_csv(path, low_memory=False)
+    required = {"id", "session", "day", *COMORBIDITY_TABLE_COLS}
+    missing = required.difference(features.columns)
+    if missing:
+        raise ValueError(f"Comorbidity feature table is missing columns: {sorted(missing)}")
+    forbidden = {
+        "PatientFID", "AppointmentFID", "ServiceDate", "DOB", "Value",
+        "FieldValue_UID", "DX_Diagnosis", "MH_diagnosis", "note_text",
+    }
+    present_forbidden = forbidden.intersection(features.columns)
+    if present_forbidden:
+        raise ValueError(
+            "Protected raw columns are forbidden in the model feature table: "
+            f"{sorted(present_forbidden)}"
+        )
+    keep = ["id", "session", "day", *COMORBIDITY_TABLE_COLS]
+    features = features[keep].copy()
+    for col in keep:
+        features[col] = pd.to_numeric(features[col], errors="coerce")
+    if features[keep].isna().any().any():
+        raise ValueError("Comorbidity feature table contains missing or nonnumeric values.")
+    features[["id", "session", "day"]] = features[["id", "session", "day"]].astype(int)
+    binary_cols = ["dx_history_available", *COMORBIDITY_CATEGORY_COLS]
+    invalid_binary = [c for c in binary_cols if not features[c].isin([0, 1]).all()]
+    if invalid_binary:
+        raise ValueError(f"Comorbidity indicator columns must contain only 0/1: {invalid_binary}")
+    if features.duplicated(["id", "session"]).any():
+        raise ValueError("Comorbidity feature table has duplicate patient-session rows.")
+    return features.sort_values(["id", "session"], kind="mergesort").reset_index(drop=True)
+
+
 def _empirical_neural_dataset(
     anchors: pd.DataFrame,
     sessions_full: pd.DataFrame,
     rdoc_sessions: pd.DataFrame | None,
+    comorbidity_sessions: pd.DataFrame,
     stats: dict,
     *,
     max_patients: int | None = None,
@@ -9140,17 +9554,36 @@ def _empirical_neural_dataset(
     action_map = {v: i for i, v in enumerate(action_values)}
     n_actions = max(len(action_map), 1)
 
-    x_cols = [f"X{j}" for j in range(10)]
+    comorbidity_use = comorbidity_sessions[comorbidity_sessions["id"].isin(ids)].copy()
+    comorbidity_by = {
+        (int(r.id), int(r.session)): r for r in comorbidity_use.itertuples(index=False)
+    }
+    expected_keys = {
+        (int(r.id), int(r.session))
+        for r in sessions[["id", "session"]].itertuples(index=False)
+    }
+    missing_keys = expected_keys.difference(comorbidity_by)
+    if missing_keys:
+        raise ValueError(
+            f"Protected comorbidity table is missing {len(missing_keys)} cohort patient-session rows."
+        )
+
+    x_cols = [f"X{j}" for j in range(len(EMPIRICAL_FEATURE_NAMES))]
     component_rows, daily_rows, anchor_rows = [], [], []
     for pid in ids:
         g = session_groups[pid]
         days = session_days[pid]
-        max_day = max(float(days.max()), 1.0) if len(days) else 1.0
-        max_session = max(float(g.get("max_session", pd.Series([len(g)])).fillna(len(g)).max()), 1.0)
         for tpos in range(max_t):
             real = tpos < len(g)
             row = g.iloc[tpos] if real else None
             day = int(row["day"]) if real else int(tpos)
+            session_index = int(row["session"]) if real else int(tpos)
+            session_number = (
+                float(row.get("global_session"))
+                if real and pd.notna(row.get("global_session"))
+                else float(session_index + 1) if real else 0.0
+            )
+            dx_row = comorbidity_by.get((pid, session_index)) if real else None
             rdoc_row = rdoc_by.get((pid, day))
             b = np.zeros(len(RDOC_COLS), dtype=float)
             rdoc_observed = 0.0
@@ -9162,11 +9595,16 @@ def _empirical_neural_dataset(
                 stale = float(stale_val) if stale_val is not None and np.isfinite(stale_val) else 0.0
             action_raw = row.get("action_id") if real and "action_id" in g.columns else None
             a = action_map.get(action_raw, -1) if real else -1
+            next_gap = max(
+                float(int(days[tpos + 1]) - day) if real and tpos + 1 < len(days) else 1.0,
+                1e-3,
+            )
             recent_tx = float(row.get("recent_treatment", 0.0) or 0.0) if real else 0.0
             burden = float(row.get("treatment_burden", row.get("side_effect_burden", 0.0)) or 0.0) if real else 0.0
             component = {
                 "id": pid, "t": tpos, "a": int(a), "z_d": 0.0, "z_p": 0.0,
                 "L": 0.0, "slow": 0.0, "delta": 0.0, "proxy_observed": bool(rdoc_observed),
+                "dt": next_gap, "session_observed": bool(real),
                 # Fields the fair direct comparators (S0/Markov) read; the empirical
                 # tensor must carry the same covariate streams BALL gets so the
                 # comparison is input-matched. recent_treatment/treatment_burden are
@@ -9180,22 +9618,26 @@ def _empirical_neural_dataset(
                 component[f"active{j}"] = False
             component_rows.append(component)
 
+            dx_values = {
+                col: float(getattr(dx_row, col)) if dx_row is not None else 0.0
+                for col in COMORBIDITY_TABLE_COLS
+            }
             features = np.array([
-                float(real),
-                float(tpos) / max(max_t - 1, 1),
-                float(day) / max_day,
-                rdoc_observed,
-                min(stale, 60.0) / 60.0,
-                float(row.get("global_session", tpos + 1)) / max_session if real else 0.0,
-                max_session / 100.0,
-                float(row.get("gad_measured", 0.0) or 0.0) if real else 0.0,
-                float(row.get("bdi_measured", 0.0) or 0.0) if real else 0.0,
-                float(a + 1) / max(n_actions, 1) if real else 0.0,
+                session_number,
+                dx_values["dx_comorbidity_count"],
+                *[dx_values[col] for col in COMORBIDITY_CATEGORY_COLS],
             ], dtype=float)
+            if len(features) != len(EMPIRICAL_FEATURE_NAMES):
+                raise RuntimeError("Empirical feature vector does not match its declared schema.")
             daily = {"id": pid, "t": tpos}
             for j, val in enumerate(features):
                 daily[x_cols[j]] = float(val)
-                daily[f"obs_{x_cols[j]}"] = bool(real)
+                daily[f"input_{x_cols[j]}"] = bool(real) and (
+                    j == 0 or bool(dx_values["dx_history_available"])
+                )
+                # These columns are conditioning covariates, not noisy outcomes
+                # for the daily reconstruction likelihood.
+                daily[f"obs_{x_cols[j]}"] = False
             daily_rows.append(daily)
 
         pid_anchors = retained[retained["id"].astype(int) == pid]
@@ -9248,6 +9690,19 @@ def _empirical_neural_dataset(
         metadata={
             "source": "empirical_rtms_sparse_anchor_tensor",
             "anchor_note": "Retained anchors only; held-out genuine measurements excluded from training.",
+            "feature_names": EMPIRICAL_FEATURE_NAMES,
+            "feature_timing": "All diagnosis records are strictly earlier than the modeled session date.",
+            "time_encoding": "Raw treatment session number as context; raw inter-session days enter the transition interval dt.",
+            "encoder_unscaled_daily_indices": list(range(len(EMPIRICAL_FEATURE_NAMES))),
+            "empirical_feature_scaling": "none",
+            "encoder_feature_scaling": "none",
+            "encoder_unscaled_daily_masks": True,
+            "raw_continuous_time_features": ["treatment_session_number", "transition_dt_days"],
+            "diagnosis_history_availability_is_a_mask": True,
+            "daily_features_are_conditioning_covariates": True,
+            "future_course_denominators": False,
+            "same_session_symptom_measurement_flags": False,
+            "action_is_separate_from_ehr_features": True,
             "padded_time_steps": int(max_t),
             "n_patients": int(len(ids)),
         },
@@ -9259,6 +9714,7 @@ def _fit_empirical_teacher_student(
     anchors: pd.DataFrame,
     sessions_full: pd.DataFrame,
     rdoc_sessions: pd.DataFrame | None,
+    comorbidity_sessions: pd.DataFrame,
     stats: dict,
     args,
     cadence: int,
@@ -9267,6 +9723,7 @@ def _fit_empirical_teacher_student(
         anchors,
         sessions_full,
         rdoc_sessions,
+        comorbidity_sessions,
         stats,
         max_patients=args.max_patients,
     )
@@ -9282,7 +9739,7 @@ def _fit_empirical_teacher_student(
         ensemble_size=args.members,
         max_individuals=data.config.n,
         seed=EMPIRICAL_SEED + int(args.seed_offset),
-        rdoc_drift_head=True,
+        rdoc_drift_head=False,
         use_alpha_slow=False,
         delta_phi=args.delta_phi,
     )
@@ -9301,6 +9758,11 @@ def _fit_empirical_teacher_student(
         "members": int(args.members),
         "n_patients": int(data.config.n),
         "t": int(data.config.t),
+        "empirical_feature_names": list(EMPIRICAL_FEATURE_NAMES),
+        "comorbidity_feature_rows": int(len(comorbidity_sessions)),
+        "comorbidity_patients": int(comorbidity_sessions["id"].nunique()),
+        "future_derived_features": False,
+        "uses_rdoc_proxy": False,
         "max_patients": args.max_patients,
         "student_metadata": student.metadata,
         "teacher_metadata": teacher.metadata,
@@ -9310,7 +9772,7 @@ def _fit_empirical_teacher_student(
         encoding="utf-8",
     )
     # Fair direct comparators on the SAME empirical SimulationData (same inputs:
-    # anchors + daily covariates X0-9 + RDoC proxy B), fixed linear basis so they
+    # anchors + the same strictly prior daily covariates + RDoC proxy B), fixed linear basis so they
     # face the same mis-specification the transformer does. Returned as {id: L over
     # session index} dicts, windowed for held-out measurements like the BALL paths.
     dc_args = _dc_args("linear")
@@ -9813,10 +10275,11 @@ def _load_rdoc_sessions() -> pd.DataFrame | None:
         manifest.get("raw_score_source") != "raw/RDoC_LLM_scorer.csv"
         or manifest.get("empirical_session_source") != "empirical/data/rtms_paper_analytic_sessions.csv"
         or manifest.get("sole_rdoc_source_for_empirical_example") is not True
+        or manifest.get("same_day_records_excluded") is not True
     ):
         raise ValueError(
             "Empirical fit requires RDoC scores generated only from raw/RDoC_LLM_scorer.csv "
-            "on empirical/data/rtms_paper_analytic_sessions.csv."
+            "on empirical/data/rtms_paper_analytic_sessions.csv with same-day notes excluded."
         )
     rdoc = pd.read_csv(path)
     required = {"id", "day", "rdoc_observed", "rdoc_days_stale", *RDOC_COLS}
@@ -10103,16 +10566,21 @@ def _write_fit_run_manifest(
     archived_outputs: list[str],
     sessions_full: pd.DataFrame | None = None,
     rdoc_sessions: pd.DataFrame | None = None,
+    comorbidity_sessions: pd.DataFrame | None = None,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
+    fit_args = {
+        k: ("[protected external file]" if k == "comorbidity_features" else
+            int(v) if isinstance(v, np.integer) else v)
+        for k, v in vars(args).items()
+    }
     payload = {
         "status": status,
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "requested_cadences": [int(c) for c in requested_cadences],
         "completed_cadences": [int(c) for c in completed_cadences],
-        "fit_args": {k: (int(v) if isinstance(v, np.integer) else v) for k, v in vars(args).items()},
+        "fit_args": fit_args,
         "archived_final_outputs": archived_outputs,
-        "rdoc_score_source": "raw/RDoC_LLM_scorer.csv",
         "empirical_session_source": "empirical/data/rtms_paper_analytic_sessions.csv",
         "final_outputs_written": status == "complete",
     }
@@ -10120,9 +10588,19 @@ def _write_fit_run_manifest(
         payload["n_sessions"] = int(len(sessions_full))
         payload["n_patients"] = int(sessions_full["id"].nunique()) if "id" in sessions_full.columns else None
     if rdoc_sessions is not None and not rdoc_sessions.empty:
+        payload["rdoc_score_source"] = "raw/RDoC_LLM_scorer.csv"
+        payload["rdoc_transition_analysis"] = True
         payload["rdoc_session_rows"] = int(len(rdoc_sessions))
         payload["rdoc_patients"] = int(rdoc_sessions["id"].nunique()) if "id" in rdoc_sessions.columns else None
         payload["rdoc_proxy_coverage"] = float(rdoc_sessions["rdoc_observed"].mean()) if "rdoc_observed" in rdoc_sessions.columns else None
+    else:
+        payload["rdoc_transition_analysis"] = False
+    if comorbidity_sessions is not None and not comorbidity_sessions.empty:
+        payload["comorbidity_feature_rows"] = int(len(comorbidity_sessions))
+        payload["comorbidity_patients"] = int(comorbidity_sessions["id"].nunique())
+        payload["comorbidity_prior_list_coverage"] = float(comorbidity_sessions["dx_history_available"].mean())
+        payload["comorbidity_source"] = "protected external numeric feature table"
+        payload["comorbidity_strictly_prior"] = True
     (run_dir / "fit_run_manifest.json").write_text(json.dumps(payload, indent=2, default=str) + "\n", encoding="utf-8")
 
 
@@ -10145,6 +10623,17 @@ def main() -> None:
     parser.add_argument("--device", default=None)
     parser.add_argument("--cadences", type=int, nargs="+", default=CADENCES)
     parser.add_argument("--run-label", default=None)
+    parser.add_argument(
+        "--rdoc-transition-analysis",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run the separate descriptive RDoC transition analysis. Never supplies RDoC to the recovery model.",
+    )
+    parser.add_argument(
+        "--comorbidity-features",
+        required=True,
+        help="Protected session-level comorbidity CSV outside every Git working tree.",
+    )
     parser.add_argument("--clean-final-outputs", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
@@ -10157,7 +10646,8 @@ def main() -> None:
     sessions = sessions_full[["id", "day"]].dropna().drop_duplicates()
     sessions["id"] = sessions["id"].astype(int)
     sessions["day"] = sessions["day"].astype(int)
-    rdoc_sessions = _load_rdoc_sessions()
+    rdoc_sessions = _load_rdoc_sessions() if args.rdoc_transition_analysis else None
+    comorbidity_sessions = _load_comorbidity_sessions(args.comorbidity_features)
     methods = ["ball", "ball_teacher", "s0_direct_lgssm", "markov_direct_transition", "interpolation", "locf", "anchor_only"]
     all_strata, all_overall, calib_rows, boot_rows, transition_frames = [], [], [], [], []
     run_label = args.run_label or datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -10173,6 +10663,7 @@ def main() -> None:
         archived_outputs=archived_outputs,
         sessions_full=sessions_full,
         rdoc_sessions=rdoc_sessions,
+        comorbidity_sessions=comorbidity_sessions,
     )
     if archived_outputs:
         print(f"archived existing final empirical outputs under {run_dir / 'superseded_final_outputs'}", flush=True)
@@ -10183,7 +10674,9 @@ def main() -> None:
         anchors = pd.read_csv(OUT / f"anchors_sparse_{cad}d.csv")
         stats = _standardizers(anchors)
         print(f"cadence {cad}d: fitting BALL teacher/student transformer", flush=True)
-        student_pred, teacher_pred, s0_pred, markov_pred, session_days = _fit_empirical_teacher_student(anchors, sessions_full, rdoc_sessions, stats, args, cad)
+        student_pred, teacher_pred, s0_pred, markov_pred, session_days = _fit_empirical_teacher_student(
+            anchors, sessions_full, None, comorbidity_sessions, stats, args, cad
+        )
         neural_predictions = {
             "student": _prediction_lookup(student_pred, "L_hat"),
             "teacher": _prediction_lookup(teacher_pred, "L_hat"),
@@ -10216,6 +10709,7 @@ def main() -> None:
                 archived_outputs=archived_outputs,
                 sessions_full=sessions_full,
                 rdoc_sessions=rdoc_sessions,
+                comorbidity_sessions=comorbidity_sessions,
             )
             continue
         ev["gap_bin"] = pd.cut(ev["gap"], bins=GAP_BINS, labels=GAP_LABELS, include_lowest=True, right=False)
@@ -10299,6 +10793,7 @@ def main() -> None:
             archived_outputs=archived_outputs,
             sessions_full=sessions_full,
             rdoc_sessions=rdoc_sessions,
+            comorbidity_sessions=comorbidity_sessions,
         )
         print(f"cadence {cad}d: wrote per-cadence outputs to {run_dir}", flush=True)
 
@@ -10327,6 +10822,7 @@ def main() -> None:
         archived_outputs=archived_outputs,
         sessions_full=sessions_full,
         rdoc_sessions=rdoc_sessions,
+        comorbidity_sessions=comorbidity_sessions,
     )
     print("\n=== BALL minus interpolation and BALL minus Markov RMSE, patient-clustered bootstrap 95% CI ===")
     print(boot.round(4).to_string(index=False))
@@ -10847,6 +11343,7 @@ MODULE_SOURCES = {
     'simulations.paper.make_tables': ('simulations/paper/make_tables.py', SRC_SIMULATIONS_PAPER_MAKE_TABLES),
     'simulations.paper.run_all': ('simulations/paper/run_all.py', SRC_SIMULATIONS_PAPER_RUN_ALL),
     'empirical.assemble_rdoc_llm': ('empirical/assemble_rdoc_llm.py', SRC_EMPIRICAL_ASSEMBLE_RDOC_LLM),
+    'empirical.build_comorbidities': ('empirical/build_comorbidities.py', SRC_EMPIRICAL_BUILD_COMORBIDITIES),
     'empirical.build_rdoc_proxy': ('empirical/build_rdoc_proxy.py', SRC_EMPIRICAL_BUILD_RDOC_PROXY),
     'empirical.build_sparse_anchors': ('empirical/build_sparse_anchors.py', SRC_EMPIRICAL_BUILD_SPARSE_ANCHORS),
     'empirical.fit_empirical': ('empirical/fit_empirical.py', SRC_EMPIRICAL_FIT_EMPIRICAL),
@@ -10868,6 +11365,7 @@ COMMANDS = {
     'paper-tables': 'simulations.paper.make_tables',
     'paper-all': 'simulations.paper.run_all',
     'empirical-assemble-rdoc-llm': 'empirical.assemble_rdoc_llm',
+    'empirical-build-comorbidities': 'empirical.build_comorbidities',
     'empirical-build-rdoc-proxy': 'empirical.build_rdoc_proxy',
     'empirical-build-anchors': 'empirical.build_sparse_anchors',
     'empirical-fit': 'empirical.fit_empirical',

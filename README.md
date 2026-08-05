@@ -10,7 +10,7 @@ for the manuscript. It contains no data.
 
 ## Layout
 
-`BALL.py` is the canonical single-file codebase. It holds 37 modules as embedded
+`BALL.py` is the canonical single-file codebase. It holds 37 modules and package stubs as embedded
 source blocks and installs them at import time as a virtual `simulations.*` and
 `empirical.*` package, so the file is self-contained and needs no accompanying
 package directory. It covers the data-generating process, the anchor and
@@ -64,7 +64,7 @@ scikit-learn, PyTorch, PyYAML, and Matplotlib.
 python BALL.py
 ```
 
-That prints 18 commands. The simulation entry point is `pipeline`, the
+That prints 19 commands. The simulation entry point is `pipeline`, the
 replicate-parallel runner is `pilot-batch`, and the empirical pipeline runs
 through the `empirical-*` commands. The `paper-*` commands regenerate the
 manuscript tables and figures from completed runs.
@@ -77,6 +77,14 @@ python validation/direct_rdoc_benchmark.py --help
 
 The empirical commands and the empirical validation scripts require the data
 inputs described above, so they will not run against a fresh clone.
+
+The empirical comorbidity builder is `empirical-build-comorbidities`. It reads
+the protected SAS extracts and writes a numeric session-level feature table to
+an explicitly supplied location outside every Git working tree. A diagnosis is
+available to a modeled session only when its recorded date is strictly earlier
+than the session date. The empirical fit requires that protected file through
+`--comorbidity-features`. Patient-level feature tables must never be copied into
+this repository.
 
 ## Terminology
 

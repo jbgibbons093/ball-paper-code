@@ -20,12 +20,27 @@ runs/
 *.xls
 *.csv.gz
 *.parquet
+*.feather
+*.sas7bdat
+*.xpt
+*.dta
+*.sav
+*.db
+*.sqlite
+*.sqlite3
 *.pkl
 *.pt
 *.ckpt
 *.npy
 *.npz
 *.log
+*.jsonl
+*.ndjson
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tgz
 
 # Manuscript and presentation artifacts
 *.docx
@@ -35,6 +50,10 @@ runs/
 # Credentials
 .openai_key
 *.key
+*.pem
+*.pfx
+*.p12
+credentials*
 .env
 
 # Python build noise

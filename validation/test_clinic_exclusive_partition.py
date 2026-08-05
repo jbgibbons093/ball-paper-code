@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -14,6 +15,7 @@ BALL._install_virtual_package()
 from empirical.fit_empirical import (  # noqa: E402
     _canonical_empirical_clinic,
     _generalization_split_maps,
+    _empirical_gp_partition_ids,
     _primary_empirical_partitions,
 )
 
@@ -85,6 +87,21 @@ class ClinicExclusivePartitionTests(unittest.TestCase):
         split = _generalization_split_maps(sessions)["forward_2025"]
         self.assertEqual(split, {1: "train", 2: "test"})
         self.assertNotIn(3, split)
+
+    def test_gaussian_process_uses_training_clinics_for_fit_and_validation_clinics_for_selection(self) -> None:
+        data = SimpleNamespace(
+            individuals=pd.DataFrame(
+                {
+                    "id": [1, 2, 3, 4],
+                    "split": ["train", "train", "train", "test"],
+                    "source_split": ["train", "train", "val", "test"],
+                }
+            )
+        )
+        fit_ids, selection_ids, development_ids = _empirical_gp_partition_ids(data)
+        self.assertEqual(fit_ids, {1, 2})
+        self.assertEqual(selection_ids, {3})
+        self.assertEqual(development_ids, {1, 2, 3})
 
 
 if __name__ == "__main__":

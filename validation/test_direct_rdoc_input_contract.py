@@ -10,7 +10,9 @@ from validation.direct_rdoc_benchmark import (
     _ode_rnn_tensors,
     fit_gp_causal_filter,
     make_data,
+    strict_transition_only_data,
 )
+from simulations.src.methods.ball_ssm import build_ssm_batch
 from validation.direct_rdoc_fair_comparator import (
     causal_encoder_action_array,
     fit_daily_readout,
@@ -146,3 +148,25 @@ def test_gp_filter_excludes_future_questionnaires() -> None:
         "L_hat",
     ].to_numpy(dtype=float)
     assert np.allclose(causal_before, causal_before_altered, atol=1e-10, rtol=0.0)
+
+
+def test_strict_transition_arm_removes_proxies_from_all_structured_paths() -> None:
+    data = make_data(_args(), 1729, 0.25, "linear")
+    strict = strict_transition_only_data(data)
+    proxy_columns = [f"X{index}" for index in range(8, 12)]
+    assert (strict.daily[proxy_columns].to_numpy(dtype=float) == 0.0).all()
+    input_columns = [f"input_{column}" for column in proxy_columns]
+    if set(input_columns).issubset(strict.daily.columns):
+        assert not strict.daily[input_columns].to_numpy(dtype=bool).any()
+    assert not strict.daily[[f"obs_{column}" for column in proxy_columns]].to_numpy(dtype=bool).any()
+    batch, _ = build_ssm_batch(
+        strict,
+        "train",
+        torch.device("cpu"),
+        max_individuals=20,
+        include_rdoc_in_encoder=False,
+    )
+    assert torch.count_nonzero(batch.ehr[:, :, 8:12]) == 0
+    assert torch.count_nonzero(batch.x_raw[:, :, 8:12]) == 0
+    assert torch.count_nonzero(batch.x_obs[:, :, 8:12]) == 0
+    assert strict.metadata["structured_reconstruction_proxy_columns"] == []

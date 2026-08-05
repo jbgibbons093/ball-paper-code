@@ -389,7 +389,7 @@ def write_distillation_ablation(per_run: pd.DataFrame, out: Path) -> None:
                 "teacher_distribution_matching": "yes",
                 "questionnaire_likelihood": "yes",
                 "updated_parameters": "causal encoder",
-                "optimizer_update_budget": "teacher training followed by student training",
+                "optimizer_update_budget": "student training schedule after the common teacher fit",
             },
             {
                 "training_arm": "Compute-matched direct causal transformer",
@@ -398,9 +398,17 @@ def write_distillation_ablation(per_run: pd.DataFrame, out: Path) -> None:
                 "teacher_distribution_matching": "no",
                 "questionnaire_likelihood": "yes",
                 "updated_parameters": "causal encoder and generative model",
-                "optimizer_update_budget": "combined teacher-plus-student variational-update count",
+                "optimizer_update_budget": "every questionnaire warm-up, teacher-variational, and student-stage update in the full BALL system",
             },
         ]
+    ).assign(
+        common_teacher_prerequisite=lambda frame: frame["training_arm"].isin(
+            [
+                "Inherited dynamics and questionnaires",
+                "Teacher matching only",
+                "Full BALL student",
+            ]
+        ).map({True: "same fitted bidirectional teacher", False: "none"})
     ).to_csv(out / "supp_table1d_distillation_arm_specification.csv", index=False)
 
 
@@ -1046,6 +1054,7 @@ def empirical_outputs(
                     "beta_norm": fmt(row.beta_norm),
                     "top_domain": row.top_domain,
                     "permutation_p": fmt(row.permutation_p),
+                    "holm_adjusted_permutation_p": fmt(row.permutation_p_holm),
                 }
             )
         pd.DataFrame(trows).to_csv(out / "supp_table5_empirical_rdoc_transition.csv", index=False)
@@ -1422,13 +1431,17 @@ def empirical_outputs(
     if not uncertainty_workload.empty:
         fig, axes = plt.subplots(1, 3, figsize=(12.5, 3.7))
         for cadence in sorted(uncertainty_workload["cadence"].astype(int).unique()):
-            panel = uncertainty_workload[
+            cadence_rows = uncertainty_workload[
                 uncertainty_workload["cadence"].astype(int) == int(cadence)
-            ].sort_values("interval_width_fraction_threshold")
-            label = f"{cadence} days"
-            axes[0].plot(panel["interval_width_fraction_threshold"], panel["additional_measurement_fraction"], "o-", label=label)
-            axes[1].plot(panel["interval_width_fraction_threshold"], panel["rmse_when_prediction_retained_development_sd_units"], "o-", label=label)
-            axes[2].plot(panel["interval_width_fraction_threshold"], panel["coverage_when_prediction_retained"], "o-", label=label)
+            ]
+            for width_type, linestyle in (("raw", "-"), ("support_clipped", "--")):
+                panel = cadence_rows[
+                    cadence_rows["width_type"].astype(str).eq(width_type)
+                ].sort_values("interval_width_fraction_threshold")
+                label = f"{cadence} days, {width_type.replace('_', ' ')}"
+                axes[0].plot(panel["interval_width_fraction_threshold"], panel["additional_measurement_fraction"], marker="o", linestyle=linestyle, label=label)
+                axes[1].plot(panel["interval_width_fraction_threshold"], panel["rmse_when_prediction_retained_development_sd_units"], marker="o", linestyle=linestyle, label=label)
+                axes[2].plot(panel["interval_width_fraction_threshold"], panel["coverage_when_prediction_retained"], marker="o", linestyle=linestyle, label=label)
         axes[0].set_title("A. Additional measurements", loc="left")
         axes[0].set_ylabel("Fraction of held-out visits")
         axes[1].set_title("B. Error among retained estimates", loc="left")

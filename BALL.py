@@ -10521,7 +10521,12 @@ def _patient_balanced_conformal_quantile(
     alpha: float,
     default: float = float("nan"),
 ) -> tuple[float, int]:
-    """Weighted quantile where every patient contributes total weight one."""
+    """Weighted quantile where every patient contributes total weight one.
+
+    The caller supplies measurements from one questionnaire instrument, so a
+    patient with ``m_im`` eligible measurements of instrument ``m`` receives
+    weight ``1 / m_im`` on each of those measurements.
+    """
 
     required = {"id", "normalized_score"}
     if not required.issubset(scores.columns):
@@ -10797,14 +10802,12 @@ def _fit_development_measurement_calibration(
                 "observation_sd": float(math.exp(anx[3])), "legal_min": 0.0, "legal_max": 21.0,
             },
         },
-        "latent_process": {
-            "depression_state_mean": float(dep[0]),
-            "depression_daily_persistence": float(1.0 / (1.0 + math.exp(-dep[1]))),
-            "depression_process_sd": float(math.exp(dep[2])),
-            "anxiety_state_mean": float(anx[0]),
-            "anxiety_daily_persistence": float(1.0 / (1.0 + math.exp(-anx[1]))),
-            "anxiety_process_sd": float(math.exp(anx[2])),
-        },
+        "calibration_processes": (
+            "separate one-channel Gaussian state processes for depression "
+            "(PHQ9 and BDI) and anxiety (GAD7); process parameters are nuisance "
+            "quantities used only during calibration and are discarded after fitting"
+        ),
+        "exported_parameters": "instrument intercepts, loadings, and observation standard deviations only",
         "optimization": {
             "depression_success": bool(depression_fit.success),
             "depression_nll_per_event": float(depression_fit.fun),
@@ -10898,6 +10901,15 @@ def _empirical_neural_dataset(
     """
 
     sessions = _coerce_sessions(sessions_full)
+    if "split" in sessions.columns:
+        source_split_by_id = (
+            sessions.groupby("id", sort=False)["split"]
+            .agg(lambda values: str(values.iloc[0]).strip().lower())
+            .replace({"validation": "val", "valid": "val"})
+            .to_dict()
+        )
+    else:
+        source_split_by_id = {}
     instrument_parameters = measurement_calibration["instruments"]
     instrument_order = ("PHQ9", "BDI", "GAD7")
     if set(instrument_parameters) != set(instrument_order):
@@ -10917,11 +10929,26 @@ def _empirical_neural_dataset(
     if max_patients is not None:
         limit = int(max_patients)
         if patient_splits:
-            train_candidates = [pid for pid in ids if patient_splits.get(int(pid)) == "train"]
+            source_train_candidates = [
+                pid for pid in ids
+                if patient_splits.get(int(pid)) == "train"
+                and source_split_by_id.get(int(pid), "train") == "train"
+            ]
+            source_selection_candidates = [
+                pid for pid in ids
+                if patient_splits.get(int(pid)) == "train"
+                and source_split_by_id.get(int(pid), "train") == "val"
+            ]
             test_candidates = [pid for pid in ids if patient_splits.get(int(pid)) == "test"]
             n_test = min(len(test_candidates), max(2, limit // 3))
-            n_train = min(len(train_candidates), max(2, limit - n_test))
-            ids = sorted(train_candidates[:n_train] + test_candidates[:n_test])
+            remaining = max(limit - n_test, 0)
+            n_selection = min(len(source_selection_candidates), max(2, remaining // 4))
+            n_train = min(len(source_train_candidates), max(2, remaining - n_selection))
+            ids = sorted(
+                source_train_candidates[:n_train]
+                + source_selection_candidates[:n_selection]
+                + test_candidates[:n_test]
+            )
         else:
             ids = ids[:limit]
     if not ids:
@@ -11137,6 +11164,7 @@ def _empirical_neural_dataset(
         "id": ids,
         "subtype": 0,
         "split": [patient_splits.get(int(pid), "train") if patient_splits else "train" for pid in ids],
+        "source_split": [source_split_by_id.get(int(pid), "train") for pid in ids],
     })
     if patient_splits and not set(individuals["id"].astype(int)).issubset(
         {int(pid) for pid in patient_splits}
@@ -11561,6 +11589,16 @@ def _fit_empirical_teacher_student(
         ode_rnn_predictions = _fit_empirical_ode_rnn(data, args)
         fit_timing_seconds["ode_rnn_ensemble"] = float(perf_counter() - stage_started)
     fit_timing_seconds["complete_benchmark_suite"] = float(perf_counter() - fit_started)
+    development_batches_per_epoch = int(
+        math.ceil(
+            int((data.individuals["split"] == "train").sum())
+            / max(int(args.batch_size), 1)
+        )
+    )
+    full_ball_updates_per_member = int(
+        development_batches_per_epoch
+        * (int(args.anchor_warmup) + int(args.teacher_epochs) + int(args.student_epochs))
+    )
     manifest = {
         "method": "BALL teacher/student transformer",
         "run_id": manifest_dir.name,
@@ -11577,6 +11615,22 @@ def _fit_empirical_teacher_student(
         "n_layers": int(args.n_layers),
         "n_heads": int(args.n_heads),
         "members": int(args.members),
+        "distillation_update_accounting": {
+            "development_batches_per_epoch": development_batches_per_epoch,
+            "common_teacher_updates_per_member": int(
+                development_batches_per_epoch
+                * (int(args.anchor_warmup) + int(args.teacher_epochs))
+            ),
+            "shared_teacher_arm_student_updates_per_member": int(
+                development_batches_per_epoch * int(args.student_epochs)
+            ),
+            "full_ball_system_updates_per_member": full_ball_updates_per_member,
+            "compute_matched_direct_updates_per_member": full_ball_updates_per_member,
+            "update_definition": (
+                "every gradient update, including questionnaire-focused warm-up, "
+                "teacher variational training, and student-stage training"
+            ),
+        },
         "n_patients": int(data.config.n),
         "n_development_patients": int((data.individuals["split"] == "train").sum()),
         "n_heldout_clinic_patients": int((data.individuals["split"] == "test").sum()),
@@ -11726,11 +11780,16 @@ def _causal_empirical_actions(comp: pd.DataFrame) -> np.ndarray:
     return previous
 
 
-def _fit_empirical_gp_scaler(data: SimulationData) -> dict[str, np.ndarray]:
-    """Estimate continuous-feature scaling from development patients only."""
+def _fit_empirical_gp_scaler(
+    data: SimulationData,
+    patient_ids: set[int] | None = None,
+) -> dict[str, np.ndarray]:
+    """Estimate continuous-feature scaling in the declared fitting patients."""
 
-    train_ids = set(
-        data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
+    train_ids = (
+        set(int(value) for value in patient_ids)
+        if patient_ids is not None
+        else set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
     )
     p = int(data.config.p_daily)
     continuous_indices = np.asarray([index for index in (0, 1) if index < p], dtype=int)
@@ -11790,11 +11849,14 @@ def _fit_empirical_gp_mean(
     data: SimulationData,
     anchor_name: str,
     scaler: dict[str, np.ndarray],
+    patient_ids: set[int] | None = None,
 ) -> tuple[np.ndarray, float]:
-    """Fit the Gaussian-process mean function on development patients only."""
+    """Fit the Gaussian-process mean function in the declared fitting patients."""
 
-    train_ids = set(
-        data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
+    train_ids = (
+        set(int(value) for value in patient_ids)
+        if patient_ids is not None
+        else set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
     )
     rows, targets = [], []
     feature_dim = None
@@ -11879,12 +11941,11 @@ def _select_empirical_gp_kernel(
     scaler: dict[str, np.ndarray],
     beta: np.ndarray,
     variance: float,
+    selection_ids: set[int],
 ) -> dict[str, float]:
-    """Select channel-specific kernel settings using development patients only."""
+    """Select channel-specific kernel settings in model-selection clinics."""
 
-    train_ids = sorted(
-        data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
-    )
+    train_ids = sorted(int(value) for value in selection_ids)
     candidates = [
         {"slow_length_days": slow, "fast_length_days": fast, "auxiliary_weight": auxiliary}
         for slow in (14.0, 28.0, 56.0)
@@ -11938,6 +11999,28 @@ def _select_empirical_gp_kernel(
     return {**best, "development_negative_log_likelihood_per_event": float(best_score)}
 
 
+def _empirical_gp_partition_ids(data: SimulationData) -> tuple[set[int], set[int], set[int]]:
+    """Return source-training, source-selection, and combined development patients."""
+
+    development = data.individuals.loc[data.individuals["split"].eq("train")].copy()
+    if "source_split" not in development.columns:
+        raise ValueError("Empirical Gaussian-process tuning requires source clinic partitions.")
+    source_training_ids = set(
+        development.loc[development["source_split"].eq("train"), "id"].astype(int)
+    )
+    source_selection_ids = set(
+        development.loc[development["source_split"].eq("val"), "id"].astype(int)
+    )
+    development_ids = set(development["id"].astype(int))
+    if not source_training_ids or not source_selection_ids:
+        raise ValueError("Empirical Gaussian-process tuning requires both training and model-selection clinics.")
+    if source_training_ids & source_selection_ids:
+        raise AssertionError("Gaussian-process fitting and model-selection patients overlap.")
+    if source_training_ids | source_selection_ids != development_ids:
+        raise AssertionError("Gaussian-process development patients lack a source clinic role.")
+    return source_training_ids, source_selection_ids, development_ids
+
+
 def _fit_empirical_gp_channel(
     data: SimulationData,
     anchor_name: str,
@@ -11945,11 +12028,25 @@ def _fit_empirical_gp_channel(
 ) -> tuple[dict[int, np.ndarray], dict[str, object]]:
     """Fit a causal Gaussian-process filter."""
 
-    scaler = _fit_empirical_gp_scaler(data)
-    beta, variance = _fit_empirical_gp_mean(data, anchor_name, scaler)
-    kernel_parameters = _select_empirical_gp_kernel(
-        data, anchor_name, session_days, scaler, beta, variance
+    source_training_ids, source_selection_ids, development_ids = (
+        _empirical_gp_partition_ids(data)
     )
+
+    selection_scaler = _fit_empirical_gp_scaler(data, source_training_ids)
+    selection_beta, selection_variance = _fit_empirical_gp_mean(
+        data, anchor_name, selection_scaler, source_training_ids
+    )
+    kernel_parameters = _select_empirical_gp_kernel(
+        data,
+        anchor_name,
+        session_days,
+        selection_scaler,
+        selection_beta,
+        selection_variance,
+        source_selection_ids,
+    )
+    scaler = _fit_empirical_gp_scaler(data, development_ids)
+    beta, variance = _fit_empirical_gp_mean(data, anchor_name, scaler, development_ids)
     causal_predictions: dict[int, np.ndarray] = {}
     for pid in sorted(data.individuals["id"].astype(int)):
         comp, features = _empirical_benchmark_inputs(data, pid, scaler)
@@ -12013,7 +12110,10 @@ def _fit_empirical_gp_channel(
         "continuous_feature_means": scaler["means"].astype(float).tolist(),
         "continuous_feature_standard_deviations": scaler["sds"].astype(float).tolist(),
         "binary_features_retained_as_zero_one": True,
-        "parameter_training_scope": "development patients only",
+        "candidate_fit_scope": "ten clinic-exclusive training clinics",
+        "kernel_selection_scope": "three clinic-exclusive model-selection clinics",
+        "final_refit_scope": "all thirteen development clinics",
+        "kernel_selection_criterion": "channel-specific questionnaire negative log likelihood per event",
     }
     return causal_predictions, metadata
 
@@ -12071,6 +12171,7 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
         action_onehot = np.eye(action_count, dtype=np.float32)[actions]
         anchor_input = np.zeros((t_count, len(instrument_names)), dtype=np.float32)
         anchor_flag = np.zeros((t_count, len(instrument_names)), dtype=np.float32)
+        event_seen = np.zeros((t_count, len(instrument_names)), dtype=bool)
         anchors = data.anchors[
             (data.anchors["id"].astype(int) == int(pid))
             & data.anchors["observed"].astype(bool)
@@ -12085,8 +12186,9 @@ def _empirical_ode_tensors(data: SimulationData, ids: list[int], device: torch.d
                 raise ValueError(f"Unknown empirical questionnaire instrument: {instrument}")
             instrument_position = instrument_index[instrument]
             value = float(anchor.value)
-            if anchor_flag[position, instrument_position] > 0:
+            if event_seen[position, instrument_position]:
                 raise ValueError("Duplicate patient-session-instrument event entered the recurrent comparator.")
+            event_seen[position, instrument_position] = True
             input_position = position + 1
             if input_position < t_count and valid[input_position]:
                 anchor_input[input_position, instrument_position] = value
@@ -13468,6 +13570,22 @@ def _transition_one_group(
     return summary, coefs
 
 
+def _holm_adjusted_probabilities(values: pd.Series | np.ndarray) -> np.ndarray:
+    """Holm adjustment that preserves missing values and the original row order."""
+
+    raw = pd.to_numeric(pd.Series(values), errors="coerce").to_numpy(dtype=float)
+    adjusted = np.full(len(raw), np.nan, dtype=float)
+    finite_positions = np.flatnonzero(np.isfinite(raw))
+    if finite_positions.size:
+        ordered_positions = finite_positions[np.argsort(raw[finite_positions], kind="mergesort")]
+        ordered_raw = raw[ordered_positions]
+        ordered_adjusted = np.maximum.accumulate(
+            (len(ordered_raw) - np.arange(len(ordered_raw))) * ordered_raw
+        )
+        adjusted[ordered_positions] = np.minimum(ordered_adjusted, 1.0)
+    return adjusted
+
+
 def _summarize_rdoc_transitions(
     transitions: pd.DataFrame,
     *,
@@ -13485,7 +13603,13 @@ def _summarize_rdoc_transitions(
         )
         summaries.append(summary)
         coefs.extend(coef_rows)
-    return pd.DataFrame(summaries), pd.DataFrame(coefs)
+    summary_frame = pd.DataFrame(summaries)
+    if not summary_frame.empty:
+        summary_frame["permutation_p_holm"] = _holm_adjusted_probabilities(
+            summary_frame["permutation_p"]
+        )
+        summary_frame["multiplicity_family"] = "three questionnaire schedules crossed with two latent channels"
+    return summary_frame, pd.DataFrame(coefs)
 
 
 def _write_fit_tables(
@@ -13909,7 +14033,8 @@ def _generalization_split_maps(sessions_full: pd.DataFrame) -> dict[str, dict[in
             if pd.notna(row["first_date"]) and row["first_date"] >= cutoff
         }
     )
-    # Courses crossing the cutoff satisfy neither rule and are excluded.
+    # Patients with records on both sides of the cutoff satisfy neither rule,
+    # so the temporal evaluation is independent in both patient and calendar time.
     return {"forward_2025": temporal_split}
 
 
@@ -14170,6 +14295,19 @@ def _empirical_input_contract_table() -> pd.DataFrame:
         ("ball_direct_compute_matched", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("ball_session_balanced", "causal", "questionnaire events from strictly earlier recorded sessions with total questionnaire weight balanced by session", "all structured features", "previous-session treatment", "raw elapsed days"),
     ]
+    tuning_scope = {
+        "ball": "candidates fitted in ten training clinics, selected in three model-selection clinics, then refitted in all thirteen development clinics",
+        "ball_direct_causal": "uses the BALL-selected persistence and questionnaire weight",
+        "ball_inherited_dynamics_only": "uses the BALL-selected persistence and questionnaire weight",
+        "ball_teacher_matching_only": "uses the BALL-selected persistence and questionnaire weight",
+        "ball_full_decomposition": "uses the BALL-selected persistence and questionnaire weight",
+        "ball_direct_compute_matched": "uses the BALL-selected persistence and questionnaire weight",
+        "ball_session_balanced": "uses the BALL-selected persistence and questionnaire weight",
+        "gp_causal_filter": "candidate kernels fitted in ten training clinics, selected in three model-selection clinics, then refitted in all thirteen development clinics",
+        "exponential_decay_gru": "architecture, smoothness weight, and optimization settings fixed before held-out evaluation",
+        "s0_direct_lgssm": "transition and regularization settings fixed before held-out evaluation",
+        "markov_direct_transition": "three availability strata and regularization settings fixed before held-out evaluation",
+    }
     return pd.DataFrame(
         [
             {
@@ -14179,6 +14317,7 @@ def _empirical_input_contract_table() -> pd.DataFrame:
                 "structured_information": structured,
                 "treatment_information": treatment,
                 "time_information": time_information,
+                "tuning_scope": tuning_scope.get(method, "no model hyperparameters selected"),
                 **shared,
             }
             for method, timing, anchors, structured, treatment, time_information in rows
@@ -15126,6 +15265,9 @@ def main() -> None:
                 instrument_eval["interval_upper_native_clipped"] = clipped_upper
                 instrument_eval["interval_width_native_raw"] = raw_upper - raw_lower
                 instrument_eval["interval_width_native_clipped"] = clipped_upper - clipped_lower
+                instrument_eval["interval_width_fraction_of_legal_range_raw"] = (
+                    (raw_upper - raw_lower) / legal_range
+                )
                 instrument_eval["interval_width_fraction_of_legal_range"] = (
                     (clipped_upper - clipped_lower) / legal_range
                 )
@@ -15161,6 +15303,9 @@ def main() -> None:
                     "mean_width_native_raw": float(instrument_eval["interval_width_native_raw"].mean()),
                     "mean_width_native_clipped": float(instrument_eval["interval_width_native_clipped"].mean()),
                     "median_width_native_clipped": float(instrument_eval["interval_width_native_clipped"].median()),
+                    "mean_width_fraction_of_legal_range_raw": float(
+                        instrument_eval["interval_width_fraction_of_legal_range_raw"].mean()
+                    ),
                     "mean_width_fraction_of_legal_range": float(
                         instrument_eval["interval_width_fraction_of_legal_range"].mean()
                     ),
@@ -15215,34 +15360,41 @@ def main() -> None:
                             "n": int(len(group)),
                             "n_patients": int(group["id"].nunique()),
                         })
-                for width_threshold in (0.10, 0.20, 0.30, 0.40, 0.50):
-                    request = (
-                        tst_eval["interval_width_fraction_of_legal_range"].to_numpy(dtype=float)
-                        > float(width_threshold)
-                    )
-                    accepted = ~request
-                    accepted_error = _development_scaled_squared_error(
-                        tst_eval.loc[accepted], "ball"
-                    )
-                    accepted_patient = accepted_error.groupby(
-                        tst_eval.loc[accepted, "id"]
-                    ).mean()
-                    uncertainty_workload_rows.append({
-                        "cadence": int(cad),
-                        "interval_width_fraction_threshold": float(width_threshold),
-                        "additional_measurement_fraction": float(np.mean(request)),
-                        "predictions_retained_fraction": float(np.mean(accepted)),
-                        "rmse_when_prediction_retained_development_sd_units": (
-                            float(np.sqrt(accepted_patient.mean())) if len(accepted_patient) else float("nan")
-                        ),
-                        "coverage_when_prediction_retained": (
-                            float(tst_eval.loc[accepted].groupby("id")["clipped_conformal_covered"].mean().mean())
-                            if accepted.any() else float("nan")
-                        ),
-                        "n_retained": int(accepted.sum()),
-                        "n_requested": int(request.sum()),
-                        "n_patients": int(tst_eval["id"].nunique()),
-                    })
+                width_definitions = {
+                    "raw": "interval_width_fraction_of_legal_range_raw",
+                    "support_clipped": "interval_width_fraction_of_legal_range",
+                }
+                for width_type, width_column in width_definitions.items():
+                    for width_threshold in (0.10, 0.20, 0.30, 0.40, 0.50):
+                        request = (
+                            tst_eval[width_column].to_numpy(dtype=float)
+                            > float(width_threshold)
+                        )
+                        accepted = ~request
+                        accepted_error = _development_scaled_squared_error(
+                            tst_eval.loc[accepted], "ball"
+                        )
+                        accepted_patient = accepted_error.groupby(
+                            tst_eval.loc[accepted, "id"]
+                        ).mean()
+                        uncertainty_workload_rows.append({
+                            "cadence": int(cad),
+                            "width_type": width_type,
+                            "primary_uncertainty_trigger": bool(width_type == "raw"),
+                            "interval_width_fraction_threshold": float(width_threshold),
+                            "additional_measurement_fraction": float(np.mean(request)),
+                            "predictions_retained_fraction": float(np.mean(accepted)),
+                            "rmse_when_prediction_retained_development_sd_units": (
+                                float(np.sqrt(accepted_patient.mean())) if len(accepted_patient) else float("nan")
+                            ),
+                            "coverage_when_prediction_retained": (
+                                float(tst_eval.loc[accepted].groupby("id")["clipped_conformal_covered"].mean().mean())
+                                if accepted.any() else float("nan")
+                            ),
+                            "n_retained": int(accepted.sum()),
+                            "n_requested": int(request.sum()),
+                            "n_patients": int(tst_eval["id"].nunique()),
+                        })
                 prediction_export = ev_all.copy()
                 interval_columns = [
                     column for column in tst_eval.columns

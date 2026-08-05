@@ -554,6 +554,15 @@ def validate_empirical(path: Path) -> dict:
     )
     require(set(transition["cadence"]) == {14, 21, 28} and len(transition) == 6, "Empirical RDoC transition summary is incomplete")
     require(
+        {"permutation_p", "permutation_p_holm"}.issubset(transition.columns)
+        and transition[["permutation_p", "permutation_p_holm"]].apply(
+            pd.to_numeric, errors="coerce"
+        ).notna().all().all()
+        and transition["permutation_p_holm"].between(0, 1).all()
+        and (transition["permutation_p_holm"] >= transition["permutation_p"]).all(),
+        "The six empirical RDoC joint tests lack valid Holm-adjusted permutation probabilities",
+    )
+    require(
         set(transition["patient_mean_mode"].astype(str)) == {"expanding_strictly_earlier"}
         and not transition["current_profile_in_reference_mean"].astype(bool).any(),
         "Primary RDoC analysis does not use the strictly earlier expanding patient mean",
@@ -595,7 +604,11 @@ def validate_empirical(path: Path) -> dict:
         set(uncertainty_workload["cadence"].astype(int)) == {14, 21, 28}
         and set(uncertainty_workload["interval_width_fraction_threshold"].astype(float))
         == {0.1, 0.2, 0.3, 0.4, 0.5}
-        and len(uncertainty_workload) == 15,
+        and set(uncertainty_workload["width_type"].astype(str)) == {"raw", "support_clipped"}
+        and len(uncertainty_workload) == 30
+        and uncertainty_workload.groupby(
+            ["cadence", "interval_width_fraction_threshold"], sort=False
+        )["width_type"].nunique().eq(2).all(),
         "Uncertainty-guided measurement analysis is incomplete",
     )
     require(
@@ -716,6 +729,9 @@ def validate_empirical(path: Path) -> dict:
     require(
         measurement_calibration.get("fit_scope")
         == "all genuine questionnaire events from the ten clinic-exclusive training clinics before artificial sparsification"
+        and measurement_calibration.get("exported_parameters")
+        == "instrument intercepts, loadings, and observation standard deviations only"
+        and "latent_process" not in measurement_calibration
         and set(measurement_calibration["development_data"]["normalized_score_mean_by_instrument"])
         == {"PHQ9", "BDI", "GAD7"},
         "Measurement calibration source or training means are incomplete",

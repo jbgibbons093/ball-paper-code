@@ -1441,7 +1441,20 @@ def run_ball_direct_causal_compute_matched(
         elapsed=elapsed,
         args=args,
     )
-    row["optimizer_update_budget"] = "teacher plus student epoch count"
+    patients_per_epoch = int(
+        np.ceil(
+            data.individuals.loc[data.individuals["split"].eq("train"), "id"].nunique()
+            / max(int(config.batch_size), 1)
+        )
+    )
+    row["optimizer_update_budget"] = (
+        "all questionnaire warm-up, teacher variational, and student-stage updates"
+    )
+    row["optimizer_updates_per_member"] = int(
+        patients_per_epoch
+        * (config.anchor_warmup_epochs + config.teacher_epochs)
+    )
+    row["compute_match_includes_teacher_questionnaire_warmup"] = True
     return row
 
 
@@ -1506,10 +1519,8 @@ def run_ball_transition_only(
     )
 
 
-def run_ball_transition_only_strict(
-    data, args, cell: str, seed: int, share: float
-) -> dict:
-    """Reserve RDoC information for the explicit transition coefficient only."""
+def strict_transition_only_data(data):
+    """Remove simulated RDoC proxy variables from every structured-data path."""
 
     strict_daily = data.daily.copy()
     proxy_columns = [f"X{index}" for index in range(8, 12)]
@@ -1520,7 +1531,7 @@ def run_ball_transition_only_strict(
             flag = f"{prefix}{column}"
             if flag in strict_daily:
                 strict_daily[flag] = False
-    strict_data = type(data)(
+    return type(data)(
         config=data.config,
         individuals=data.individuals.copy(),
         daily=strict_daily,
@@ -1533,8 +1544,21 @@ def run_ball_transition_only_strict(
             "encoder_observed_rdoc_profile": False,
             "encoder_rdoc_proxy_columns": [],
             "removed_proxy_columns": proxy_columns,
+            "structured_reconstruction_proxy_columns": [],
+            "strict_proxy_exclusion_scope": (
+                "teacher and student encoder inputs, unrestricted transition inputs, "
+                "structured-emission reconstruction targets, and any structured readout built from that tensor"
+            ),
         },
     )
+
+
+def run_ball_transition_only_strict(
+    data, args, cell: str, seed: int, share: float
+) -> dict:
+    """Reserve RDoC information for the explicit transition coefficient only."""
+
+    strict_data = strict_transition_only_data(data)
     start = perf_counter()
     config = dataclasses.replace(ball_config(args, seed), encoder_use_rdoc=False)
     student = fit_ball_ssm(

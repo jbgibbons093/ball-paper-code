@@ -1,0 +1,20 @@
+scenarios:
+  B:
+    description: Default identifiability-critical case.
+    anchor_quality: moderate
+    daily_signal: moderate
+    slow_proxy_signal: moderate
+    proxy_measurement_error: moderate
+    assignment: weakly_adaptive
+    missingness: mar
+    r_ts: 0.03
+  W1:
+    description: Adaptive-MNAR-misleading-proxy worst case.
+    anchor_quality: moderate
+    daily_signal: moderate
+    slow_proxy_signal: misleading
+    proxy_measurement_error: site_biased_note_density_endogenous
+    assignment: strongly_adaptive
+    missingness: mnar_block
+    r_ts: 0.03
+

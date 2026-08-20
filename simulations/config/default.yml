@@ -1,0 +1,66 @@
+seed: 1729
+
+data:
+  n: 1000
+  t: 84
+  q: 6
+  p_daily: 24
+  n_subtypes: 3
+  subtype_probs: [0.40, 0.35, 0.25]
+
+latent:
+  baseline_means: [0.5, 0.0, -0.5]
+  baseline_sd: 0.75
+  r_ts: 0.03
+  slow_fraction: 0.30
+  active_loading_prob: 0.30
+  loading_drift_sd: 0.02
+  c_process_sd: 0.05
+  # Primary scenario residual is a unit-coefficient random walk (matches the PDF
+  # dynamics and the model's phi=1 assumption). Subtype-AR < 1 is a
+  # misspecification-scenario knob, not the moderate default.
+  delta_ar: [1.0, 1.0, 1.0]
+  delta_innovation_sd: 0.35
+  shock_probability: 0.02
+  shock_sd: 1.0
+
+proxy:
+  measurement_error_sd: 0.25
+  site_bias_sd: 0.0
+  note_density_error_multiplier: 1.0
+  endogenous_observation: true
+
+treatment:
+  n_types: 12
+  min_count: 10
+  max_count: 15
+  assignment: weakly_adaptive
+
+anchors:
+  y1:
+    cadence: 7
+    recall_window: 14
+    loading: 1.0
+    error_sd: 0.95
+    missing_probability: 0.10
+  y2:
+    cadence: 7
+    recall_window: 7
+    loading: 0.75
+    error_sd: 0.85
+    missing_probability: 0.20
+  rho_cross: 0.30
+  rho_serial_y1: 0.20
+  rho_serial_y2: 0.20
+
+missingness:
+  mechanism: mar
+  daily_base_probability: 0.30
+  block_probability: 0.02
+  mnar_gamma_l: 0.0
+
+splits:
+  train: 0.60
+  validation: 0.10
+  conformal: 0.10
+  test: 0.20

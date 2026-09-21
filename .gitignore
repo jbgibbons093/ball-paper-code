@@ -5,7 +5,8 @@
 # output derived from them.
 
 # Data inputs and any derived artifacts
-empirical/
+empirical/*
+!empirical/*.py
 raw/
 data/
 derived/

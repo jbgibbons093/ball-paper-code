@@ -1,4 +1,12 @@
-'''Audit recovery of known transition coefficients by the classical models.'''
+"""Known-truth audit of LGSSM and Markov transition-coefficient recovery.
+
+The definitive benchmark estimates a shared six-variable transition coefficient
+after reconstructing two latent channels.  Convergence of the alternating fit
+does not establish that the coefficient sign and column order are correct.  This
+audit therefore supplies dense, nearly noiseless one-day anchors and activates
+one coefficient at a time.  It also diagnoses how observed RDoC measurement
+error and the dense-record readout affect recovery in the publication DGP.
+"""
 
 from __future__ import annotations
 
@@ -109,6 +117,7 @@ def _one_active_fixture(
             z_a[position] = 0.6 * z_a[position - 1] + drift + rng.normal(0.0, 0.02)
 
         components.loc[order, "a"] = -1
+        components.loc[order, "encoder_a"] = -1
         components.loc[order, "recent_treatment"] = 0.0
         components.loc[order, "treatment_burden"] = 0.0
         components.loc[order, "dt"] = 1.0
@@ -124,7 +133,9 @@ def _one_active_fixture(
             components.loc[order, f"C{dimension}"] = exposure[:, dimension]
             components.loc[order, f"B{dimension}"] = exposure[:, dimension]
 
-    # Dense EHR values are removed from this fixture so that the full estimator must.
+    # Dense EHR values are removed from this fixture so that the full estimator
+    # must recover the transition from the anchor-defined state and explicit
+    # coefficient path rather than from a competing proxy readout.
     for column in daily.columns:
         if column.startswith("X"):
             daily[column] = 0.0

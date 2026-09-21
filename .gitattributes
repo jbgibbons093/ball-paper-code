@@ -1,0 +1,5 @@
+* text=auto eol=lf
+# These frozen analysis inputs retain their original bytes for provenance checks.
+BALL.py -text
+validation/direct_rdoc_fair_comparator.py -text
+validation/irt_calibration.json -text

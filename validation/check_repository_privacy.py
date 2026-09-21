@@ -18,6 +18,7 @@ BLOCKED_SUFFIXES = {
 BLOCKED_SEGMENTS = {"empirical", "raw", "data", "derived", "derived_phi", "outputs", "runs"}
 BLOCKED_BASENAMES = {"rdoc_llm_scorer.csv", ".env", ".openai_key"}
 SECRET_PATTERNS = {
+    "local user path": re.compile(r"(?:[A-Za-z]:[\\/](?:Users|Documents and Settings)[\\/]|/(?:Users|home)/)", re.IGNORECASE),
     "private key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
     "OpenAI-style API key": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
@@ -42,7 +43,11 @@ def _blocked_path(rel: str) -> str | None:
         return "data or document file extension"
     if lower_name.endswith((".tar.gz", ".csv.gz")):
         return "compressed data or archive filename"
-    if parts.intersection(BLOCKED_SEGMENTS):
+    empirical_source = (
+        len(path.parts) == 2 and path.parts[0].lower() == "empirical"
+        and path.suffix.lower() == ".py"
+    )
+    if parts.intersection(BLOCKED_SEGMENTS) and not empirical_source:
         return "protected or generated data directory"
     if lower_name in BLOCKED_BASENAMES or lower_name.startswith("credentials"):
         return "known protected or credential filename"

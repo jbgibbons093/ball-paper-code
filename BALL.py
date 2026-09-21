@@ -1,5 +1,9 @@
 #!/usr/bin/env python
-'''Canonical one-file BALL codebase.'''
+"""Canonical one-file BALL codebase.
+
+All active simulation, empirical, table, and figure code lives in this file.
+Archived split files are loaded from the source blocks below as an in-memory package.
+"""
 
 from __future__ import annotations
 
@@ -11,34 +15,38 @@ import types
 
 REPO_ROOT = Path(__file__).resolve().parent
 
-# simulations
+# --- simulations (simulations/__init__.py) ---
 SRC_SIMULATIONS = r'''
 """BALL simulation package."""
 '''
 
-# simulations.src
+# --- simulations.src (simulations/src/__init__.py) ---
 SRC_SIMULATIONS_SRC = r'''
 """BALL simulation package."""
 '''
 
-# simulations.src.methods
+# --- simulations.src.methods (simulations/src/methods/__init__.py) ---
 SRC_SIMULATIONS_SRC_METHODS = r'''
 """Simulation method implementations."""
 '''
 
-# simulations.paper
+# --- simulations.paper (simulations/paper/__init__.py) ---
 SRC_SIMULATIONS_PAPER = r'''
 
 '''
 
-# empirical
+# --- empirical (empirical/__init__.py) ---
 SRC_EMPIRICAL = r'''
-
 '''
 
-# simulations.src.model_utils
+# --- simulations.src.model_utils (simulations/src/model_utils.py) ---
 SRC_SIMULATIONS_SRC_MODEL_UTILS = r'''
-"""Shared utilities and schemas for BALL simulations."""
+"""Shared utilities and schemas for BALL simulations.
+
+All simulation modules should depend on this file for common dataclasses,
+RNG handling, and dataframe schema helpers. This keeps the DGP, diagnostics,
+baselines, and S0 prototype connected to one implementation contract.
+"""
 
 from __future__ import annotations
 
@@ -91,19 +99,27 @@ class SimulationConfig:
     alpha_action_drift: float = 0.04
     support_switch_prob: float = 0.04
     c_process_sd: float = 0.05
-    c_reversion_rate: float = 0.03
-    c_treatment_drift: float = 0.02
+    c_reversion_rate: float = 0.03          # kappa_B: slow-process mean reversion per day
+    c_treatment_drift: float = 0.02         # H_B: treatment nudge on the slow process
+    # Optional direct RDoC drift term for parameter-recovery scenarios:
+    # z_{t+1} - z_t contains C_t beta in addition to nuisance dynamics.
+    # Default 0.0 preserves the original DGP.
     rdoc_drift_share: float = 0.0
     rdoc_drift_active_dims: int = 3
     rdoc_drift_beta_seed: int = 31011
     rdoc_drift_min_abs: float = 0.35
+    # Residual (fast) persistence per subtype. PDF dynamics are a unit-coefficient
+    # random walk (phi = 1); subtype-specific AR < 1 is available for scenarios
+    # that need stationary, subtype-heterogeneous residual autocorrelation.
     delta_ar: tuple[float, ...] = (1.0, 1.0, 1.0)
     delta_innovation_sd: float = 0.35
     shock_probability: float = 0.02
     shock_sd: float = 1.0
     proxy_measurement_error_sd: float = 0.25
-    site_bias_sd: float = 0.0
-    note_density_error_multiplier: float = 1.0
+    # Moderate/primary scenario is clean (no site bias); proxy-fragility scenarios
+    # set this > 0. The decomposition machinery is always active.
+    site_bias_sd: float = 0.0               # systematic per-site documentation bias
+    note_density_error_multiplier: float = 1.0   # extra proxy noise when records are sparse
     endogenous_proxy_observation: bool = True
     n_treatment_types: int = 12
     min_treatment_count: int = 10
@@ -115,6 +131,11 @@ class SimulationConfig:
     y2: AnchorSpec = field(
         default_factory=lambda: AnchorSpec("Y2", 7, 7, 0.75, 0.85, 0.20)
     )
+    # Optional event-level questionnaire measurement specification.  Empty
+    # tuples retain the two-instrument simulation defaults declared by y1/y2.
+    # Empirical fits populate three instruments (PHQ-9, BDI-II and GAD-7), so
+    # same-session questionnaires remain distinct observations even when two
+    # instruments measure the same latent channel.
     anchor_instrument_names: tuple[str, ...] = ()
     anchor_instrument_channels: tuple[int, ...] = ()
     anchor_instrument_intercepts: tuple[float, ...] = ()
@@ -123,14 +144,21 @@ class SimulationConfig:
     rho_cross: float = 0.30
     rho_serial_y1: float = 0.20
     rho_serial_y2: float = 0.20
+    # Anchor observation model (spec): "gaussian" on the total score (default) or
+    # "irt", a graded-response item response model generating item-level data.
     anchor_observation: str = "gaussian"
     irt_n_items: int = 9
     irt_n_categories: int = 4
     irt_discrimination: float = 1.5
+    # Frozen calibrated-instrument parameters (validation/irt_calibration.json), set by
+    # the benchmark loader for the IRT observation-model sensitivity. The model latent is
+    # expressed on the calibrated trait scale via trait = (windowed_latent - irt_loc) /
+    # irt_scale. The per-item ordered thresholds and discriminations are FIXED (not
+    # learned) and identical for BALL, S0, and Markov. Empty -> legacy unit calibration.
     irt_loc: float = 0.0
     irt_scale: float = 1.0
-    irt_item_thresholds: tuple = ()
-    irt_item_discriminations: tuple = ()
+    irt_item_thresholds: tuple = ()        # (n_items, n_categories-1), ordered per item, trait scale
+    irt_item_discriminations: tuple = ()   # (n_items,)
     missingness_mechanism: str = "mar"
     daily_base_missing_probability: float = 0.30
     block_probability: float = 0.02
@@ -169,7 +197,18 @@ def combine_raw_ensemble(
     member_sd_source: str = "raw_sd",
     metadata: Optional[Mapping[str, Any]] = None,
 ) -> MethodResult:
-    """Moment-match member predictions and raw Gaussian intervals."""
+    """Moment-match member predictions and raw Gaussian intervals.
+
+    This is the shared deep-ensemble scaffold used before Laplace or final
+    calibration. The interval variance follows the law of total variance:
+
+        mean_k(raw_sd_k^2 + mean_k^2) - mean_ensemble^2
+
+    When member_sd_source is "interval_width", the member standard deviation is
+    recovered from lower/upper bounds as half_width / interval_scale. This lets
+    existing oracle- or anchor-conformal member intervals flow through the same
+    ensemble moment-matching rule.
+    """
 
     members = list(member_results)
     if not members:
@@ -236,6 +275,9 @@ def combine_raw_ensemble(
             on=["member", "id", "t"],
             how="inner",
         )
+        # Vectorized Gaussian-mixture moment matching over members, per (id, t).
+        # total_var = E_members[sd^2 + mean^2] - E_members[mean]^2 (law of total
+        # variance); epistemic = between-member spread.
         mm = member_mean.copy()
         scale_col = (
             mm["interval_scale"].to_numpy(dtype=float)
@@ -348,7 +390,13 @@ def weighted_window_average(values: np.ndarray, start: int, end: int) -> float:
 
 
 def marginal_anchor_sd(spec: AnchorSpec, rho_serial: float) -> float:
-    """Stationary marginal SD of the AR(1) anchor error process."""
+    """Stationary marginal SD of the AR(1) anchor error process.
+
+    The anchor errors are generated as e_k = rho * e_{k-1} + N(0, error_sd^2),
+    so the marginal error SD is error_sd / sqrt(1 - rho^2). Methods that fix a
+    Gaussian anchor observation SD should use this rather than the raw
+    innovation SD to avoid an overconfident anchor likelihood.
+    """
 
     rho = float(rho_serial)
     return float(spec.error_sd) / math.sqrt(max(1.0 - rho**2, 1e-8))
@@ -363,6 +411,10 @@ def conformal_quantile(scores: np.ndarray, alpha: float, default: float) -> floa
     if n == 0:
         return float(default)
     rank = int(math.ceil((n + 1) * (1.0 - alpha)))
+    # Finite-sample split conformal: when the required rank exceeds the number of
+    # calibration scores, the (1-alpha) quantile is +inf (interval (-inf, +inf)).
+    # Clipping to max(scores) would silently break the >= 1-alpha guarantee on
+    # small calibration folds.
     if rank > n:
         return float("inf")
     return float(np.sort(clean)[max(rank, 1) - 1])
@@ -474,7 +526,7 @@ def load_config(path: str | Path) -> SimulationConfig:
 
 
 def _is_file_lock_error(exc: OSError) -> bool:
-    """Return True for common transient file-lock failures."""
+    """Return True for common Windows/Dropbox transient file-lock failures."""
 
     return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in {32, 33}
 
@@ -485,7 +537,12 @@ def publish_latest_artifact(
     retries: int = 5,
     delay_seconds: float = 0.25,
 ) -> bool:
-    """Copy a completed artifact to its latest-result path."""
+    """Copy a run artifact to a latest path without making file locks fatal.
+
+    Timestamped run artifacts are the durable record. The latest paths are
+    convenience pointers for agents/reviewers and can be temporarily locked by
+    Dropbox, Excel, or another process on Windows.
+    """
 
     source_path = Path(source)
     target_path = Path(target)
@@ -527,7 +584,7 @@ def publish_latest_text(
     return False
 '''
 
-# simulations.src.missingness
+# --- simulations.src.missingness (simulations/src/missingness.py) ---
 SRC_SIMULATIONS_SRC_MISSINGNESS = r'''
 """Missingness mechanisms for daily observed variables and proxy timing."""
 
@@ -545,11 +602,24 @@ def daily_observation_mask(
     person_id: int,
     x: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Return observed-mask matrix with shape (T, p_daily)."""
+    """Return observed-mask matrix with shape (T, p_daily).
+
+    Under "mar", observation propensity at day t depends on the previous day's
+    OBSERVED strong-contemporaneous features (X0-X3), so the conditioning set is
+    exactly the analyst-visible record: missing at random by construction. The
+    MCAR block process is drawn first and folded into each day's realized mask
+    before that mask drives the next day, so the dependence never conditions on
+    values the analyst cannot see. Under "mnar", propensity depends directly on
+    the true latent.
+    """
 
     rng = make_rng(config.seed, "missingness", person_id)
     base_obs = 1.0 - config.daily_base_missing_probability
     base_logit = np.log(base_obs / (1.0 - base_obs))
+    # Per-group observation propensities (6 groups of 4 columns): strong
+    # contemporaneous features are documented more often than slow proxies,
+    # treatment/burden, or pure-noise channels, so the 24 variables do not all
+    # share a single missingness rate.
     group_offsets = np.array([0.6, 0.6, 0.3, 0.0, 0.2, -0.4])
     col_offset = np.repeat(group_offsets, 4)[: config.p_daily]
     mech = config.missingness_mechanism.lower()
@@ -559,6 +629,8 @@ def daily_observation_mask(
             "daily_observation_mask."
         )
 
+    # MCAR block dropout, independent of everything else; drawn up-front so the
+    # MAR dependence below conditions on the post-block (analyst-visible) mask.
     blocked = np.zeros((config.t, config.p_daily), dtype=bool)
     if config.block_probability > 0:
         for j in range(config.p_daily):
@@ -613,7 +685,7 @@ def apply_daily_missingness(
     return out
 '''
 
-# simulations.src.anchors
+# --- simulations.src.anchors (simulations/src/anchors.py) ---
 SRC_SIMULATIONS_SRC_ANCHORS = r'''
 """Sparse recall-window anchor generation."""
 
@@ -630,7 +702,11 @@ def scheduled_anchor_days(config: SimulationConfig, spec: AnchorSpec) -> list[in
 
 
 def _grm_item_thresholds(config: SimulationConfig) -> np.ndarray:
-    """Item thresholds b_{j,k} for the graded-response model, on the latent scale."""
+    """Item thresholds b_{j,k} for the graded-response model, on the latent scale.
+
+    Each item has n_categories-1 increasing thresholds spread across the
+    standardized latent range, with mild per-item jitter so items differ.
+    """
 
     rng = make_rng(config.seed, "irt_items")
     n_cat = max(int(config.irt_n_categories), 2)
@@ -640,14 +716,18 @@ def _grm_item_thresholds(config: SimulationConfig) -> np.ndarray:
 
 
 def _grm_total_score(window_mean: float, thresholds: np.ndarray, discrimination: float, rng) -> float:
-    """Sample a graded-response total score for a recall-windowed latent value."""
+    """Sample a graded-response total score for a recall-windowed latent value.
+
+    For item j and category cut k, P(response_j >= k) = logit^{-1}(a (z - b_{j,k})).
+    Category probabilities are successive differences; responses are summed.
+    """
 
     if not np.isfinite(window_mean):
         return float("nan")
-    p_ge = 1.0 / (1.0 + np.exp(-discrimination * (float(window_mean) - thresholds)))
+    p_ge = 1.0 / (1.0 + np.exp(-discrimination * (float(window_mean) - thresholds)))  # (J, K-1)
     total = 0
     for j in range(thresholds.shape[0]):
-        pg = np.concatenate(([1.0], p_ge[j], [0.0]))
+        pg = np.concatenate(([1.0], p_ge[j], [0.0]))  # P(>=0)=1 ... P(>=K)=0
         probs = pg[:-1] - pg[1:]
         probs = np.clip(probs, 1e-9, None)
         probs = probs / probs.sum()
@@ -656,13 +736,20 @@ def _grm_total_score(window_mean: float, thresholds: np.ndarray, discrimination:
 
 
 def _calibrated_irt_params(config: SimulationConfig):
-    """Frozen calibrated-instrument parameters for the IRT observation model."""
+    """Frozen calibrated-instrument parameters for the IRT observation model.
+
+    Returns the affine trait map (loc, scale) and the FIXED per-item discriminations
+    and ordered thresholds on the trait scale. When the config carries a calibration
+    (set from validation/irt_calibration.json), those exact constants are used for
+    every seed, share, method, and control. Without a calibration the function falls
+    back to a deterministic legacy instrument, used only by the structural gate test.
+    """
 
     thr = config.irt_item_thresholds
     disc = config.irt_item_discriminations
     if thr and disc:
-        thresholds = np.asarray(thr, dtype=float)
-        discriminations = np.asarray(disc, dtype=float)
+        thresholds = np.asarray(thr, dtype=float)                       # (J, K-1)
+        discriminations = np.asarray(disc, dtype=float)                 # (J,)
         scale = float(config.irt_scale) or 1.0
         return float(config.irt_loc), scale, discriminations, thresholds
     thresholds = _grm_item_thresholds(config)
@@ -672,9 +759,13 @@ def _calibrated_irt_params(config: SimulationConfig):
 
 def _grm_item_responses(trait_value: float, discriminations: np.ndarray,
                         thresholds: np.ndarray, rng) -> np.ndarray:
-    """Sample per-item graded responses for a windowed trait value (one anchor)."""
+    """Sample per-item graded responses for a windowed trait value (one anchor).
 
-    p_ge = 1.0 / (1.0 + np.exp(-discriminations[:, None] * (float(trait_value) - thresholds)))
+    For item j and cut k, P(response_j >= k) = logit^{-1}(a_j (trait - b_{j,k})).
+    Returns an integer array (J,) of category responses.
+    """
+
+    p_ge = 1.0 / (1.0 + np.exp(-discriminations[:, None] * (float(trait_value) - thresholds)))  # (J, K-1)
     responses = np.empty(thresholds.shape[0], dtype=int)
     for j in range(thresholds.shape[0]):
         pg = np.concatenate(([1.0], p_ge[j], [0.0]))
@@ -688,7 +779,23 @@ def generate_anchors(
     config: SimulationConfig,
     train_ids: set[int] | None = None,
 ) -> pd.DataFrame:
-    """Generate two sparse recall-windowed anchors."""
+    """Generate two sparse recall-windowed anchors.
+
+    In the PDF-faithful default, Y1 is a PHQ-style anchor on z_d and Y2 is a
+    PCL-style anchor on z_p. The legacy scalar columns are retained by storing
+    the channel-specific recall target in window_mean_L.
+
+    Note on the error process: anchor errors are AR(1) with coefficient
+    rho_serial, so the stationary marginal error SD is
+    error_sd / sqrt(1 - rho^2), slightly larger than error_sd. Methods that fix
+    the anchor observation SD should use model_utils.marginal_anchor_sd rather
+    than the raw error_sd to avoid overconfident anchor likelihoods.
+
+    Under the IRT observation model the linear/Gaussian methods remain
+    deliberately misspecified (they keep the loading * window-mean Gaussian
+    working model); only the SSM has an IRT-aware likelihood. That is a
+    misspecification-robustness scenario, not an oversight.
+    """
 
     use_irt = str(config.anchor_observation).lower() == "irt"
     if use_irt:
@@ -748,6 +855,9 @@ def generate_anchors(
                 prior_errors[spec.name] = error
                 observed = rng.random() >= spec.missing_probability
                 if use_irt:
+                    # Express the windowed latent on the calibrated trait scale, then
+                    # sample per-item graded responses from the FROZEN instrument.
+                    # Unobserved anchors yield missing items and total (no leakage).
                     trait = (window_mean - irt_loc) / irt_scale if np.isfinite(window_mean) else np.nan
                     if observed and np.isfinite(trait):
                         items = _grm_item_responses(trait, irt_disc, irt_thresholds, rng)
@@ -757,7 +867,7 @@ def generate_anchors(
                         irt_items = [float("nan")] * int(config.irt_n_items)
                         irt_total = float("nan")
                     irt_trait_truth = float(trait) if np.isfinite(trait) else float("nan")
-                    value = float("nan")
+                    value = float("nan")   # IRT uses item responses, not a scalar readout
                 else:
                     irt_total = float("nan")
                     irt_items = None
@@ -787,7 +897,7 @@ def generate_anchors(
     return pd.DataFrame(rows)
 '''
 
-# simulations.src.dgp
+# --- simulations.src.dgp (simulations/src/dgp.py) ---
 SRC_SIMULATIONS_SRC_DGP = r'''
 """Data-generating process for the BALL sparse-anchor simulation."""
 
@@ -803,6 +913,10 @@ from .model_utils import SimulationConfig, SimulationData, make_rng, split_indiv
 
 REFERENCE_R_TS = 0.03
 
+# Strength of the severity dependence in treatment assignment (the
+# confounding-by-indication knob). "random" assigns days and protocol types
+# uniformly; the adaptive modes up-weight treatment days and aggressive
+# protocols when current severity is high.
 ASSIGNMENT_GAMMA = {
     "random": 0.0,
     "weakly_adaptive": 0.4,
@@ -811,25 +925,39 @@ ASSIGNMENT_GAMMA = {
 
 
 def _alpha_innovation_sd(config: SimulationConfig) -> float:
-    """Loading-drift innovation scale for the slow-process time-scale knob."""
+    """Loading-drift innovation scale for the slow-process time-scale knob.
+
+    `r_ts` controls relative loading innovation variance around the default
+    reference value. `loading_drift_sd` is the absolute loading random-walk SD at
+    the reference `r_ts`. The later slow/fast marginal rescaling is controlled
+    separately by `slow_fraction`.
+    """
 
     r_ts_scale = np.sqrt(max(float(config.r_ts), 1e-8) / REFERENCE_R_TS)
     return max(1e-4, float(config.loading_drift_sd) * r_ts_scale)
 
 
 def _build_treatment_kernels(n_types: int, d_max: int = 20) -> tuple[np.ndarray, int]:
-    """Fixed per-type response kernels K_a(d) over days-since-treatment."""
+    """Fixed per-type response kernels K_a(d) over days-since-treatment.
+
+    The 12 default types span five response shapes the model must learn:
+    immediate-transient (3), delayed-transient (3), sustained (3), null/weak (2),
+    and one harmful-for-subtype type. Negative amplitudes improve severity;
+    the harmful type carries a positive amplitude applied only to its vulnerable
+    subtype (handled at the call site). Returns the kernel matrix and the index
+    of the harmful type (-1 if there are too few types to include one).
+    """
 
     d = np.arange(d_max + 1, dtype=float)
     immediate = lambda amp, tau=2.0: amp * np.exp(-d / tau)
-    delayed = lambda amp, tau=5.0: amp * (d / tau) * np.exp(1.0 - d / tau)
+    delayed = lambda amp, tau=5.0: amp * (d / tau) * np.exp(1.0 - d / tau)   # peak ~tau
     sustained = lambda amp, tau=3.0: amp * (1.0 - np.exp(-d / tau))
     specs = [
         immediate(-0.30), immediate(-0.22), immediate(-0.38),
         delayed(-0.28), delayed(-0.20), delayed(-0.34),
         sustained(-0.18), sustained(-0.12), sustained(-0.24),
-        np.zeros_like(d), np.zeros_like(d),
-        sustained(0.30, tau=4.0),
+        np.zeros_like(d), np.zeros_like(d),                 # null / weak
+        sustained(0.30, tau=4.0),                           # harmful (sign applied per subtype)
     ]
     kernels = np.zeros((n_types, d_max + 1), dtype=float)
     harmful_idx = 11 if n_types >= 12 else -1
@@ -888,14 +1016,24 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         )
     assignment_gamma = ASSIGNMENT_GAMMA[config.assignment]
 
+    # Action-conditional drift directions for the loading dynamics (spec
+    # f_theta(alpha, a)). Each rTMS protocol nudges the recovery recipe along a
+    # fixed unit direction; the magnitude is config.alpha_action_drift. This is
+    # what the model's neural drift has to learn.
     action_drift_dirs = rng.normal(0.0, 1.0, size=(config.n_treatment_types, config.q))
     action_drift_dirs /= np.maximum(np.linalg.norm(action_drift_dirs, axis=1, keepdims=True), 1e-8)
 
+    # Fixed treatment response kernels (shared across patients; the model learns
+    # them) and the harmful-for-subtype type.
     treatment_kernels, harmful_type = _build_treatment_kernels(config.n_treatment_types)
     kernel_dmax = treatment_kernels.shape[1] - 1
     vulnerable_subtype = config.n_subtypes - 1
+    # Per-type aggressiveness (peak severity improvement) used by the adaptive
+    # assignment modes: sicker patients are steered toward aggressive protocols.
     improvement = np.maximum(0.0, -treatment_kernels.min(axis=1))
     type_aggressiveness = (improvement - improvement.mean()) / (improvement.std() + 1e-8)
+    # Subtype-specific slow-process long-run profiles mu_B,u and per-site
+    # documentation-bias profiles, fixed across patients.
     c_subtype_profiles = rng.normal(0.0, 1.0, size=(config.n_subtypes, config.q))
     site_profiles = rng.normal(0.0, 1.0, size=(5, config.q))
     rdoc_drift_beta_unit = _make_rdoc_drift_beta(config)
@@ -912,12 +1050,23 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         site = int(rng_i.integers(0, 5))
         baseline = rng_i.normal(config.baseline_means[subtype], config.baseline_sd)
 
+        # Per-patient, time-varying sparse support for the recovery recipe (spec
+        # adaptive Lasso): most RDoC dimensions are silent at any session, a few
+        # are active, the support is drawn per patient, and it can shift over the
+        # course of treatment as dimensions toggle on and off.
         active_td = np.zeros((config.t, config.q), dtype=bool)
         init_active = rng_i.random(config.q) < config.active_loading_prob
         if not init_active.any():
             init_active[rng_i.integers(0, config.q)] = True
         active_td[0] = init_active
 
+        # Treatment assignment is sequential: at each candidate day the treatment
+        # hazard (and, in adaptive modes, the protocol choice) depends on the
+        # patient's current severity state, so config.assignment controls
+        # confounding by indication. The total count is forced into
+        # [min_treatment_count, max_treatment_count] by the remaining/days-left
+        # base hazard, which reduces to uniform random assignment when the
+        # severity tilt gamma is zero.
         n_candidates = max(config.t - 2, 0)
         min_count = min(config.min_treatment_count, n_candidates)
         max_count = min(config.max_treatment_count, n_candidates)
@@ -935,11 +1084,15 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         residual = np.zeros((config.t, 2))
         c[0] = rng_i.normal(0.0, 1.0, size=config.q)
         alpha[0] = init_active * rng_i.normal(0.6, 0.25, size=config.q)
+        # Residual is zero-mean here; the per-patient level (baseline) and the
+        # treatment response are added after the variance rescaling so neither is
+        # washed out by standardization.
         residual[0, 0] = rng_i.normal(0.0, 0.25)
         residual[0, 1] = rng_i.normal(0.0, 0.25)
 
         delta_sd = config.delta_innovation_sd
         alpha_sd = _alpha_innovation_sd(config)
+        # Subtype residual persistence (phi = 1 => PDF random walk).
         phi_delta_u = float(config.delta_ar[subtype]) if subtype < len(config.delta_ar) else 1.0
         innovation_cov = np.array(
             [
@@ -948,8 +1101,18 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
             ]
         )
         for t in range(1, config.t):
+            # Treatment decision for day t (candidate days 1..T-2), made from the
+            # day t-1 state BEFORE the day-t dynamics so the assignment is
+            # adapted but never anticipatory. The severity proxy uses the
+            # pre-rescaling components plus the running treatment response, so
+            # adaptive assignment reacts to shocks, drift, and prior response.
             if remaining > 0 and t <= config.t - 2:
                 days_left = (config.t - 2) - t + 1
+                # Dynamic (within-person) state drives treatment TIMING; the full
+                # severity including the stable baseline drives the PROTOCOL
+                # choice below. Folding the baseline into the timing tilt would
+                # saturate tanh for severe patients and erase the within-person
+                # dependence the adaptive scenarios are meant to create.
                 s_dyn = (
                     float(np.dot(alpha[t - 1], c[t - 1]))
                     + 0.5 * (residual[t - 1, 0] + residual[t - 1, 1])
@@ -987,6 +1150,10 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
                             "treatment_burden": float(treatment_burden),
                         }
                     )
+                    # Treatment response as a per-type kernel contribution (spec
+                    # Stage-3 structure), accumulated as the trajectory unfolds.
+                    # The harmful type only worsens its vulnerable subtype; for
+                    # other subtypes it is effectively null.
                     end = min(config.t, t + kernel_dmax + 1)
                     seg = treatment_kernels[treatment_type][: end - t]
                     if treatment_type == harmful_type and subtype != vulnerable_subtype:
@@ -995,6 +1162,8 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
                     trt_level_p[t:end] += 0.8 * seg
                     remaining -= 1
 
+            # Slow process: subtype-specific mean reversion toward mu_B,u plus a
+            # slow treatment effect H_B along the delivered protocol's direction.
             prev_a = treatment_type_by_day[t - 1]
             h_b = config.c_treatment_drift * action_drift_dirs[prev_a] if prev_a >= 0 else 0.0
             c[t] = (
@@ -1003,6 +1172,9 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
                 + h_b
                 + rng_i.normal(0.0, config.c_process_sd, size=config.q)
             )
+            # Evolve the sparse support with an asymmetric on/off toggle whose
+            # stationary active fraction equals active_loading_prob, so the recipe
+            # shifts over time but stays sparse (most dimensions silent).
             prev_active = active_td[t - 1]
             p_active = max(min(config.active_loading_prob, 0.999), 1e-3)
             rate_on = config.support_switch_prob
@@ -1013,10 +1185,13 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
             if not cur_active.any():
                 cur_active[rng_i.integers(0, config.q)] = True
             active_td[t] = cur_active
+            # Action-conditional drift on the loading (spec f_theta(alpha, a)):
+            # the delivered protocol nudges the recipe along its drift direction.
             a_t = treatment_type_by_day[t]
             drift = config.alpha_action_drift * action_drift_dirs[a_t] if a_t >= 0 else 0.0
             random_walk = alpha[t - 1] + drift + rng_i.normal(0.0, alpha_sd, size=config.q)
             fresh = rng_i.normal(0.6, 0.25, size=config.q)
+            # continuing-active: random walk; newly-active: fresh loading; inactive: exactly zero.
             alpha[t] = np.where(
                 cur_active & prev_active,
                 random_walk,
@@ -1025,6 +1200,10 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
             shock = np.zeros(2)
             if rng_i.random() < config.shock_probability:
                 shock = rng_i.normal(0.0, config.shock_sd, size=2)
+            # Residual dynamics: delta_{n+1} = phi * delta_n + shock + noise. The
+            # treatment response is NOT in the increment (it is added as a level
+            # after rescaling, via the per-type kernel contribution), so treatment
+            # heterogeneity survives the variance normalization.
             residual[t] = (
                 phi_delta_u * residual[t - 1]
                 + shock
@@ -1035,6 +1214,14 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         for day in treatment_days:
             recent_treatment[day : min(config.t, day + 7)] = 1.0
 
+        # Center each proxy dimension per person over time so that the
+        # RDoC-explained component carries no per-person level (the level lives
+        # in `baseline`/delta, matching how the structural and neural fits
+        # estimate an intercept). The loadings `alpha`, not the product, are
+        # then rescaled to the target variance, so the appendix identity
+        # slow = alpha' RDoC holds exactly for the stored alpha. Without this,
+        # rescaling the product decoupled the stored alpha from slow and made
+        # rho_RDoC, alpha-recovery, and active-set metrics ill-defined.
         c = c - c.mean(axis=0, keepdims=True)
         target_slow_sd = np.sqrt(max(config.slow_fraction, 1e-6))
         target_fast_sd = np.sqrt(max(1.0 - config.slow_fraction, 1e-6))
@@ -1042,6 +1229,19 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         slow_scale = target_slow_sd / (raw_slow.std() + 1e-8)
         alpha = alpha * slow_scale
         slow = np.sum(alpha * c, axis=1)
+        # Standardize the zero-mean residual walk to the target fast SD, then add
+        # the deterministic treatment response as a LEVEL (so it survives the
+        # rescaling) and the per-patient baseline. The dynamic fast residual
+        # (walk + treatment, zero per-patient level) is what the fast-residual
+        # proxies X12-15 measure; the spec delta that carries the per-patient
+        # level is baseline + dynamic residual.
+        # Combine the zero-mean residual walk with the (zero-mean) treatment
+        # response, then scale the joint dynamic fast component to the fast
+        # variance budget. Treatment-type shape is preserved within the fast
+        # signal while the WITHIN-PERSON slow/fast variance split stays at
+        # slow_fraction (the rho_RDoC metric is within-person). Note the
+        # per-patient baseline added below inflates the *population* fast
+        # variance, so pooled slow share is lower than slow_fraction.
         resid_d = residual[:, 0] - residual[:, 0].mean()
         resid_p = residual[:, 1] - residual[:, 1].mean()
         fast_dyn_d = resid_d + (trt_level_d - trt_level_d.mean())
@@ -1050,6 +1250,8 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         joint_scale = target_fast_sd / (joint_fast.std() + 1e-8)
         fast_dyn_d = fast_dyn_d * joint_scale
         fast_dyn_p = fast_dyn_p * joint_scale
+        # Spec decomposition z = alpha'RDoC + delta with no separate intercept:
+        # the per-patient level lives inside delta.
         fast_d = baseline + fast_dyn_d
         fast_p = baseline + fast_dyn_p
         z_d = slow + fast_d
@@ -1063,6 +1265,9 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         )
         rdoc_drift_scales.append(float(rdoc_direct_scale))
         if float(config.rdoc_drift_share) > 0.0:
+            # Direct RDoC parameter-recovery scenario: the same C_t beta drift
+            # shifts both anchor channels, while the legacy decomposition columns
+            # remain algebraically consistent by carrying the level in delta.
             fast_d = fast_d + rdoc_direct_level
             fast_p = fast_p + rdoc_direct_level
             z_d = z_d + rdoc_direct_level
@@ -1072,6 +1277,11 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         fast_dyn = 0.5 * (fast_dyn_d + fast_dyn_p)
 
         proxy_obs = proxy_observation_mask(latent, recent_treatment, site, config, person_id)
+        # Proxy error decomposition m(t) = m_site + m_density(t) + m_random(t):
+        #  - m_site: systematic per-site documentation bias (a fixed direction),
+        #  - m_density(t): noise that grows when records are sparse (low recent
+        #    proxy-observation density),
+        #  - m_random(t): baseline measurement noise.
         m_site = config.site_bias_sd * site_profiles[site]
         density = pd.Series(proxy_obs.astype(float)).rolling(7, min_periods=1).mean().to_numpy()
         density_factor = 1.0 + config.note_density_error_multiplier * (1.0 - density)
@@ -1091,23 +1301,35 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
         )
 
         x = np.zeros((config.t, config.p_daily))
+        # Six groups of four variables.
         for j in range(4):
             if config.double_anchor_latents:
                 severity_stream = z_d if j < 2 else z_p
+                # Fast-residual proxies track the zero-baseline dynamic residual
+                # (recent shocks + treatment response), not the static per-patient
+                # level, which would otherwise contaminate the fast channel.
                 fast_stream = fast_dyn_d if j < 2 else fast_dyn_p
             else:
                 severity_stream = latent
                 fast_stream = fast_dyn
             x[:, j] = severity_stream + rng_i.normal(0.0, 0.5, size=config.t)
             x[:, 4 + j] = pd.Series(severity_stream).rolling(7, min_periods=1).mean().to_numpy() + rng_i.normal(0.0, 0.7, size=config.t)
+            # Noise recalibrated (0.6 -> 0.45) for the per-person-centered proxy
+            # c: centering removes the slowly-decaying initial level, so the
+            # slow-proxy streams need a lower noise floor to remain informative
+            # about C(t)'s within-person variation.
             x[:, 8 + j] = c[:, j % config.q] + rng_i.normal(0.0, 0.45, size=config.t)
             x[:, 12 + j] = fast_stream + rng_i.normal(0.0, 0.6, size=config.t)
+            # Treatment/burden group: recent-treatment indicator and side-effect
+            # burden (a documented treatment-burden signal), both noisy.
             if j < 2:
                 x[:, 16 + j] = recent_treatment + rng_i.normal(0.0, 0.4, size=config.t)
             else:
                 x[:, 16 + j] = side_effect_burden_by_day + rng_i.normal(0.0, 0.4, size=config.t)
             x[:, 20 + j] = rng_i.normal(0.0, 1.0, size=config.t)
 
+        # The observation mask is drawn AFTER the daily values exist so the MAR
+        # mechanism can condition on the previous day's observed features.
         obs_mask = daily_observation_mask(latent, config, person_id, x=x)
 
         individuals.append(
@@ -1138,6 +1360,7 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
                 "proxy_observed": bool(proxy_obs[t]),
                 "recent_treatment": recent_treatment[t],
                 "a": int(treatment_type_by_day[t]),
+                "encoder_a": int(treatment_type_by_day[t - 1]) if t > 0 else -1,
                 "treatment_burden": float(treatment_burden_by_day[t]),
                 "side_effect_burden": float(side_effect_burden_by_day[t]),
             }
@@ -1200,7 +1423,7 @@ def generate_dataset(config: SimulationConfig) -> SimulationData:
     )
 '''
 
-# simulations.src.diagnostics
+# --- simulations.src.diagnostics (simulations/src/diagnostics.py) ---
 SRC_SIMULATIONS_SRC_DIAGNOSTICS = r'''
 """Programmatic DGP diagnostics and sanity checks."""
 
@@ -1308,8 +1531,14 @@ def run_diagnostics(data: SimulationData) -> list[DiagnosticResult]:
     for anchor in ["Y1", "Y2"]:
         sub = anchor_obs[anchor_obs["anchor"] == anchor]
         all_sub = data.anchors[data.anchors["anchor"] == anchor]
+        # Under IRT the scalar value is missing by design; the integer total is the
+        # observed readout that should track the recall window.
         anchor_signal = sub["value"] if str(config.anchor_observation).lower() == "gaussian" else sub["irt_total"]
         corr = _corr(anchor_signal, sub["window_mean_L"])
+        # Bands reflect the spec anchor observation (unit loading). The upper bound
+        # accommodates both the Gaussian total-score form and the slightly tighter
+        # graded-response IRT form. Y2 has the shorter recall window and smaller
+        # error_sd, so it tracks its window mean more tightly than Y1.
         lo, hi = (0.30, 0.96) if anchor == "Y1" else (0.30, 0.97)
         _add(
             results,
@@ -1331,6 +1560,9 @@ def run_diagnostics(data: SimulationData) -> list[DiagnosticResult]:
     both_anchor = anchor_obs.pivot_table(
         index=["id", "t"], columns="anchor", values=["value", "window_mean_L", "loading"]
     )
+    # The cross-anchor residual correlation only has the configured Gaussian
+    # structure under the Gaussian observation model; under graded-response IRT the
+    # "residual" is item-sampling discretization with no rho_cross structure.
     if (
         str(config.anchor_observation).lower() == "gaussian"
         and ("value", "Y1") in both_anchor.columns
@@ -1365,6 +1597,9 @@ def run_diagnostics(data: SimulationData) -> list[DiagnosticResult]:
     daily_truth = data.daily.merge(data.components[["id", "t", "L", "delta", "C0"]], on=["id", "t"])
     strong_proxy_corr = _corr(daily_truth["X0"], daily_truth["L"])
     slow_proxy_corr = _corr(daily_truth["X8"], daily_truth["C0"])
+    # Fast-residual proxies track the zero-baseline dynamic residual (recent
+    # shocks + treatment response), not the per-person level, so compare against
+    # the within-person-centered delta rather than the level-laden delta.
     daily_truth["delta_within"] = daily_truth.groupby("id")["delta"].transform(lambda s: s - s.mean())
     fast_proxy_corr = _corr(daily_truth["X12"], daily_truth["delta_within"])
     noise_corr = abs(_corr(daily_truth["X20"], daily_truth["L"]))
@@ -1419,6 +1654,10 @@ def run_diagnostics(data: SimulationData) -> list[DiagnosticResult]:
         "Observed B(t) should be a noisy but useful proxy for C(t).",
     )
 
+    # slow_fraction controls the within-person dynamic decomposition. Because the
+    # residual delta now carries the per-person level (spec: z = alpha'RDoC +
+    # delta, no separate intercept), the ratio is computed on within-person
+    # (mean-removed) variances so the between-person level does not inflate delta.
     slow_within = data.components.groupby("id")["slow"].transform(lambda s: s - s.mean())
     delta_within = data.components.groupby("id")["delta"].transform(lambda s: s - s.mean())
     slow_var = float(slow_within.var())
@@ -1477,7 +1716,7 @@ def assert_diagnostics_pass(results: list[DiagnosticResult]) -> None:
         raise AssertionError(f"DGP diagnostics failed: {messages}")
 '''
 
-# simulations.src.metrics
+# --- simulations.src.metrics (simulations/src/metrics.py) ---
 SRC_SIMULATIONS_SRC_METRICS = r'''
 """Recovery, coverage, and interval metrics."""
 
@@ -1552,7 +1791,7 @@ def double_anchor_latent_metrics(
     individuals: pd.DataFrame | None = None,
     split: str | None = None,
 ) -> dict[str, object]:
-    """Compute metrics for the two latent channels."""
+    """Metrics for PDF-style PHQ/PCL latent channels when available."""
 
     required = {"z_d_hat", "z_p_hat"}
     truth_required = {"z_d", "z_p"}
@@ -1605,6 +1844,10 @@ def leakage_corr(
     merged = _filter_split(merged, split).dropna(subset=[estimate_col, truth_col])
     if len(merged) < 3:
         return float("nan")
+    # Center within person before correlating: a pooled correlation conflates
+    # between-person level differences with within-person day-to-day leakage, so
+    # a method that nails person means but mislocates daily variation would
+    # spuriously pass. Leakage is a within-person dynamic property.
     est = merged[estimate_col].to_numpy(dtype=float) - merged.groupby("id")[estimate_col].transform("mean").to_numpy(dtype=float)
     tru = merged[truth_col].to_numpy(dtype=float) - merged.groupby("id")[truth_col].transform("mean").to_numpy(dtype=float)
     if np.std(est) < 1e-12 or np.std(tru) < 1e-12:
@@ -1625,6 +1868,10 @@ def coverage(
     if merged.empty:
         return float("nan")
     covered = (merged["lower"] <= merged["L"]) & (merged["L"] <= merged["upper"])
+    # Replicate-level coverage: aggregate per person first (equal weight per
+    # patient), then average across patients. Person-day pooling is prohibited
+    # in primary tables because patients with more observed sessions would
+    # otherwise dominate the statistic.
     per_person = covered.groupby(merged["id"]).mean()
     return float(per_person.mean())
 
@@ -1642,6 +1889,9 @@ def mean_width(
         data = _filter_split(data, split)
     if data.empty:
         return float("nan")
+    # Replicate-level width: per-person mean first, then average across patients,
+    # consistent with coverage() and interval_score() so the three columns
+    # aggregate over the same units.
     widths = (data["upper"] - data["lower"]).to_numpy(dtype=float)
     per_person = pd.Series(widths, index=data["id"].to_numpy()).groupby(level=0).mean()
     return float(per_person.mean())
@@ -1654,7 +1904,14 @@ def interval_score(
     individuals: pd.DataFrame | None = None,
     split: str | None = None,
 ) -> float:
-    """Mean interval (Winkler) score for the latent composite L."""
+    """Mean interval (Winkler) score for the latent composite L.
+
+    IS_alpha = width + (2/alpha)(lower - L) I[L < lower] + (2/alpha)(L - upper) I[L > upper].
+
+    Rewards intervals that are simultaneously narrow and calibrated; reported
+    alongside coverage and width because coverage alone is gameable by widening.
+    Aggregated per person first (replicate-level), then averaged across patients.
+    """
 
     truth = _with_split(truth, individuals)
     cols = ["id", "t", "L"] + (["split"] if "split" in truth.columns else [])
@@ -1679,7 +1936,7 @@ def channel_interval_metrics(
     individuals: pd.DataFrame | None = None,
     split: str | None = None,
 ) -> dict[str, float]:
-    """Compute coverage and width for channel-specific severity intervals."""
+    """Coverage and width for PDF disorder-specific severity intervals."""
 
     required = {"z_d_lower", "z_d_upper", "z_p_lower", "z_p_upper"}
     truth_required = {"z_d", "z_p"}
@@ -1698,6 +1955,8 @@ def channel_interval_metrics(
     merged = _filter_split(merged, split)
     z_d_covered = (merged["z_d_lower"] <= merged["z_d"]) & (merged["z_d"] <= merged["z_d_upper"])
     z_p_covered = (merged["z_p_lower"] <= merged["z_p"]) & (merged["z_p"] <= merged["z_p_upper"])
+    # Replicate-level (per-person then average), consistent with coverage(); not
+    # person-day pooled. Widths use the same aggregation as mean_width().
     ids = merged["id"]
     z_d_width = merged["z_d_upper"] - merged["z_d_lower"]
     z_p_width = merged["z_p_upper"] - merged["z_p_lower"]
@@ -1717,7 +1976,14 @@ def active_set_metrics(
     individuals: pd.DataFrame | None = None,
     split: str | None = None,
 ) -> dict[str, float]:
-    """Per-session active-set recovery for the time-varying sparse support."""
+    """Per-session active-set recovery for the time-varying sparse support.
+
+    Because the recovery recipe's support shifts over time (spec adaptive Lasso),
+    recovery is scored per session-dimension: at each (patient, session, RDoC
+    dimension), the dimension is truly active when its loading is nonzero, and is
+    predicted active when the fitted loading exceeds the threshold tau. The top-k
+    variant uses, per session, the true number of active dimensions.
+    """
 
     alpha_cols = [f"alpha_hat{d}" for d in range(q)]
     active_cols = [f"active{d}" for d in range(q)]
@@ -1739,9 +2005,9 @@ def active_set_metrics(
             "active_f1": float("nan"),
             "active_accuracy": float("nan"),
         }
-    alpha_abs = merged[alpha_cols].abs().to_numpy(dtype=float)
+    alpha_abs = merged[alpha_cols].abs().to_numpy(dtype=float)  # (rows, q)
     pred_active = alpha_abs >= tau
-    true_active = merged[active_cols].to_numpy(dtype=bool)
+    true_active = merged[active_cols].to_numpy(dtype=bool)       # (rows, q)
     tp = float(np.logical_and(pred_active, true_active).sum())
     fp = float(np.logical_and(pred_active, ~true_active).sum())
     fn = float(np.logical_and(~pred_active, true_active).sum())
@@ -1750,7 +2016,10 @@ def active_set_metrics(
     recall = tp / (tp + fn) if tp + fn > 0 else float("nan")
     f1 = 2 * precision * recall / (precision + recall) if np.isfinite(precision) and np.isfinite(recall) and precision + recall > 0 else float("nan")
     accuracy = (tp + tn) / max(tp + fp + fn + tn, 1.0)
-    ranks = np.argsort(np.argsort(-alpha_abs, axis=1), axis=1)
+    # Top-k per session: predict the k strongest loadings active, k = true count.
+    # Vectorized: rank each dimension within its row by descending |alpha| and
+    # mark it active when its rank is below that row's true active count.
+    ranks = np.argsort(np.argsort(-alpha_abs, axis=1), axis=1)  # rank 0 = strongest
     k_per_row = true_active.sum(axis=1, keepdims=True)
     topk_pred = ranks < k_per_row
     topk_tp = float(np.logical_and(topk_pred, true_active).sum())
@@ -1817,7 +2086,16 @@ def anchor_conformal_residuals(
     anchor_name: str,
     channel_hat_col: str,
 ) -> np.ndarray:
-    """Absolute residuals between observed anchors and recall-windowed predictions."""
+    """Absolute residuals between observed anchors and recall-windowed predictions.
+
+    This is the appendix Sec. 5 conformity score R_i = |y_i - f_hat(x_i)|, where
+    f_hat is the model's prediction of the *observable anchor* (recall-windowed
+    mean of the predicted channel times the anchor loading), NOT the unobservable
+    latent. Calibrating on these scores is what makes the coverage guarantee
+    deployable: in the empirical study the latent is never measured, so conformal
+    residuals can only be formed against anchors. Latent coverage against truth is
+    reported separately as a simulation-only diagnostic.
+    """
 
     if channel_hat_col not in predictions.columns:
         return np.array([], dtype=float)
@@ -1849,8 +2127,18 @@ def rdoc_recovery_fraction(
     data,
     split: str | None = None,
 ) -> float:
-    """Estimate rho_RDoC = Var(alpha'RDoC) / (Var(z_d) + Var(z_p)) from fitted outputs."""
+    """Estimate rho_RDoC = Var(alpha'RDoC) / (Var(z_d) + Var(z_p)) from fitted outputs.
 
+    This is the falsifiable latent-model claim from the appendix ("What this
+    buys"), the share of recovery variance explained by RDoC features. It is a
+    section-3 latent-recovery quantity.
+    """
+
+    # Numerator is the slow component variance Var(alpha'RDoC). The fitted
+    # estimate of that quantity is the proxy slow component alpha_hat dot B
+    # (proxy_slow_hat), NOT slow_hat = z - delta: the latter inherits the full z
+    # signal and double-counts against the z denominator. Fall back to slow_hat
+    # only if the proxy column is unavailable.
     slow_col = "proxy_slow_hat" if "proxy_slow_hat" in predictions.columns else "slow_hat"
     required = {slow_col, "z_d_hat", "z_p_hat"}
     if not required.issubset(predictions.columns):
@@ -1864,6 +2152,11 @@ def rdoc_recovery_fraction(
         frame = frame[frame["split"] == split]
     if frame.empty:
         return float("nan")
+    # Within-person variance: the per-patient level lives in delta (spec
+    # z = alpha'RDoC + delta, no intercept), so a pooled variance would inflate
+    # the denominator with between-patient level and deflate rho. rho_RDoC is a
+    # statement about the within-person dynamic decomposition, so center each
+    # quantity per patient before taking variances.
     def _within_var(column: str) -> float:
         centered = frame[column].to_numpy(dtype=float) - frame.groupby("id")[column].transform("mean").to_numpy(dtype=float)
         return float(np.var(centered, ddof=0))
@@ -1878,7 +2171,19 @@ def identifiability_diagnostics(
     data,
     split: str | None = None,
 ) -> dict[str, float]:
-    """Post-fit structural-identifiability diagnostics."""
+    """Post-fit structural-identifiability diagnostics.
+
+    The decomposition claim (slow alpha'RDoC vs fast delta) requires more than
+    good anchor fit: the recovered slow component must track the TRUE slow
+    component and not the fast one, and vice versa. These within-person
+    correlations expose signal swapping. A model that predicts anchors well but
+    assigns fast shocks to the slow channel fails the structural claim even with
+    low anchor RMSE.
+
+    Reported: recovery correlations (want high), cross leakage correlations (want
+    low), within-person component-variance recovery ratios (want ~1), and the
+    mean per-step loading change (loading stability).
+    """
 
     truth = data.components[["id", "t", "slow", "delta"]]
     ind = data.individuals
@@ -1928,7 +2233,13 @@ def latent_relative_width(
     individuals: pd.DataFrame | None = None,
     split: str | None = None,
 ) -> float:
-    """Mean interval width divided by the marginal SD of the latent state."""
+    """Mean interval width divided by the marginal SD of the latent state.
+
+    Reports width on an interpretable scale (units of latent standard
+    deviation), so coverage near 1.0 at a given width can be judged for
+    informativeness. The denominator is the marginal SD of L on the evaluated
+    split.
+    """
 
     truth = _with_split(truth, individuals)
     cols = ["id", "t", "L"] + (["split"] if "split" in truth.columns else [])
@@ -1968,7 +2279,13 @@ def coverage_by_anchor_distance(
     split: str | None = None,
     bins: tuple[int, ...] = (0, 1, 2, 4, 7, 1000),
 ) -> pd.DataFrame:
-    """Latent coverage and relative width stratified by days to nearest anchor."""
+    """Latent coverage and relative width stratified by days to nearest anchor.
+
+    Tests the overconfidence-under-weak-information risk. Days far from any
+    observed anchor carry less direct information, so honest intervals should
+    widen and coverage should hold there. Returns one row per distance bin with
+    per-person-aggregated coverage and width in latent SD units.
+    """
 
     truth = _with_split(truth, individuals)
     cols = ["id", "t", "L"] + (["split"] if "split" in truth.columns else [])
@@ -2003,7 +2320,13 @@ def coverage_by_daily_missingness(
     split: str | None = None,
     bins: tuple[float, ...] = (0.0, 0.5, 0.7, 0.85, 1.01),
 ) -> pd.DataFrame:
-    """Latent coverage and relative width stratified by daily missingness."""
+    """Latent coverage and relative width stratified by daily missingness.
+
+    For each (id, t) the daily missingness fraction is one minus the mean of the
+    obs_X observation flags. Days with more missing daily covariates carry less
+    information, so honest intervals should widen there. Returns one row per
+    missingness bin.
+    """
 
     obs_cols = [c for c in daily.columns if c.startswith("obs_X")]
     if not obs_cols:
@@ -2050,7 +2373,7 @@ def summarize_mcse(values: pd.Series) -> dict[str, float]:
     }
 '''
 
-# simulations.src.methods.baselines
+# --- simulations.src.methods.baselines (simulations/src/methods/baselines.py) ---
 SRC_SIMULATIONS_SRC_METHODS_BASELINES = r'''
 """Cheap baseline methods for sparse anchors."""
 
@@ -2084,7 +2407,13 @@ def linear_interpolation(data: SimulationData, anchor: str = "Y1") -> MethodResu
 
 
 def locf(data: SimulationData, anchor: str = "Y1") -> MethodResult:
-    """Strictly causal last-observation-carried-forward on the anchor."""
+    """Strictly causal last-observation-carried-forward on the anchor.
+
+    Days before the first observed anchor are filled with 0.0, the population
+    prior mean on the standardized anchor scale; backfilling with the first
+    anchor would leak future information into a baseline that is meant to be a
+    filter.
+    """
 
     rows: list[pd.DataFrame] = []
     anchors = _anchor_series(data, anchor)
@@ -2102,7 +2431,12 @@ def locf(data: SimulationData, anchor: str = "Y1") -> MethodResult:
 
 
 def anchor_only_windowed_mean(data: SimulationData) -> MethodResult:
-    """Simple windowed-anchor baseline: assign each day mean covering anchor value."""
+    """Simple windowed-anchor baseline: assign each day mean covering anchor value.
+
+    Each anchor value is divided by its loading before averaging so the two
+    anchors contribute on a common latent scale (Y2's 0.75 loading would
+    otherwise bias the level of every day its window covers).
+    """
 
     rows = []
     for person_id, comp in data.components.groupby("id", sort=True):
@@ -2123,9 +2457,20 @@ def anchor_only_windowed_mean(data: SimulationData) -> MethodResult:
     return MethodResult("anchor_only_windowed_mean", pd.concat(rows, ignore_index=True))
 '''
 
-# simulations.src.methods.s0
+# --- simulations.src.methods.s0 (simulations/src/methods/s0.py) ---
 SRC_SIMULATIONS_SRC_METHODS_S0 = r'''
-"""S0 structural-prior linear Gaussian smoother."""
+"""S0 structural-prior linear Gaussian smoother.
+
+S0 is the non-transformer prototype comparator from the simulation plan. It is
+not BALL: there is no teacher/student distillation, ensemble, Laplace layer,
+or conformal calibration here. It is a per-person MAP smoother with:
+
+- recall-window Gaussian anchor rows;
+- observed daily proxy rows for latent and fast residual streams;
+- structural rows tying L(t) to alpha'B(t) + delta(t) (no intercept; level in delta);
+- random-walk smoothing on L(t) and delta AR smoothing;
+- adaptive ridge rows that approximate sparse loading shrinkage.
+"""
 
 from __future__ import annotations
 
@@ -2145,6 +2490,9 @@ class S0Hyperparameters:
     xi: float = 0.15
     structural_sd: float = 0.35
     latent_smooth_sd: float = 1.25
+    # daily_latent_sd / daily_delta_sd retained for compatibility but unused:
+    # the daily-covariate likelihood now uses a learned readout (no oracle
+    # group/channel hints) whose per-covariate residual sd replaces these.
     daily_latent_sd: float = 0.70
     daily_delta_sd: float = 0.80
     daily_readout_ridge: float = 1.0
@@ -2197,6 +2545,9 @@ def _solve_person(
 
     t_count = len(comp_i)
     q = data.config.q
+    # Match the spec: unit-coefficient random-walk delta and no separate
+    # intercept (the level is carried by delta), so the comparator is scored on
+    # the same decomposition convention as the truth and BALL.
     phi_delta = 1.0
 
     l_start = 0
@@ -2241,8 +2592,16 @@ def _solve_person(
             else:
                 spec, rho = data.config.y2, data.config.rho_serial_y2
             coeff = spec.loading / len(window)
+            # Marginal AR(1) anchor error SD (error_sd / sqrt(1 - rho^2)).
             add([(l_start + t_pos, coeff) for t_pos in window], float(anchor_row.value), marginal_anchor_sd(spec, rho))
 
+        # Daily-covariate likelihood via a LEARNED readout (no oracle group/channel
+        # hints). Each covariate X_j is a learned linear function of the latent
+        # coordinates [L, delta], with loadings beta_j, intercept b_j and residual
+        # sd sigma_j fit on the training split only. One row per observed value:
+        # beta_j_L * L(t) + beta_j_delta * delta(t) = X_j(t) - b_j, weighted 1/sigma_j.
+        # The preliminary pass (daily_readout=None) uses anchors + proxy + smoothness
+        # only, supplying the coordinates the readout is regressed on.
         if daily_readout:
             x_cols = list(daily_readout.keys())
             for t_pos, drow in enumerate(daily_i.itertuples(index=False)):
@@ -2309,6 +2668,7 @@ def _solve_person(
     delta_hat = last_result[delta_start:alpha_start]
     alpha_hat = last_result[alpha_start:]
     proxy_slow_hat = b_proxy @ alpha_hat
+    # No intercept: slow = L - delta; the level lives in the random-walk delta.
     slow_hat = l_hat - delta_hat
     precision_l = np.maximum(last_precision_diag[l_start:delta_start], 1e-8)
     raw_sd = hyper.interval_inflation / np.sqrt(precision_l)
@@ -2339,7 +2699,12 @@ def _solve_person(
 
 
 def _estimate_s0_daily_readout(work, train_ids, data, hyper, p_daily):
-    """Learn each daily covariate's loading on [L, delta] on the TRAIN split only."""
+    """Learn each daily covariate's loading on [L, delta] on the TRAIN split only.
+
+    Prelim per-person solves (no daily rows) supply the latent coordinates the
+    24 covariates are ridge-regressed on. No oracle group/channel assignment, so
+    permuting the covariate columns and refitting changes nothing.
+    """
 
     x_cols = [f"X{j}" for j in range(p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(p_daily)]
@@ -2362,7 +2727,7 @@ def _estimate_s0_daily_readout(work, train_ids, data, hyper, p_daily):
     coords_all = np.concatenate(coord_rows, axis=0)
     x_all = np.concatenate(x_rows, axis=0)
     obs_all = np.concatenate(obs_rows, axis=0)
-    design = np.concatenate([np.ones((coords_all.shape[0], 1)), coords_all], axis=1)
+    design = np.concatenate([np.ones((coords_all.shape[0], 1)), coords_all], axis=1)  # [1, L, delta]
     ridge = hyper.daily_readout_ridge * np.eye(3)
     ridge[0, 0] = 0.0
     for j in range(p_daily):
@@ -2381,7 +2746,12 @@ def fit_s0_structural_prior_ssm(
     xi: float = 0.15,
     hyperparameters: S0Hyperparameters | None = None,
 ) -> MethodResult:
-    """Fit S0 structural-prior linear Gaussian smoother."""
+    """Fit S0 structural-prior linear Gaussian smoother.
+
+    The returned intervals are raw diagonal-precision Gaussian intervals. They
+    are useful for plumbing and rough behavior checks, but they are not split
+    conformal intervals and should not be used as BALL uncertainty claims.
+    """
 
     hyper = hyperparameters or S0Hyperparameters(xi=xi)
     predictions: list[pd.DataFrame] = []
@@ -2402,6 +2772,7 @@ def fit_s0_structural_prior_ssm(
             anchors_i = pd.DataFrame(columns=data.anchors.columns)
         work.append((comp_i, daily_i, anchors_i))
 
+    # Two-pass fair daily use: learn the readout on train, then solve all patients.
     train_ids = set(int(i) for i in data.individuals.loc[data.individuals["split"] == "train", "id"])
     readout = _estimate_s0_daily_readout(work, train_ids, data, hyper, data.config.p_daily)
     for comp_i, daily_i, anchors_i in work:
@@ -2434,9 +2805,17 @@ def fit_s0_structural_prior_ssm(
     )
 '''
 
-# simulations.src.methods.ball_structural
+# --- simulations.src.methods.ball_structural (simulations/src/methods/ball_structural.py) ---
 SRC_SIMULATIONS_SRC_METHODS_BALL_STRUCTURAL = r'''
-"""Two-channel BALL structural posterior smoother."""
+"""Two-channel BALL structural posterior smoother.
+
+This is a linear-Gaussian posterior scaffold for the PDF appendix structure:
+shared dynamic RDoC loadings alpha(t), disorder-specific residual channels
+delta_d(t)/delta_p(t), and recall-window PHQ/PCL anchors for z_d/z_p.
+
+It is not the transformer student. It is a direct structural posterior used as
+a smoke-stage target and ceiling check for the neural BALL path.
+"""
 
 from __future__ import annotations
 
@@ -2464,9 +2843,16 @@ class BallStructuralHyperparameters:
     xi: float = 0.08
     structural_sd: float = 0.30
     latent_smooth_sd: float = 1.10
+    # daily_latent_sd / daily_lag_sd / daily_delta_sd are retained for backward
+    # compatibility but no longer used: the daily-covariate likelihood now uses a
+    # learned population readout (no oracle group/channel hints) whose per-feature
+    # residual sd replaces these fixed scales.
     daily_latent_sd: float = 0.50
     daily_lag_sd: float = 0.70
     daily_delta_sd: float = 0.45
+    # Learned daily-covariate readout: ridge strength for the per-covariate
+    # latent->feature regression, and a floor on the estimated residual sd so a
+    # spuriously well-fit covariate cannot dominate the calibrated anchors.
     daily_readout_ridge: float = 1.0
     daily_readout_sigma_floor: float = 0.30
     delta_phi: float = 1.0
@@ -2477,6 +2863,8 @@ class BallStructuralHyperparameters:
     lsqr_atol: float = 1e-6
     lsqr_btol: float = 1e-6
     lsqr_iter_lim: int = 4000
+    # Raw intervals now use the true marginal posterior variance, so no fudge
+    # factor; split conformal performs the calibration step.
     interval_inflation: float = 1.0
 
 
@@ -2521,20 +2909,29 @@ def _marginal_posterior_variances(
     dd_start: int,
     t_count: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return per-session marginal posterior variances for z_d, z_p and their."""
+    """Return per-session marginal posterior variances for z_d, z_p and their
+    cross-covariance.
+
+    The weighted design ``matrix`` (every row already scaled by 1/sd) makes
+    ``A^T A`` the Gaussian posterior *precision*, so the posterior covariance is
+    ``(A^T A)^{-1}``. We need only the z_d / z_p diagonal (and the per-session
+    z_d-z_p cross term for the joint composite), so we solve the precision system
+    against the corresponding unit vectors via a single sparse LU factorization
+    rather than inverting the full matrix.
+    """
 
     ata = (matrix.T @ matrix).tocsc()
     ata = ata + 1e-8 * sparse.identity(n_vars, format="csc")
     lu = splu(ata)
-    cols = np.arange(zd_start, dd_start)
+    cols = np.arange(zd_start, dd_start)            # z_d block then z_p block
     rhs = np.zeros((n_vars, cols.size))
     rhs[cols, np.arange(cols.size)] = 1.0
-    inv_cols = lu.solve(rhs)
+    inv_cols = lu.solve(rhs)                         # (n_vars, 2*t_count)
     zd_rows = np.arange(zd_start, zp_start)
     zp_rows = np.arange(zp_start, dd_start)
     var_zd = inv_cols[zd_rows, np.arange(t_count)]
     var_zp = inv_cols[zp_rows, np.arange(t_count, 2 * t_count)]
-    cov = inv_cols[zp_rows, np.arange(t_count)]
+    cov = inv_cols[zp_rows, np.arange(t_count)]      # Cov(z_d[t], z_p[t])
     var_zd = np.clip(var_zd, 1e-10, None)
     var_zp = np.clip(var_zp, 1e-10, None)
     return var_zd, var_zp, cov
@@ -2554,8 +2951,14 @@ def _solve_person(
 
     t_count = len(comp_i)
     q = config.q
+    # Delta smoothing-prior AR coefficient. Default 1.0 matches the spec's
+    # unit-coefficient random walk; setting it below 1 lets the comparator's delta
+    # prior match a mean-reverting DGP (used to test slow/fast identifiability).
     phi_delta = float(hyper.delta_phi)
 
+    # Spec decomposition has no separate intercept (z = alpha'RDoC + delta); the
+    # per-patient level is carried by the random-walk residual delta, so the
+    # linear system solves only for z_d, z_p, delta_d, delta_p, and alpha.
     zd_start = 0
     zp_start = zd_start + t_count
     dd_start = zp_start + t_count
@@ -2602,8 +3005,19 @@ def _solve_person(
             if not days:
                 continue
             coeff = spec.loading / len(days)
+            # Marginal AR(1) anchor error SD (error_sd / sqrt(1 - rho^2)).
             add([(channel_start + t_pos, coeff) for t_pos in days], float(anchor_row.value), marginal_anchor_sd(spec, rho))
 
+        # Daily-covariate likelihood via a LEARNED population readout (no oracle
+        # group/channel hints). The readout supplies, for each daily covariate
+        # X_j, loadings beta_j on the same-day latent coordinates
+        # [z_d, z_p, delta_d, delta_p], an intercept b_j, and a residual sd
+        # sigma_j, all estimated on the training split only (the linear-solver
+        # mirror of the neural daily_readout, which learns which covariates load
+        # on the latent and which are noise). Each observed value contributes one
+        # row sum_c beta_{j,c} * coord_c(t) = X_j(t) - b_j, weighted by 1/sigma_j.
+        # The preliminary pass (daily_readout=None) fits anchors + proxy +
+        # smoothness only, supplying the coordinates the readout is regressed on.
         if daily_readout:
             coord_starts = (zd_start, zp_start, dd_start, dp_start)
             for t_pos, col, value in _observed_daily_rows(daily_i, list(daily_readout.keys())):
@@ -2669,6 +3083,8 @@ def _solve_person(
     proxy_slow = np.sum(alpha * b_proxy, axis=1)
     joint = 0.5 * (z_d + z_p)
     delta = 0.5 * (delta_d + delta_p)
+    # No intercept in the spec decomposition: slow = z - delta carries no level,
+    # and the level is held by delta.
     slow_d = z_d - delta_d
     slow_p = z_p - delta_p
     slow = 0.5 * (slow_d + slow_p)
@@ -2676,6 +3092,7 @@ def _solve_person(
     var_zd, var_zp, cov_zdzp = _marginal_posterior_variances(
         last_matrix, n_vars, zd_start, zp_start, dd_start, t_count
     )
+    # Joint composite L = 0.5 (z_d + z_p): Var(L) = 0.25 (Var z_d + Var z_p + 2 Cov).
     var_joint = np.clip(0.25 * (var_zd + var_zp + 2.0 * cov_zdzp), 1e-10, None)
     raw_sd = hyper.interval_inflation * np.sqrt(var_joint)
     raw_sd_zd = hyper.interval_inflation * np.sqrt(var_zd)
@@ -2730,7 +3147,16 @@ def _estimate_daily_readout(
     hyper: BallStructuralHyperparameters,
     p_daily: int,
 ) -> dict[str, tuple[np.ndarray, float, float]]:
-    """Learn a per-covariate latent->feature readout on the TRAIN split."""
+    """Learn a per-covariate latent->feature readout on the TRAIN split.
+
+    Each daily covariate X_j is ridge-regressed on the preliminary latent
+    coordinates [z_d, z_p, delta_d, delta_p] (estimated from anchors + proxy +
+    smoothness only, with no daily rows) pooled over training patient-days. The
+    result is the loadings, intercept, and residual sd used as the covariate's
+    observation model in the final solve. Fit on TRAIN only, so the readout never
+    sees the conformal or test split (no leakage), mirroring the neural
+    daily_readout trained on the train batch.
+    """
 
     x_cols = [f"X{j}" for j in range(p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(p_daily)]
@@ -2762,9 +3188,9 @@ def _estimate_daily_readout(
     coords_all = np.concatenate(coord_rows, axis=0)
     x_all = np.concatenate(x_rows, axis=0)
     obs_all = np.concatenate(x_obs_rows, axis=0)
-    design = np.concatenate([np.ones((coords_all.shape[0], 1)), coords_all], axis=1)
+    design = np.concatenate([np.ones((coords_all.shape[0], 1)), coords_all], axis=1)  # [1, z_d, z_p, dd, dp]
     ridge = hyper.daily_readout_ridge * np.eye(5)
-    ridge[0, 0] = 0.0
+    ridge[0, 0] = 0.0  # do not shrink the intercept
     for j in range(p_daily):
         mask = (obs_all[:, j] > 0.5) & np.isfinite(x_all[:, j])
         if int(mask.sum()) < 5:
@@ -2789,6 +3215,9 @@ def fit_ball_structural_posterior(
     daily_groups = dict(tuple(data.daily.groupby("id", sort=True)))
     anchor_groups = dict(tuple(data.anchors.groupby("id", sort=True)))
 
+    # Build the per-patient work items; the solves are independent, so they run
+    # in parallel across CPU cores (the per-person linear system is the main
+    # cost at scale).
     work: list[tuple] = []
     for person_id, comp_i in data.components.groupby("id", sort=True):
         daily_i = daily_groups.get(person_id)
@@ -2799,6 +3228,8 @@ def fit_ball_structural_posterior(
             anchors_i = pd.DataFrame(columns=data.anchors.columns)
         work.append((comp_i, daily_i, anchors_i))
 
+    # Two-pass fair daily-covariate use: learn the population readout on train,
+    # then solve every patient with it (no oracle group/channel hints).
     train_ids = set(int(i) for i in data.individuals.loc[data.individuals["split"] == "train", "id"])
     readout = _estimate_daily_readout(work, train_ids, config, hyper, config.p_daily)
     solved = [_solve_person(comp_i, daily_i, anchors_i, config, hyper, daily_readout=readout)
@@ -2871,7 +3302,19 @@ def conformal_calibrate_structural_posterior(
     alpha: float = 0.05,
     split: str = "conformal",
 ) -> MethodResult:
-    """Apply patient-balanced, variance-normalized split conformal calibration."""
+    """Apply patient-balanced, variance-normalized split conformal calibration.
+
+    Observable recall-windowed anchor residuals are divided by the model-derived
+    predictive standard deviation for the same recalled quantity. Every
+    calibration patient contributes total weight one, divided equally among that
+    patient's measurements. The weighted quantile uses the number of independent
+    patient clusters to set its rank, and the resulting multiplier acts on each session's
+    ensemble-plus-Laplace standard deviation, so interval width remains patient-
+    and session-specific. This targets patient-balanced marginal measurement
+    coverage rather than simultaneous coverage of every measurement within a
+    patient. Calibration is against observable anchors. Any coverage of latent
+    truth remains a simulation-only diagnostic.
+    """
 
     if result.intervals is None:
         raise ValueError("normalized conformal calibration requires model-derived intervals")
@@ -2924,6 +3367,9 @@ def conformal_calibrate_structural_posterior(
         if window.empty:
             continue
         anchor_hat = float(row.loading) * float(window[mean_col].mean())
+        # Marginal posterior covariance across days is unavailable. Aggregate
+        # diagonal variances over the recall-window mean and let conformal
+        # calibration absorb the omitted temporal covariance.
         latent_anchor_sd = abs(float(row.loading)) * float(
             np.sqrt(np.square(window[sd_col].to_numpy(dtype=float)).sum()) / len(window)
         )
@@ -3003,7 +3449,13 @@ def oracle_latent_conformal_intervals(
     alpha: float = 0.05,
     split: str = "conformal",
 ) -> MethodResult:
-    """Simulation-only ORACLE: split conformal calibrated on TRUE-latent residuals."""
+    """Simulation-only ORACLE: split conformal calibrated on TRUE-latent residuals.
+
+    This is an upper-bound diagnostic on achievable latent calibration and is NOT
+    available in a real application (the latent is never observed). Reported as
+    the third latent-coverage row alongside the raw posterior interval and the
+    anchor-residual split-conformal interval, to expose the latent-calibration gap.
+    """
 
     comp = data.components[["id", "t", "z_d", "z_p"]].copy()
     comp["L"] = 0.5 * (comp["z_d"] + comp["z_p"])
@@ -3024,6 +3476,7 @@ def oracle_latent_conformal_intervals(
     intervals["z_d_upper"] = intervals["z_d_hat"] + q_zd
     intervals["z_p_lower"] = intervals["z_p_hat"] - q_zp
     intervals["z_p_upper"] = intervals["z_p_hat"] + q_zp
+    # Defensive sd columns (some consumers, e.g. ensemble combine, require them).
     intervals["raw_sd"] = q_L / 1.96
     intervals["total_sd"] = q_L / 1.96
     intervals["interval_source"] = "oracle_latent_conformal"
@@ -3047,9 +3500,51 @@ def oracle_latent_conformal_intervals(
     )
 '''
 
-# simulations.src.methods.markov_pattern_mixture
+# --- simulations.src.methods.markov_pattern_mixture (simulations/src/methods/markov_pattern_mixture.py) ---
 SRC_SIMULATIONS_SRC_METHODS_MARKOV_PATTERN_MIXTURE = r'''
-"""Markov pattern-mixture latent-trajectory comparator."""
+"""Markov pattern-mixture latent-trajectory comparator.
+
+This is the classical "old-school statistics" arm of the comparison required by
+the project specification: old-school statistics versus the transformer
+teacher/student model for latent recovery. It is a separate baseline. It is
+never used as a pseudo-target for BALL.
+
+The math-spec appendix (the BALL specification PDF, Sec. 4) names the classical analogue of
+the inference problem explicitly: "the closest familiar analogue is a Kalman
+filter on a linear-Gaussian state-space model." This module is that analogue,
+extended in two classical directions that the transformer is not:
+
+1. Markov dynamics. The per-day latent severity is an unobserved-components
+   state-space model, L(t) = level(t) + fast(t), where level(t) is a random
+   walk (the slow component) and fast(t) is a stationary AR(1) residual. This is
+   a first-order Markov latent process with linear-Gaussian transitions.
+
+2. Pattern mixture. The cohort is a finite mixture of K trajectory classes. Each
+   class has its own Markov dynamics, pooled across patients (so the model
+   borrows strength across patients within a class, unlike the per-person S0
+   smoother). Class membership is modeled conditional on the observed-data
+   pattern, the defining feature of a pattern-mixture model (Little, 1993): the
+   prior class weights depend on each patient's anchor-observation stratum.
+
+Inference is classical throughout. Class dynamics and mixing weights are fit by
+expectation maximization on the marginal likelihood of the observed anchors.
+Each anchor is a loading-scaled average of the latent over its recall window
+plus Gaussian noise, so the anchor vector of a patient is multivariate Gaussian
+with a covariance the class dynamics imply in closed form. Given the fitted
+classes, the per-patient latent trajectory is the responsibility-weighted
+posterior mean of a batch linear-Gaussian smoother that conditions on the
+retained anchors and, in simulation, on the same-day daily severity proxies.
+Uncertainty is the model-based Gaussian interval from the smoother posterior
+variance combined across classes by the law of total variance. There is no
+ensemble, no Laplace layer, and no conformal calibration. Those are BALL
+constructions. The contrast is deliberate.
+
+The comparator estimates the composite latent severity L only. It does not
+attempt to recover the sparse RDoC loading vector alpha or the proxy-explained
+slow component. Identifying which proxy dimensions drive recovery is a
+BALL-specific capability, so the RDoC-specific diagnostics (active-set F1,
+rho_RDoC, denoised C recovery) are reported as not applicable for this method.
+"""
 
 from __future__ import annotations
 
@@ -3088,19 +3583,26 @@ class MarkovMixtureHyperparameters:
     jitter: float = 1e-6
     interval_scale: float = 1.96
     random_state: int = 0
+    # Bounds for the per-class innovation and anchor-noise scales (z units).
     min_scale: float = 0.02
     max_scale: float = 6.0
 
 
+# ---------------------------------------------------------------------------
+# Per-person observed-data containers, assembled once and reused across EM.
+# ---------------------------------------------------------------------------
 @dataclass
 class _PersonObs:
     person_id: int
-    t_index: np.ndarray
+    t_index: np.ndarray            # day positions 0..T-1 actually present
     n_days: int
+    # Anchor design: each retained anchor is loading/|window| spread over its
+    # window day positions. window_rows is a list of (positions, coeff, value).
     anchor_positions: list[np.ndarray]
     anchor_coeffs: list[float]
-    anchor_values: np.ndarray
-    anchor_design: np.ndarray
+    anchor_values: np.ndarray      # standardized anchor values (length W)
+    anchor_design: np.ndarray      # (W, n_days) windowed-mean design with loading
+    # Daily same-day severity observations of L(t): value and day position.
     daily_positions: np.ndarray
     daily_values: np.ndarray
     stratum: int
@@ -3135,6 +3637,7 @@ def _build_person_obs(
             dtype=int,
         )
         if positions.size == 0:
+            # No overlap with present days: attach to nearest present day.
             nearest = int(np.argmin(np.abs(days - end)))
             positions = np.array([nearest], dtype=int)
         loading = float(getattr(row, "loading"))
@@ -3153,6 +3656,11 @@ def _build_person_obs(
     daily_positions = np.array([], dtype=int)
     daily_values = np.array([], dtype=float)
     if use_daily and daily_readout is not None and daily_i is not None and not daily_i.empty:
+        # Daily severity observation via a LEARNED readout (no oracle group hints):
+        # the per-day reading of L(t) is the train-fit linear prediction of L from
+        # ALL daily covariates, b + sum_j beta_j * X_j(t), with missing covariates
+        # imputed to their train means. Permuting the covariate columns and refitting
+        # leaves this prediction unchanged.
         b0, beta, means = daily_readout
         p_daily = len(beta)
         x_cols = [f"X{j}" for j in range(p_daily)]
@@ -3189,12 +3697,15 @@ def _build_person_obs(
     )
 
 
+# ---------------------------------------------------------------------------
+# Class dynamics: latent covariance and anchor marginal likelihood.
+# ---------------------------------------------------------------------------
 @dataclass
 class _ClassParams:
-    s_lev: float
-    phi: float
-    s_fast: float
-    anchor_sd: float
+    s_lev: float       # random-walk innovation SD (slow level)
+    phi: float         # AR(1) coefficient of the fast residual
+    s_fast: float      # AR(1) innovation SD of the fast residual
+    anchor_sd: float   # pooled anchor measurement SD (z units)
 
 
 def _latent_cov(params: _ClassParams, n_days: int, level_prior_var: float,
@@ -3214,8 +3725,8 @@ def _anchor_loglik(person: _PersonObs, cov_L: np.ndarray, anchor_sd: float,
     w = person.anchor_design.shape[0]
     if w == 0:
         return 0.0
-    M = person.anchor_design
-    cov_anchor = M @ cov_L @ M.T
+    M = person.anchor_design                       # (W, n_days)
+    cov_anchor = M @ cov_L @ M.T                    # (W, W)
     cov_anchor = cov_anchor + (anchor_sd**2 + jitter) * np.eye(w)
     y = person.anchor_values
     try:
@@ -3229,9 +3740,17 @@ def _anchor_loglik(person: _PersonObs, cov_L: np.ndarray, anchor_sd: float,
     return -0.5 * (quad + logdet + w * math.log(2.0 * math.pi))
 
 
+# ---------------------------------------------------------------------------
+# Batch linear-Gaussian smoother for one person under one class.
+# ---------------------------------------------------------------------------
 def _smooth_person(person: _PersonObs, params: _ClassParams,
                    hyper: MarkovMixtureHyperparameters) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (L_hat, level_hat, var_L) for one person under one class."""
+    """Return (L_hat, level_hat, var_L) for one person under one class.
+
+    Solves the weighted Gaussian system over the stacked state [level, fast]
+    via the normal equations, then reads the latent posterior variance from the
+    inverse information matrix.
+    """
 
     n = person.n_days
     level0 = 0
@@ -3249,14 +3768,17 @@ def _smooth_person(person: _PersonObs, params: _ClassParams,
         rows.append(row)
         targets.append(target * weight)
 
+    # State priors at the first day.
     add([(level0 + 0, 1.0)], 0.0, hyper.level_prior_sd)
     fast_marg_sd = params.s_fast / math.sqrt(max(1.0 - params.phi**2, 1e-6))
     add([(fast0 + 0, 1.0)], 0.0, max(fast_marg_sd, hyper.min_scale))
 
+    # Markov transitions.
     for t in range(1, n):
         add([(level0 + t, 1.0), (level0 + t - 1, -1.0)], 0.0, params.s_lev)
         add([(fast0 + t, 1.0), (fast0 + t - 1, -params.phi)], 0.0, params.s_fast)
 
+    # Anchor observations: loading-scaled window mean of L = value.
     for design_row, value in zip(person.anchor_design, person.anchor_values):
         positions = np.nonzero(design_row)[0]
         coeffs: list[tuple[int, float]] = []
@@ -3265,6 +3787,7 @@ def _smooth_person(person: _PersonObs, params: _ClassParams,
             coeffs.append((fast0 + p, design_row[p]))
         add(coeffs, float(value), params.anchor_sd)
 
+    # Same-day daily severity observations of L(t).
     if hyper.use_daily and person.daily_positions.size:
         for p, value in zip(person.daily_positions, person.daily_values):
             add([(level0 + int(p), 1.0), (fast0 + int(p), 1.0)], float(value), hyper.daily_obs_sd)
@@ -3282,6 +3805,7 @@ def _smooth_person(person: _PersonObs, params: _ClassParams,
     level_hat = x[level0:fast0]
     fast_hat = x[fast0:]
     l_hat = level_hat + fast_hat
+    # Var(L_t) = Var(level_t) + Var(fast_t) + 2 Cov(level_t, fast_t).
     diag_level = np.diag(cov)[level0:fast0]
     diag_fast = np.diag(cov)[fast0:]
     cross = cov[np.arange(level0, fast0), np.arange(fast0, n_vars)]
@@ -3289,10 +3813,15 @@ def _smooth_person(person: _PersonObs, params: _ClassParams,
     return l_hat, level_hat, var_L
 
 
+# ---------------------------------------------------------------------------
+# Expectation maximization for the class dynamics and mixing weights.
+# ---------------------------------------------------------------------------
 def _init_classes(hyper: MarkovMixtureHyperparameters, anchor_values: np.ndarray) -> list[_ClassParams]:
     base_sd = float(np.std(anchor_values)) if anchor_values.size else 1.0
     base_sd = min(max(base_sd, 0.2), 3.0)
     classes: list[_ClassParams] = []
+    # Spread the initial classes across slow/fast regimes so EM can separate a
+    # smooth-trajectory class from a volatile one.
     phis = np.linspace(0.2, 0.8, hyper.n_classes)
     lev_scales = np.linspace(0.15, 0.6, hyper.n_classes)
     for k in range(hyper.n_classes):
@@ -3335,7 +3864,11 @@ def _fit_markov_mixture_params(
     level_prior_var: float,
     n_days: int,
 ) -> tuple[list[_ClassParams], np.ndarray]:
-    """EM over class dynamics and stratum-conditional mixing weights."""
+    """EM over class dynamics and stratum-conditional mixing weights.
+
+    Returns the fitted class parameters and the (n_strata x n_classes) matrix of
+    pattern-conditional mixing weights.
+    """
 
     from scipy.optimize import minimize
 
@@ -3361,15 +3894,17 @@ def _fit_markov_mixture_params(
 
     prev_total = -np.inf
     for _ in range(max(1, hyper.em_iters)):
-        loglik = np.column_stack([class_loglik_vector(c) for c in classes])
-        log_weights = np.log(np.clip(weights[strata], 1e-8, None))
+        # E-step: per-person, per-class anchor log-likelihood and responsibilities.
+        loglik = np.column_stack([class_loglik_vector(c) for c in classes])  # (N, K)
+        log_weights = np.log(np.clip(weights[strata], 1e-8, None))            # (N, K)
         joint = loglik + log_weights
         row_max = joint.max(axis=1, keepdims=True)
         resp = np.exp(joint - row_max)
         resp_sum = resp.sum(axis=1, keepdims=True)
-        resp = resp / np.where(resp_sum > 0, resp_sum, 1.0)
+        resp = resp / np.where(resp_sum > 0, resp_sum, 1.0)                   # (N, K)
         total = float(np.sum(row_max.ravel() + np.log(np.clip(resp_sum.ravel(), 1e-12, None))))
 
+        # M-step (weights): stratum-conditional mixing.
         new_weights = np.full_like(weights, 1.0 / hyper.n_classes)
         for s in range(hyper.n_strata):
             mask = strata == s
@@ -3380,6 +3915,7 @@ def _fit_markov_mixture_params(
         weights = np.clip(new_weights, 1e-6, None)
         weights = weights / weights.sum(axis=1, keepdims=True)
 
+        # M-step (dynamics): maximize responsibility-weighted anchor likelihood.
         new_classes: list[_ClassParams] = []
         for k, c in enumerate(classes):
             r_k = resp[:, k]
@@ -3412,8 +3948,19 @@ def _fit_markov_mixture_params(
     return classes, weights
 
 
+# ---------------------------------------------------------------------------
+# Public entry point.
+# ---------------------------------------------------------------------------
 def _estimate_markov_daily_readout(data, train_ids, p_daily, ridge=1.0):
-    """Learn a single linear predictor of composite severity L from ALL daily."""
+    """Learn a single linear predictor of composite severity L from ALL daily
+    covariates, on the TRAIN split only.
+
+    The prelim L target is a crude per-patient anchor interpolation; the 24
+    covariates are then ridge-regressed onto it, with missing covariates imputed
+    to their train means. No oracle group/channel hints, so permuting the
+    covariate columns and refitting leaves the predictor unchanged. Returns
+    (intercept, beta[p_daily], train_means[p_daily]) or None.
+    """
 
     x_cols = [f"X{j}" for j in range(p_daily)]
     obs_cols = [f"obs_X{j}" for j in range(p_daily)]
@@ -3461,12 +4008,19 @@ def fit_markov_pattern_mixture(
     data: SimulationData,
     hyperparameters: MarkovMixtureHyperparameters | None = None,
 ) -> MethodResult:
-    """Fit the Markov pattern-mixture comparator on a simulated dataset."""
+    """Fit the Markov pattern-mixture comparator on a simulated dataset.
+
+    The returned intervals are model-based Gaussian intervals from the smoother
+    posterior variance combined across mixture classes by the law of total
+    variance. They are not split-conformal intervals. They are the classical
+    counterpart to the BALL uncertainty stack, reported as a comparator.
+    """
 
     hyper = hyperparameters or MarkovMixtureHyperparameters()
     config = data.config
     n_days = config.t
 
+    # Per-day covariance grids, shared across all classes for the fixed horizon.
     idx = np.arange(n_days)
     min_grid = np.minimum.outer(idx, idx).astype(float)
     lag_grid = np.abs(np.subtract.outer(idx, idx)).astype(float)
@@ -3475,6 +4029,7 @@ def fit_markov_pattern_mixture(
     daily_groups = dict(tuple(data.daily.groupby("id", sort=True))) if data.daily is not None else {}
     anchor_groups = dict(tuple(data.anchors.groupby("id", sort=True)))
 
+    # Learn the daily readout on the train split only (no oracle group hints).
     markov_train_ids = (
         set(int(i) for i in data.individuals.loc[data.individuals["split"] == "train", "id"])
         if "split" in data.individuals.columns else None
@@ -3492,6 +4047,8 @@ def fit_markov_pattern_mixture(
             anchors_i = pd.DataFrame(columns=data.anchors.columns)
         people.append(_build_person_obs(comp_i, daily_i, anchors_i, hyper.use_daily, daily_readout))
 
+    # Pattern strata from the observed anchor count. This is what makes the
+    # mixing weights pattern-conditional (pattern-mixture structure).
     anchor_counts = np.array([p.anchor_values.size for p in people], dtype=float)
     if hyper.n_strata > 1 and np.unique(anchor_counts).size >= hyper.n_strata:
         quantiles = np.quantile(anchor_counts, np.linspace(0, 1, hyper.n_strata + 1)[1:-1])
@@ -3501,6 +4058,8 @@ def fit_markov_pattern_mixture(
     for p, s in zip(people, strata):
         p.stratum = int(min(s, hyper.n_strata - 1))
 
+    # Parameter fitting is restricted to the configured split (default train) and
+    # capped for runtime; the fitted classes are then applied to every patient.
     split_ids: set[int] | None = None
     if hyper.fit_split is not None and "split" in data.individuals.columns:
         split_ids = set(
@@ -3517,6 +4076,7 @@ def fit_markov_pattern_mixture(
         fit_people, hyper, min_grid, lag_grid, level_prior_var, n_days
     )
 
+    # Precompute each class's latent covariance for the responsibility step.
     class_cov = [_latent_cov(c, n_days, level_prior_var, min_grid, lag_grid) for c in classes]
 
     pred_frames: list[pd.DataFrame] = []
@@ -3526,6 +4086,8 @@ def fit_markov_pattern_mixture(
     for person in people:
         days = person.t_index
         w = person.anchor_values.size
+        # Responsibilities from the anchor marginal likelihood and the patient's
+        # pattern-conditional mixing weights.
         if w > 0:
             ll = np.array(
                 [_anchor_loglik(person, cov, c.anchor_sd, hyper.jitter) for c, cov in zip(classes, class_cov)],
@@ -3540,6 +4102,7 @@ def fit_markov_pattern_mixture(
         resp = resp / resp.sum()
         n_active_classes.append(float(np.sum(resp > 0.05)))
 
+        # Smooth under each class, then mix the trajectories by responsibility.
         l_by_class = np.zeros((len(classes), person.n_days), dtype=float)
         var_by_class = np.zeros((len(classes), person.n_days), dtype=float)
         for k, c in enumerate(classes):
@@ -3548,11 +4111,20 @@ def fit_markov_pattern_mixture(
             var_by_class[k] = var_L
 
         l_mix = np.einsum("k,kt->t", resp, l_by_class)
+        # Law of total variance across mixture classes: within-class posterior
+        # variance plus between-class disagreement of the posterior means.
         second_moment = np.einsum("k,kt->t", resp, var_by_class + l_by_class**2)
         var_total = np.maximum(second_moment - l_mix**2, 1e-10)
         raw_sd = np.sqrt(var_total)
 
         pred = pd.DataFrame({"id": person.person_id, "t": days, "L_hat": l_mix})
+        # The classical comparator targets the composite severity, so both
+        # disorder channels inherit the composite estimate. It does NOT report a
+        # slow/fast decomposition: separating the RDoC-explained slow component
+        # from the residual requires the proxy and sparsity identification that
+        # is specific to BALL. Reporting a level/fast split here would not align
+        # with the data-generating slow/delta convention, so the decomposition
+        # and RDoC diagnostics are left not applicable for this comparator.
         pred["z_d_hat"] = l_mix
         pred["z_p_hat"] = l_mix
         pred_frames.append(pred)
@@ -3604,9 +4176,38 @@ def fit_markov_pattern_mixture(
     return MethodResult("markov_pattern_mixture", predictions, intervals, metadata=metadata)
 '''
 
-# simulations.src.methods.ball_ssm
+# --- simulations.src.methods.ball_ssm (simulations/src/methods/ball_ssm.py) ---
 SRC_SIMULATIONS_SRC_METHODS_BALL_SSM = r'''
-"""BALL deep state-space variational model."""
+"""BALL as written in the appendix: a deep state-space variational model.
+
+This is the literal implementation of Sec. 3-4 (no structural-smoother
+stand-in, no smoothness-penalty stand-in for the KL):
+
+* Generative model p_theta(u) with explicit neural drift functions
+  - alpha_{n+1} ~ N(alpha_n + f_theta(alpha_n, a_n), dt * Sigma_alpha)   (eq. 7)
+  - alpha_{n,d} carries the adaptive-Lasso prior (eq. 8), a per-(n,d) Laplace
+  - delta^.{n+1} ~ N(delta^.n + g_theta(delta^.n, x_EHR_n, a_n), dt * Sigma_delta)
+  - z^d_n = alpha_n . RDoC_n + delta^d_n ,  z^p_n = alpha_n . RDoC_n + delta^p_n
+  - anchors are recall-windowed means of z, observed via a Gaussian on the total
+    score or a graded-response IRT model.
+
+* Teacher q_psi(u | full record): a bidirectional transformer returning a
+  Gaussian over u_n at every session, trained by maximizing the ELBO
+      L = E_q[log p(y|u)] - KL(q_psi(u) || p_theta(u))
+  with the reparameterization trick. The KL is the actual KL to the dynamics
+  prior, evaluated by a single-sample Monte Carlo estimate of
+  log q(u) - log p(u) under the transition densities above.
+
+* Student q(u | past): the same backbone with a causal mask, trained by
+  distilling the teacher's per-session Gaussian posterior (a Gaussian KL whose
+  mean term is the spec's Mahalanobis distance to the teacher mean) plus direct
+  re-anchoring (eta times the anchor log-likelihood), per the spec student
+  objective L2 = ||mu - u_teacher||^2_{Sigma^-1} + eta * [-log p(y|u)].
+
+Sec. 5 is implemented as a deep ensemble with a diagonal last-layer Laplace
+approximation on the transformer's final mean head, followed by split conformal
+calibration in the pipeline wrapper.
+"""
 
 from __future__ import annotations
 
@@ -3642,37 +4243,62 @@ class SSMConfig:
     batch_size: int = 64
     learning_rate: float = 1e-3
     grad_clip_norm: float = 5.0
-    kl_warmup_epochs: int = 80
-    anchor_warmup_epochs: int = 120
+    kl_warmup_epochs: int = 80          # anneal the KL weight 0 -> 1 (beta-VAE warmup)
+    anchor_warmup_epochs: int = 120     # phase-1: anchor-only warmup sets latent scale/sign
+    # The calibrated (sparse) anchors are up-weighted in the ELBO to correct for
+    # the dense daily features being highly redundant (6 correlated groups, not
+    # 24 independent observations); without this the dense likelihood swamps the
+    # anchors and the optimizer drifts a channel's sign into a flipped basin.
     anchor_weight: float = 40.0
+    # Primary fits sum the evidence from every observed questionnaire.  The
+    # paired-session sensitivity divides the questionnaire contribution at a
+    # patient-session by the number of instruments administered there so that
+    # every observed session has total measurement weight one.
     anchor_session_balance: bool = False
-    ensemble_size: int = 5
-    delta_phi: float = 1.0
-    delta_drift_use_ehr: bool = True
-    delta_persistence_penalty: float = 0.0
-    delta_persistence_window: int = 14
-    alpha_proxy_anchor_weight: float = 0.0
-    use_alpha_slow: bool = True
+    ensemble_size: int = 5              # deep ensemble K (spec Sec. 5)
+    delta_phi: float = 1.0              # delta AR coefficient; 1.0 = spec random walk, <1 = mean-reverting
+    # Decomposition-pressure ablation knobs (validation step B). All default to the
+    # current model behavior, so the canonical fit is unchanged unless an arm sets them.
+    delta_drift_use_ehr: bool = True         # False drops EHR from g_theta (the delta-drift escape hatch)
+    delta_persistence_penalty: float = 0.0   # >0 penalizes low-frequency (persistent) power in delta
+    delta_persistence_window: int = 14       # window (days) for the persistence/anchor low-pass
+    alpha_proxy_anchor_weight: float = 0.0   # >0 anchors the slow component to the low-pass composite
+    use_alpha_slow: bool = True              # False: direct latent-drift model, no alpha'RDoC severity term
+    # Direct RDoC drift head for parameter-recovery scenarios. When enabled, a
+    # sparse linear B_t beta term is added to both delta-channel transition means.
     rdoc_drift_head: bool = False
     rdoc_drift_l1: float = 0.0
-    rdoc_drift_adaptive: bool = False
-    rdoc_drift_adaptive_gamma: float = 1.0
-    rdoc_drift_adaptive_eps: float = 1e-3
-    rdoc_drift_weights: tuple = ()
+    rdoc_drift_adaptive: bool = False         # adaptive-Lasso: penalize beta with fixed pilot-derived weights
+    rdoc_drift_adaptive_gamma: float = 1.0    # weight exponent gamma in w_j = 1/(|beta_pilot_j|+eps)^gamma
+    rdoc_drift_adaptive_eps: float = 1e-3     # stabilizer eps in the pilot weight formula
+    rdoc_drift_weights: tuple = ()            # FIXED per-coordinate weights from the pilot fit (empty = unit L1)
+    # Corrected student objective.  Teacher and student posteriors are compared
+    # on the anchored two-channel state rather than every internal variational
+    # coordinate.  The questionnaire coefficient is therefore defined on the
+    # event-averaged student objective and is selected separately from the
+    # teacher ELBO anchor weight.
     student_distill_weight: float = 1.0
     student_anchor_weight: float = 5.0
-    student_init_mode: str = "teacher"
+    student_init_mode: str = "teacher"          # teacher or random
     student_kl_direction: str = "teacher_to_student"
     student_covariance_jitter: float = 1e-6
     student_predictive_anchor: bool = True
+    # Deprecated aliases retained only so archived diagnostic calls fail
+    # gracefully.  New code uses the explicit student fields above.
     reanchor_weight: float | None = None
     teacher_matching_weight: float | None = None
-    encoder_use_rdoc: bool = True
+    encoder_use_rdoc: bool = True       # False keeps RDoC in the transition prior while removing it from q(Z|O)
+    # Adaptive-Lasso alpha rate for the neural ELBO. This is not numerically
+    # interchangeable with the structural posterior's xi because the VI loss
+    # sums the Laplace prior across every time point and latent dimension.
     alpha_lasso_xi: float = 2.0
     laplace_prior_precision: float = 1.0
     laplace_scale: float = 1.0
     max_individuals: int = 1000
     seed: int = 1729
+    # Operational controls. These fields do not change the statistical model.
+    # They make long fits observable and allow completed ensemble members to be
+    # reused after an interrupted process.
     progress_every_epochs: int = 10
     diagnostics_every_epochs: int = 5
     state_checkpoint_every_epochs: int = 10
@@ -3682,6 +4308,10 @@ class SSMConfig:
     resume_member_checkpoints: bool = False
     require_training_checkpoints: bool = False
     fast_two_by_two_kl: bool = True
+    # Optional convergence control for focused training-strategy comparisons.
+    # The primary manuscript fits retain their prespecified epoch counts unless
+    # this flag is enabled explicitly. When enabled, the causal estimator is
+    # selected using questionnaire events reserved in validation patients.
     convergence_selection: bool = False
     convergence_selection_every_epochs: int = 25
     convergence_min_epochs: int = 600
@@ -3693,32 +4323,39 @@ class SSMConfig:
     convergence_target_column: str = "measurement_selection"
 
 
+# ---------------------------------------------------------------------------
+# Data tensors (built directly from the simulation so f_theta / g_theta get the
+# action index and the structured-EHR signals they condition on).
+# ---------------------------------------------------------------------------
 @dataclass
 class SSMBatch:
     ids: list[int]
     t_values: np.ndarray
-    rdoc: torch.Tensor
-    ehr: torch.Tensor
-    x_raw: torch.Tensor
-    x_obs: torch.Tensor
-    enc_features: torch.Tensor
-    action: torch.Tensor
-    encoder_action: torch.Tensor
-    dt: torch.Tensor
-    valid: torch.Tensor
-    anchor_value: torch.Tensor
-    anchor_obs: torch.Tensor
-    anchor_total: torch.Tensor
-    anchor_items: torch.Tensor
-    anchor_channel: torch.Tensor
-    win_start: torch.Tensor
-    win_end: torch.Tensor
-    z_truth: torch.Tensor
+    rdoc: torch.Tensor            # (B, T, q)   observed RDoC proxy (model input + z = alpha'RDoC)
+    ehr: torch.Tensor            # (B, T, p)   structured-EHR daily features (g_theta input, imputed)
+    x_raw: torch.Tensor          # (B, T, p)   raw daily observations (likelihood targets; 0 where missing)
+    x_obs: torch.Tensor          # (B, T, p)   daily observation mask
+    enc_features: torch.Tensor   # (B, T, F)   full encoder input
+    action: torch.Tensor         # (B, T) current treatment, used only by the transition prior
+    encoder_action: torch.Tensor # (B, T) treatment known at the time of estimation
+    dt: torch.Tensor             # (B, T) elapsed days to the next modeled position
+    valid: torch.Tensor          # (B, T) true only for recorded, non-padding positions
+    anchor_value: torch.Tensor   # (B, T, M) one slot per questionnaire instrument
+    anchor_obs: torch.Tensor     # (B, T, M)
+    anchor_total: torch.Tensor   # (B, T, M) raw integer graded-response total (IRT); 0 if Gaussian
+    anchor_items: torch.Tensor   # (B, T, M, J) integer per-item graded responses (IRT); 0 if Gaussian
+    anchor_channel: torch.Tensor # (B, T, M) latent channel index for each instrument
+    win_start: torch.Tensor      # (B, T, M) long
+    win_end: torch.Tensor        # (B, T, M) long
+    z_truth: torch.Tensor        # (B, T, 2) z_d, z_p (eval only)
 
 
 def _impute(frame: pd.DataFrame, cols: list[str], *, causal: bool = False) -> np.ndarray:
     arr = frame[cols].astype(float)
     if causal:
+        # Forward-only students cannot borrow future RDoC/EHR observations to
+        # fill earlier missing sessions. Initial gaps have no past observation,
+        # so they fall back to zero rather than a full-record mean.
         arr = arr.ffill().fillna(0.0)
     else:
         arr = arr.interpolate(limit_direction="both").fillna(arr.mean()).fillna(0.0)
@@ -3850,11 +4487,14 @@ def build_ssm_batch(
             dt[row] = _raw_elapsed_days(ci["dt"])
         if "session_observed" in ci.columns:
             valid[row] = ci["session_observed"].fillna(False).astype(bool).to_numpy()
-        action[row] = (ci["a"].to_numpy(dtype=int) + 1)
-        encoder_action[row] = (
-            ci["encoder_a"].to_numpy(dtype=int) + 1
-            if "encoder_a" in ci.columns else action[row]
-        )
+        action[row] = (ci["a"].to_numpy(dtype=int) + 1)  # -1 (none) -> 0
+        if "encoder_a" in ci.columns:
+            encoder_action[row] = ci["encoder_a"].to_numpy(dtype=int) + 1
+        else:
+            # The initial session has no prior treatment. Preserve this timing
+            # contract for older/synthetic records lacking the explicit field.
+            encoder_action[row, 0] = 0
+            encoder_action[row, 1:] = action[row, :-1]
         z_truth[row, :, 0] = ci["z_d"].to_numpy(dtype=np.float32)
         z_truth[row, :, 1] = ci["z_p"].to_numpy(dtype=np.float32)
         ai = anc_by_id.get(pid)
@@ -3881,7 +4521,7 @@ def build_ssm_batch(
                         continue
                     anchor_items[row, k, instrument_position, :] = np.asarray(items, dtype=np.float32)
                     anchor_total[row, k, instrument_position] = float(total)
-                    anchor_value[row, k, instrument_position] = float(total)
+                    anchor_value[row, k, instrument_position] = float(total)   # finite encoder feature; likelihood uses items
                 else:
                     if not np.isfinite(arow.value):
                         continue
@@ -3893,6 +4533,10 @@ def build_ssm_batch(
                 win_start[row, k, instrument_position] = max(0, t_index.get(int(arow.window_start), 0))
                 win_end[row, k, instrument_position] = t_index.get(int(arow.window_end), k)
 
+    # Prospective encoders receive questionnaire events beginning at the next
+    # recorded session. The event likelihood remains at the true session, so a
+    # same-session questionnaire can supervise training without becoming an
+    # input to another questionnaire prediction from that encounter.
     if strict_prior_questionnaire_inputs is None:
         strict_prior_questionnaire_inputs = bool(causal_impute)
     encoder_anchor_value = anchor_value.copy()
@@ -3903,6 +4547,9 @@ def build_ssm_batch(
         encoder_anchor_value[:, 0, :] = 0.0
         encoder_anchor_obs[:, 0, :] = 0.0
 
+    # Encoder features: standardized [EHR | EHR availability masks | RDoC |
+    # strictly prior anchor value*obs | strictly prior obs flags] +
+    # the action is added as a learned embedding inside the encoder.
     encoder_rdoc = rdoc if include_rdoc_in_encoder else np.zeros_like(rdoc)
     raw = np.concatenate(
         [ehr, x_input, encoder_rdoc, encoder_anchor_value * encoder_anchor_obs, encoder_anchor_obs],
@@ -3921,6 +4568,9 @@ def build_ssm_batch(
         feature_stats = (mean.astype(np.float32), std.astype(np.float32))
     mean, std = feature_stats
     enc = raw.astype(np.float32) if no_encoder_scaling else ((raw - mean) / std).astype(np.float32)
+    # Some empirical covariates are deliberately represented as raw continuous
+    # counts. Preserve those declared daily columns exactly in the encoder rather
+    # than silently standardizing them with a cohort-derived denominator.
     unscaled_daily = data.metadata.get("encoder_unscaled_daily_indices", [])
     for col_idx in unscaled_daily:
         col_idx = int(col_idx)
@@ -3955,6 +4605,10 @@ def build_ssm_batch(
     return batch, feature_stats
 
 
+# ---------------------------------------------------------------------------
+# Generative model parameters: f_theta, g_theta, diffusion scales, Lasso rate,
+# observation noise.  (theta in the appendix.)
+# ---------------------------------------------------------------------------
 def _gap_transition_factors(
     dt_step: torch.Tensor,
     phi: float,
@@ -3989,11 +4643,16 @@ class GenerativeModel(nn.Module):
         self.irt_n_items = int(irt_n_items)
         self.irt_n_categories = max(int(irt_n_categories), 2)
         self.action_embed = nn.Embedding(n_actions, config.action_embed_dim)
+        # f_theta(alpha_n, a_n) -> drift on the q-dim loading
         self.f_theta = nn.Sequential(
             nn.Linear(q + config.action_embed_dim, config.drift_hidden),
             nn.Tanh(),
             nn.Linear(config.drift_hidden, q),
         )
+        # g_theta(delta, [x_EHR], a) -> scalar drift, applied per channel (shared).
+        # delta_drift_use_ehr=False drops the EHR input: the EHR-conditioned drift is
+        # the path by which a flexible delta re-creates persistence from the covariates
+        # and absorbs the slow signal (validation step B arm).
         self.delta_drift_use_ehr = bool(getattr(config, "delta_drift_use_ehr", True))
         g_in = 1 + config.action_embed_dim + (ehr_dim if self.delta_drift_use_ehr else 0)
         self.g_theta = nn.Sequential(
@@ -4001,42 +4660,78 @@ class GenerativeModel(nn.Module):
             nn.Tanh(),
             nn.Linear(config.drift_hidden, 1),
         )
+        # Daily EHR observation head: the dense daily features X are noisy
+        # correlates of the latent (notes, vitals, fills correlated with the
+        # PHQ/PCL latent), modeled as a learnable linear-Gaussian readout of the
+        # severity components. The model learns which features load on the latent
+        # and which are uninformative (near-zero loading, absorbed as noise).
+        # Readout from the independent latent coordinates [slow, delta_d, delta_p]
+        # (z_d, z_p are linear combos of these; feeding them too would be
+        # rank-deficient and induces channel sign-mixing). The delta coordinates
+        # are ALSO provided within-person centered: the DGP fast-residual
+        # proxies (X12-X15) track the zero-level dynamic residual while the
+        # per-patient level lives inside delta, and a global readout bias cannot
+        # absorb per-person levels. Without the centered coordinates the
+        # level-free targets pull delta toward zero level and push the person
+        # level into the slow component (the same level mis-assignment fixed in
+        # the structural posterior on 2026-06-10). Centered and uncentered
+        # deltas differ by a per-person constant, so across a batch they are not
+        # collinear and the readout learns which convention fits each feature.
         self.daily_readout = nn.Linear(5, ehr_dim)
         self.log_sigma_x = nn.Parameter(torch.full((ehr_dim,), math.log(0.6)))
+        # Per-day diffusion log-sds.
         self.log_sigma_alpha = nn.Parameter(torch.full((q,), math.log(0.05)))
         self.log_sigma_delta = nn.Parameter(torch.full((2,), math.log(0.35)))
-        self.delta_phi = float(getattr(config, "delta_phi", 1.0))
+        self.delta_phi = float(getattr(config, "delta_phi", 1.0))  # delta AR coef (1=random walk)
         self.rdoc_drift_head = bool(getattr(config, "rdoc_drift_head", False))
         self.rdoc_drift_l1 = float(getattr(config, "rdoc_drift_l1", 0.0))
         self.rdoc_drift_adaptive = bool(getattr(config, "rdoc_drift_adaptive", False))
         self.rdoc_drift_adaptive_gamma = float(getattr(config, "rdoc_drift_adaptive_gamma", 1.0))
         self.rdoc_drift_adaptive_eps = float(getattr(config, "rdoc_drift_adaptive_eps", 1e-3))
         self.rdoc_drift_beta = nn.Parameter(torch.zeros(q))
+        # FIXED adaptive-Lasso weights (a buffer, not a parameter: never updated by
+        # the optimizer). Empty config -> unit weights, which reduce the adaptive
+        # penalty to plain L1. Populated by the two-stage pilot in the benchmark.
         _drift_w = tuple(getattr(config, "rdoc_drift_weights", ()) or ())
         if len(_drift_w) == q:
             self.register_buffer("rdoc_drift_weights", torch.tensor(_drift_w, dtype=torch.float32))
         else:
             self.register_buffer("rdoc_drift_weights", torch.ones(q))
+        # Adaptive-Lasso rate xi is a hyperparameter (eq. 8), fixed: making it
+        # learnable lets the model inflate log p via the log(xi/2) normalizer and
+        # drive the KL negative.
         self.register_buffer("log_xi", torch.tensor(math.log(max(float(config.alpha_lasso_xi), 1e-8))))
+        # Observation noise is a known property of the instrument (PHQ/PCL), so it
+        # is fixed rather than learned (a learnable obs sd collapses by inflating
+        # to explain the anchors away as noise).
         if not (len(obs_sd) == len(loadings) == len(intercepts) == len(anchor_channels)):
             raise ValueError("The questionnaire measurement specification has inconsistent lengths.")
         self.register_buffer("log_sigma_obs", torch.log(torch.tensor(obs_sd, dtype=torch.float32)))
+        # Anchor loadings beta_k (Y1, Y2): the anchor measures beta_k * windowed
+        # mean of the latent, so the likelihood compares against beta_k * zbar.
         self.register_buffer("anchor_loadings", torch.tensor(loadings, dtype=torch.float32))
         self.register_buffer("anchor_intercepts", torch.tensor(intercepts, dtype=torch.float32))
         self.register_buffer("anchor_channels", torch.tensor(anchor_channels, dtype=torch.long))
+        # Graded-response IRT observation (calibrated-instrument sensitivity). The
+        # per-item discriminations and ordered thresholds and the affine trait map are
+        # FIXED buffers from the frozen calibration (validation/irt_calibration.json),
+        # not learned. Fixing the instrument is what identifies the latent scale, and
+        # the same constants are shared with the S0 and Markov comparators. The integer
+        # responses enter through the EXACT per-item graded-response likelihood.
         if self.anchor_observation == "irt":
             if not len(irt_item_disc) or not len(irt_item_thresholds):
                 raise ValueError("anchor_observation='irt' requires a frozen calibration (irt_item_disc/thresholds)")
-            self.register_buffer("irt_item_disc", torch.tensor(irt_item_disc, dtype=torch.float32))
-            self.register_buffer("irt_item_thresholds", torch.tensor(irt_item_thresholds, dtype=torch.float32))
+            self.register_buffer("irt_item_disc", torch.tensor(irt_item_disc, dtype=torch.float32))            # (J,)
+            self.register_buffer("irt_item_thresholds", torch.tensor(irt_item_thresholds, dtype=torch.float32))  # (J, K-1)
             self.register_buffer("irt_loc", torch.tensor(float(irt_loc), dtype=torch.float32))
             self.register_buffer("irt_scale", torch.tensor(float(irt_scale) or 1.0, dtype=torch.float32))
-        self.log_sigma0 = nn.Parameter(torch.tensor(math.log(1.5)))
+        self.log_sigma0 = nn.Parameter(torch.tensor(math.log(1.5)))       # prior sd at n=1
 
     def drift_alpha(self, alpha: torch.Tensor, a_emb: torch.Tensor) -> torch.Tensor:
         return self.f_theta(torch.cat([alpha, a_emb], dim=-1))
 
     def drift_delta(self, delta_channel: torch.Tensor, ehr: torch.Tensor, a_emb: torch.Tensor) -> torch.Tensor:
+        # delta_channel: (B,T); ehr: (B,T,p); a_emb: (B,T,e) -> (B,T)
         parts = [delta_channel.unsqueeze(-1)]
         if self.delta_drift_use_ehr:
             parts.append(ehr)
@@ -4051,14 +4746,18 @@ class GenerativeModel(nn.Module):
     def log_prior(self, alpha, delta_d, delta_p, batch: SSMBatch) -> torch.Tensor:
         """log p_theta(u) for sampled trajectories. Returns (B,) summed over n,dims."""
 
-        a_emb = self.action_embed(batch.action)
+        a_emb = self.action_embed(batch.action)           # (B,T,e)
         dt = batch.dt
+        # Floor the diffusion sds so the learned prior cannot collapse to a
+        # near-deterministic fit of the posterior (which would drive the KL to
+        # zero/negative and remove all regularization).
         floor = math.log(0.03)
-        sig_a2 = (self.log_sigma_alpha.clamp(min=floor).exp() ** 2).view(1, 1, -1)
+        sig_a2 = (self.log_sigma_alpha.clamp(min=floor).exp() ** 2).view(1, 1, -1)   # (1,1,q)
         sig_d2 = (self.log_sigma_delta.clamp(min=floor).exp() ** 2).view(1, 1, 2)
         sigma0_2 = self.log_sigma0.exp() ** 2
         valid = batch.valid.bool()
 
+        # n = 1 prior: N(0, sigma0^2) for alpha and delta.
         def gauss_lp(x, mean, var):
             return -0.5 * (LOG_2PI + torch.log(var) + (x - mean) ** 2 / var)
 
@@ -4067,12 +4766,22 @@ class GenerativeModel(nn.Module):
         lp = lp + gauss_lp(delta_d[:, 0], torch.zeros_like(delta_d[:, 0]), sigma0_2) * valid0
         lp = lp + gauss_lp(delta_p[:, 0], torch.zeros_like(delta_p[:, 0]), sigma0_2) * valid0
 
-        f = self.drift_alpha(alpha[:, :-1, :], a_emb[:, :-1, :])
+        # Transitions n>=2. Drift is parameterized per calendar day. For the
+        # slow random-walk coordinate, both mean drift and diffusion accumulate
+        # over the observed gap. For the fast AR(1) coordinates, phi**dt gives
+        # gap-coherent persistence and the geometric sums give the corresponding
+        # accumulated drift and innovation variance. Thus a one-day and a
+        # multi-day gap cannot have the same expected transition.
+        f = self.drift_alpha(alpha[:, :-1, :], a_emb[:, :-1, :])             # (B,T-1,q)
         dt_step = dt[:, :-1]
         gd = self.drift_delta(delta_d[:, :-1], batch.ehr[:, :-1, :], a_emb[:, :-1, :])
         gp = self.drift_delta(delta_p[:, :-1], batch.ehr[:, :-1, :], a_emb[:, :-1, :])
         bd = self.direct_rdoc_drift(batch.rdoc[:, :-1, :])
         positive_gap = dt_step > 0
+        # Exact zero-day pairs remain zero in the tensor. Because the extract
+        # has dates but no reliable within-day ordering, they contribute no
+        # dynamic transition likelihood rather than being assigned an invented
+        # positive interval.
         transition_valid = (
             valid[:, :-1] & valid[:, 1:] & positive_gap
         ).to(alpha.dtype)
@@ -4091,15 +4800,22 @@ class GenerativeModel(nn.Module):
         lp = lp + (gauss_lp(delta_d[:, 1:], mean_d, var_d) * transition_valid).sum(1)
         lp = lp + (gauss_lp(delta_p[:, 1:], mean_p, var_p) * transition_valid).sum(1)
 
+        # Adaptive-Lasso prior on each alpha_{n,d} (eq. 8): marginalizing tau gives
+        # a Laplace(0, 1/xi); log p = log(xi/2) - xi|alpha|.
         xi = self.log_xi.exp()
         alpha_lasso_lp = (torch.log(xi / 2.0) - xi * alpha.abs()).sum(-1)
         lp = lp + (alpha_lasso_lp * valid.to(alpha.dtype)).sum(1)
         return lp
 
     def anchor_log_lik(self, z_d, z_p, batch: SSMBatch) -> torch.Tensor:
-        """Anchor observation log-likelihood, summed per patient (B,)."""
+        """Anchor observation log-likelihood, summed per patient (B,).
 
-        sig2 = (self.log_sigma_obs.exp() ** 2)
+        Gaussian: N(value | loading * windowed-latent, sigma^2). IRT: the exact
+        per-item graded-response likelihood through the fixed calibrated instrument
+        (see _irt_channel_log_lik), with the latent mapped to the calibrated trait scale.
+        """
+
+        sig2 = (self.log_sigma_obs.exp() ** 2)   # (M,)
         z = [z_d, z_p]
         B, T = z_d.shape
         device = z_d.device
@@ -4109,12 +4825,12 @@ class GenerativeModel(nn.Module):
         )
         for instrument in range(batch.anchor_obs.shape[-1]):
             channel = int(self.anchor_channels[instrument].item())
-            obs = batch.anchor_obs[:, :, instrument] > 0.5
-            starts = batch.win_start[:, :, instrument].unsqueeze(-1)
+            obs = batch.anchor_obs[:, :, instrument] > 0.5         # (B,T)
+            starts = batch.win_start[:, :, instrument].unsqueeze(-1)   # (B,T,1)
             ends = batch.win_end[:, :, instrument].unsqueeze(-1)
-            win = ((arange >= starts) & (arange <= ends)).float()
+            win = ((arange >= starts) & (arange <= ends)).float()   # (B,T,T)
             win = win / win.sum(-1, keepdim=True).clamp(min=1.0)
-            zbar = torch.einsum("bts,bs->bt", win, z[channel])
+            zbar = torch.einsum("bts,bs->bt", win, z[channel])          # (B,T) windowed mean
             if self.anchor_observation == "irt":
                 lp = self._irt_channel_log_lik(zbar, batch.anchor_items[:, :, instrument, :])
             else:
@@ -4135,7 +4851,16 @@ class GenerativeModel(nn.Module):
         state_covariance: torch.Tensor,
         batch: SSMBatch,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return predictive questionnaire NLL sum and effective event count."""
+        """Return predictive questionnaire NLL sum and effective event count.
+
+        ``state_mean`` has shape (B,T,2), and ``state_covariance`` has shape
+        (B,T,2,2).  Recall-window variance uses the manuscript's explicit
+        marginal-independence approximation across recorded sessions.  Each
+        Gaussian total score is one event.  For the item-response sensitivity,
+        item log likelihoods are averaged within an event before events are
+        averaged, so instruments with more items do not receive more student
+        re-anchoring weight solely because of their length.
+        """
 
         if state_mean.ndim != 3 or state_mean.shape[-1] != 2:
             raise ValueError("Anchored state means must have shape (B,T,2).")
@@ -4198,7 +4923,12 @@ class GenerativeModel(nn.Module):
         items_obs: torch.Tensor,
         quadrature_points: int = 15,
     ) -> torch.Tensor:
-        """Posterior-predictive graded-response log likelihood per event."""
+        """Posterior-predictive graded-response log likelihood per event.
+
+        Gauss-Hermite quadrature integrates each observed category probability
+        over the Gaussian recall-windowed student trait.  The returned value is
+        the mean item log likelihood within each questionnaire event.
+        """
 
         nodes_np, weights_np = np.polynomial.hermite.hermgauss(int(quadrature_points))
         nodes = torch.as_tensor(nodes_np, dtype=zbar_mean.dtype, device=zbar_mean.device)
@@ -4231,33 +4961,51 @@ class GenerativeModel(nn.Module):
         return torch.log(predictive_probability).mean(-1)
 
     def _irt_channel_log_lik(self, zbar: torch.Tensor, items_obs: torch.Tensor) -> torch.Tensor:
-        """Exact per-item graded-response log-likelihood for one anchor channel."""
+        """Exact per-item graded-response log-likelihood for one anchor channel.
 
-        trait = (zbar - self.irt_loc) / self.irt_scale
-        a = self.irt_item_disc.view(1, 1, -1, 1)
-        b = self.irt_item_thresholds.unsqueeze(0).unsqueeze(0)
-        pstar = torch.sigmoid(a * (trait[..., None, None] - b))
+        The windowed latent zbar (B,T) is mapped to the calibrated trait scale,
+        trait = (zbar - loc) / scale, and each item's category probability is
+        P(item_j = c | trait) = sigma(a_j (trait - b_{j,c})) - sigma(a_j (trait - b_{j,c+1})),
+        with the fixed calibrated discriminations a_j and ordered thresholds b_{j,.}.
+        The observed integer responses are scored exactly; the result is summed over
+        the J items (B,T). items_obs is (B,T,J) and is masked by anchor_obs upstream.
+        """
+
+        trait = (zbar - self.irt_loc) / self.irt_scale                  # (B,T)
+        a = self.irt_item_disc.view(1, 1, -1, 1)                        # (1,1,J,1)
+        b = self.irt_item_thresholds.unsqueeze(0).unsqueeze(0)          # (1,1,J,K-1)
+        pstar = torch.sigmoid(a * (trait[..., None, None] - b))         # (B,T,J,K-1) = P(>=k)
         ones = torch.ones_like(pstar[..., :1])
         zeros = torch.zeros_like(pstar[..., :1])
-        pad = torch.cat([ones, pstar, zeros], dim=-1)
-        probs = (pad[..., :-1] - pad[..., 1:]).clamp(min=1e-9)
-        idx = items_obs.long().clamp(0, probs.shape[-1] - 1).unsqueeze(-1)
-        p_resp = probs.gather(-1, idx).squeeze(-1)
-        return torch.log(p_resp).sum(-1)
+        pad = torch.cat([ones, pstar, zeros], dim=-1)                  # (B,T,J,K+1)
+        probs = (pad[..., :-1] - pad[..., 1:]).clamp(min=1e-9)         # (B,T,J,K) = P(=c)
+        idx = items_obs.long().clamp(0, probs.shape[-1] - 1).unsqueeze(-1)   # (B,T,J,1)
+        p_resp = probs.gather(-1, idx).squeeze(-1)                     # (B,T,J)
+        return torch.log(p_resp).sum(-1)                              # (B,T)
 
     def daily_log_lik(self, slow, delta_d, delta_p, batch: SSMBatch) -> torch.Tensor:
-        """Dense daily-EHR observation log-likelihood, masked by missingness (B,)."""
+        """Dense daily-EHR observation log-likelihood, masked by missingness (B,).
+
+        The daily features are noisy correlates of the latent; this is what pins
+        the daily trajectory between the sparse anchors. Modeled as a linear
+        readout of the independent latent coordinates [slow, delta_d, delta_p].
+        """
 
         dd_c = delta_d - delta_d.mean(dim=1, keepdim=True)
         dp_c = delta_p - delta_p.mean(dim=1, keepdim=True)
-        feat = torch.stack([slow, delta_d, delta_p, dd_c, dp_c], dim=-1)
-        pred = self.daily_readout(feat)
+        feat = torch.stack([slow, delta_d, delta_p, dd_c, dp_c], dim=-1)  # (B,T,5)
+        pred = self.daily_readout(feat)                                   # (B,T,p)
+        # Floor the daily observation noise so the dense features cannot be
+        # over-trusted and swamp the calibrated (but sparse) anchors.
         sig2 = (self.log_sigma_x.clamp(min=math.log(0.4)).exp() ** 2).view(1, 1, -1)
         resid2 = (batch.x_raw - pred) ** 2
         lp = -0.5 * (LOG_2PI + torch.log(sig2) + resid2 / sig2)
         return (lp * batch.x_obs).sum(dim=(1, 2))
 
 
+# ---------------------------------------------------------------------------
+# Inference network q_psi (teacher: bidirectional; student: causal).
+# ---------------------------------------------------------------------------
 class InferenceTransformer(nn.Module):
     def __init__(self, feature_dim: int, q: int, max_t: int, config: SSMConfig,
                  action_embed: nn.Embedding, causal: bool) -> None:
@@ -4315,6 +5063,7 @@ def _slow_from_alpha(alpha: torch.Tensor, rdoc: torch.Tensor, config: SSMConfig)
 
 
 def _gaussian_entropy(logvar: torch.Tensor) -> torch.Tensor:
+    # H(q) summed over dims, per patient (B,)
     return 0.5 * (LOG_2PI + 1.0 + logvar).sum(dim=(1, 2))
 
 
@@ -4330,16 +5079,23 @@ def _causal_rolling_mean(x: torch.Tensor, window: int) -> torch.Tensor:
 
 
 def _decomposition_pressure(slow, dd, dp, config: SSMConfig) -> torch.Tensor:
-    """Validation step B: optional penalties that push persistent signal out of the."""
+    """Validation step B: optional penalties that push persistent signal out of the
+    fast residual delta and into the proxy-explained slow component alpha'RDoC.
+
+    Returns a scalar penalty, zero unless an arm enables a knob.
+    """
     w = int(getattr(config, "delta_persistence_window", 14))
     pressure = slow.new_zeros(())
     pw = float(getattr(config, "delta_persistence_penalty", 0.0))
     if pw > 0.0:
+        # A fast residual should carry little content slower than the recall window.
         pressure = pressure + pw * (
             _causal_rolling_mean(dd, w) ** 2 + _causal_rolling_mean(dp, w) ** 2
         ).mean()
     aw = float(getattr(config, "alpha_proxy_anchor_weight", 0.0))
     if aw > 0.0:
+        # Anchor the slow component to the low-pass of the composite latent, so the
+        # persistent part of severity is carried by alpha'RDoC rather than delta.
         z_avg = slow + 0.5 * (dd + dp)
         pressure = pressure + aw * ((_causal_rolling_mean(z_avg, w) - slow) ** 2).mean()
     return pressure
@@ -4353,10 +5109,16 @@ def _rdoc_drift_penalty(gen: GenerativeModel) -> torch.Tensor:
         return gen.rdoc_drift_beta.new_zeros(())
     beta = gen.rdoc_drift_beta
     if getattr(gen, "rdoc_drift_adaptive", False):
+        # Adaptive Lasso (Zou 2006): FIXED per-coordinate weights derived from an
+        # unpenalized pilot fit (set on the model as rdoc_drift_weights), so the
+        # penalized objective is not path-dependent. Plain L1 is the unit-weight case.
         return weight * (gen.rdoc_drift_weights * beta.abs()).sum()
     return weight * beta.abs().sum()
 
 
+# ---------------------------------------------------------------------------
+# Production fit / predict / deep ensemble for the literal BALL SSM.
+# ---------------------------------------------------------------------------
 import dataclasses as _dataclasses
 
 _B_FIELDS = [
@@ -4394,7 +5156,7 @@ def _checkpoint_root(config: SSMConfig, *, label: str | None = None) -> Path | N
 
 
 def _validate_training_artifact_contract(config: SSMConfig) -> None:
-    """Validate restart metadata for large training runs."""
+    """Require a unique restart namespace for publication-scale fits."""
 
     if bool(getattr(config, "convergence_selection", False)):
         positive_integer_fields = (
@@ -4435,7 +5197,7 @@ def _validate_training_artifact_contract(config: SSMConfig) -> None:
 
 
 def _replace_checkpoint_file(temporary: Path, destination: Path) -> None:
-    """Replace a checkpoint despite brief file locks."""
+    """Replace a checkpoint despite brief Dropbox or antivirus file locks."""
 
     last_error = None
     for attempt in range(40):
@@ -4941,6 +5703,8 @@ def _save_training_state(
                 f"checkpoint pointer for {role} seed={seed} could not be refreshed "
                 f"({error!r}); immutable checkpoint {version_path.name} is intact"
             )
+    # Retain the newest two immutable generations. A file that Dropbox is
+    # momentarily syncing is left in place and can be cleaned on a later save.
     for obsolete in _training_state_versions(config, role, seed)[2:]:
         try:
             obsolete.unlink()
@@ -4966,6 +5730,8 @@ def _load_training_state(config: SSMConfig, role: str, seed: int) -> dict | None
         except (OSError, json.JSONDecodeError):
             pass
     candidates.extend(_training_state_versions(config, role, seed))
+    # Legacy and rotating checkpoint names remain readable so interrupted runs
+    # created by the previous operational implementation can still resume.
     candidates.extend(
         [path, path.with_name(path.stem + ".previous" + path.suffix)]
     )
@@ -5119,7 +5885,14 @@ def _prepare_questionnaire_selection_targets(
     batch: SSMBatch,
     target_column: str,
 ) -> list[dict[str, object]]:
-    """Compile questionnaire events reserved for causal model selection."""
+    """Compile questionnaire events reserved for causal model selection.
+
+    The target values remain outside ``build_ssm_batch`` because the benchmark
+    marks them unobserved before any model input is constructed. This helper
+    reads those values only for validation scoring and maps every event to its
+    patient, recall-window positions, latent channel and frozen measurement
+    parameters.
+    """
 
     if not target_column or target_column not in data.anchors.columns:
         return []
@@ -5318,6 +6091,8 @@ def _update_selection_control(
 
 def _subbatch(batch: SSMBatch, idx: torch.Tensor) -> SSMBatch:
     kw = {f: getattr(batch, f)[idx] for f in _B_FIELDS}
+    # Training losses never use patient identifiers. Keeping this list empty
+    # avoids synchronizing a CUDA index tensor back to the CPU for every batch.
     kw["ids"] = []
     kw["t_values"] = batch.t_values
     return _dataclasses.replace(batch, **kw)
@@ -5363,7 +6138,10 @@ def _train_one_ssm(data: SimulationData, train_batch: SSMBatch, config: SSMConfi
                    device: torch.device, causal: bool, seed: int,
                    selection_batch: SSMBatch | None = None,
                    selection_targets: list[dict[str, object]] | None = None):
-    """Train a single ELBO model with the anchor-warmup + anchor-upweighted."""
+    """Train a single ELBO model with the anchor-warmup + anchor-upweighted
+    curriculum validated to recover both channels. Used for the bidirectional
+    teacher; the deployable causal student is produced by
+    `_train_student_distilled`, not by re-running this with a causal mask."""
 
     torch.manual_seed(seed)
     if device.type == "cuda":
@@ -5395,6 +6173,11 @@ def _train_one_ssm(data: SimulationData, train_batch: SSMBatch, config: SSMConfi
         f"({config.anchor_warmup_epochs} epochs)"
     )
 
+    # Phase 1: daily-free anchor ELBO so the calibrated sparse anchors set the
+    # latent scale and sign before the dense daily likelihood can lock a flipped
+    # basin. It is a reparameterized sample with the KL term (not the posterior
+    # mean), so the variational variance head is trained from the start rather
+    # than entering Phase 2 untrained.
     opt1 = torch.optim.Adam(params, lr=2e-3)
     warmup_start = 0
     if resume_phase == "anchor_warmup":
@@ -5480,6 +6263,12 @@ def _train_one_ssm(data: SimulationData, train_batch: SSMBatch, config: SSMConfi
                 f"{ep + 1}/{config.anchor_warmup_epochs}, loss={loss_value:.6f}"
             )
 
+    # Phase 2: full ELBO (anchor up-weighted) minibatched with KL annealing.
+    # The KL weight deliberately re-anneals from zero here (a second warm
+    # restart): the dense daily likelihood switches on at this phase boundary
+    # and re-shapes the posterior, so the dynamics prior is reintroduced
+    # gradually against the new reconstruction term rather than fighting it at
+    # full strength from the first step.
     opt2 = torch.optim.Adam(params, lr=config.learning_rate)
     teacher_start = 0
     if resume_phase == "teacher_elbo":
@@ -5743,6 +6532,9 @@ def _anchored_gaussian_kl(
     approximation_covariance = approximation_covariance + jitter_value * identity
     difference = (approximation_mean - source_mean).unsqueeze(-1)
     if fast_two_by_two:
+        # Closed-form two-by-two inverse and determinant. This is the same
+        # Gaussian KL as the general solve below, but it avoids launching many
+        # tiny linear-algebra kernels for every patient-session position.
         a00 = approximation_covariance[..., 0, 0]
         a01 = approximation_covariance[..., 0, 1]
         a10 = approximation_covariance[..., 1, 0]
@@ -5837,7 +6629,13 @@ def _train_student_distilled(data: SimulationData, teacher_train_batch: SSMBatch
                              teacher_net: InferenceTransformer, seed: int,
                              selection_batch: SSMBatch | None = None,
                              selection_targets: list[dict[str, object]] | None = None):
-    """Distill the anchored depression-anxiety posterior into a causal student."""
+    """Distill the anchored depression-anxiety posterior into a causal student.
+
+    The primary objective averages KL(q_teacher || q_student) over valid
+    patient-session positions and averages posterior-predictive questionnaire
+    negative log likelihood over observed patient-session-instrument events.
+    Only the causal inference encoder is updated.
+    """
 
     torch.manual_seed(seed)
     if device.type == "cuda":
@@ -6298,7 +7096,13 @@ def _last_layer_laplace_variance(
     eval_batch: SSMBatch,
     config: SSMConfig,
 ) -> torch.Tensor:
-    """Diagonal last-layer Laplace variance for the final mean head."""
+    """Diagonal last-layer Laplace variance for the final mean head.
+
+    This is the lightweight Sec. 5 uncertainty layer: freeze the transformer
+    feature extractor, approximate the final linear head posterior with a
+    diagonal Gaussian precision prior + feature Gram diagonal, and propagate the
+    resulting parameter variance to every latent output coordinate.
+    """
 
     with torch.no_grad():
         h_train_all = net.encode(train_batch)
@@ -6321,7 +7125,11 @@ def _member_predict(
     laplace_train_batch: SSMBatch | None = None,
     config: SSMConfig | None = None,
 ):
-    """Per-session posterior means and variances for one ensemble member."""
+    """Per-session posterior means and variances for one ensemble member.
+
+    Returns dict of (B,T) arrays for z_d, z_p, slow, delta_d, delta_p and their
+    posterior variances (var_zd, var_zp, var_L), plus per-dim alpha means.
+    """
 
     net.eval()
     with torch.no_grad():
@@ -6336,8 +7144,11 @@ def _member_predict(
         cfg = config or SSMConfig()
         rdoc = batch.rdoc
         slow = _slow_from_alpha(a, rdoc, cfg)
+        # When the slow alpha'RDoC term is disabled (direct-RDoC mode) it adds
+        # nothing to severity, so its posterior variance must be zero too;
+        # otherwise the raw interval width/coverage inflate spuriously.
         if getattr(cfg, "use_alpha_slow", True):
-            var_slow = (rdoc ** 2 * var[..., :q]).sum(-1)
+            var_slow = (rdoc ** 2 * var[..., :q]).sum(-1)        # Var(alpha'RDoC), diag
             lap_slow = (rdoc ** 2 * laplace_var[..., :q]).sum(-1)
         else:
             var_slow = torch.zeros_like(var[..., q])
@@ -6352,6 +7163,7 @@ def _member_predict(
         var_zp = var_slow + var_dp
         lap_var_zd = lap_slow + lap_dd
         lap_var_zp = lap_slow + lap_dp
+        # Cov(z_d, z_p) = Var(slow) (shared slow); Var(L) for L = 0.5(z_d+z_p).
         var_L = 0.25 * (var_zd + var_zp + 2.0 * var_slow)
         lap_var_L = 0.25 * (lap_var_zd + lap_var_zp + 2.0 * lap_slow)
     f = lambda x: x.cpu().numpy()
@@ -6365,10 +7177,15 @@ def _member_predict(
 
 
 def _assemble_ssm_ensemble(members, output_batch, q, method_name, metadata):
-    """Combine ensemble member predictions into a MethodResult."""
+    """Combine ensemble member predictions into a MethodResult.
+
+    Deep-ensemble law of total variance: total var = mean_k(member var) +
+    var_k(member mean) [aleatoric + epistemic]. Shared by the causal student
+    ensemble and the bidirectional teacher ensemble.
+    """
 
     def _combine(key_mean, key_var):
-        means = np.stack([m[key_mean] for m in members], axis=0)
+        means = np.stack([m[key_mean] for m in members], axis=0)   # (K,B,T)
         variances = np.stack([m[key_var] for m in members], axis=0)
         mean = means.mean(0)
         total_var = variances.mean(0) + means.var(0)
@@ -6389,6 +7206,7 @@ def _assemble_ssm_ensemble(members, output_batch, q, method_name, metadata):
     z_d_mean, z_d_sd = _combine("z_d", "var_zd")
     z_p_mean, z_p_sd = _combine("z_p", "var_zp")
     L_mean = 0.5 * (z_d_mean + z_p_mean)
+    # L total var from member L variances + between-member L-mean disagreement.
     L_means = np.stack([0.5 * (m["z_d"] + m["z_p"]) for m in members], axis=0)
     L_vars = np.stack([m["var_L"] for m in members], axis=0)
     L_sd = np.sqrt(np.clip(L_vars.mean(0) + L_means.var(0), 1e-10, None))
@@ -6398,7 +7216,7 @@ def _assemble_ssm_ensemble(members, output_batch, q, method_name, metadata):
     slow_mean = np.stack([m["slow"] for m in members], axis=0).mean(0)
     dd_mean = np.stack([m["dd"] for m in members], axis=0).mean(0)
     dp_mean = np.stack([m["dp"] for m in members], axis=0).mean(0)
-    alpha_mean = np.stack([m["alpha"] for m in members], axis=0).mean(0)
+    alpha_mean = np.stack([m["alpha"] for m in members], axis=0).mean(0)   # (B,T,q)
     beta_members = np.stack([m["rdoc_drift_beta"] for m in members], axis=0)
     metadata = dict(metadata)
     metadata["rdoc_drift_beta_hat"] = beta_members.mean(axis=0).tolist()
@@ -6473,7 +7291,19 @@ def fit_ball_ssm(
     prediction_split: str = "test",
     return_teacher: bool = False,
 ) -> "MethodResult | tuple[MethodResult, MethodResult]":
-    """Fit the literal BALL deep state-space VI as a deep ensemble and return."""
+    """Fit the literal BALL deep state-space VI as a deep ensemble and return
+    predictions + raw posterior intervals (law-of-total-variance combined).
+
+    causal=False is the bidirectional ELBO teacher; causal=True trains a
+    bidirectional teacher per member and then distills its anchored two-channel
+    posterior into a forward-only student using teacher-to-student Gaussian KL
+    and posterior-predictive questionnaire re-anchoring.
+
+    When causal=True and return_teacher=True, the bidirectional teacher ensemble
+    the students distil from is ALSO evaluated and returned as a second
+    MethodResult (the primary smoother), at no extra training cost since those
+    teachers are already trained for distillation.
+    """
 
     config = config or SSMConfig()
     _validate_training_artifact_contract(config)
@@ -6605,6 +7435,8 @@ def fit_ball_ssm(
             loss_history.append(rec)
         if causal:
             if return_teacher:
+                # Evaluate the bidirectional teacher (no extra training): it is the
+                # primary smoother the student distils from.
                 teacher_prediction = _member_predict(
                     gen, teacher_net, eval_batch, q,
                     laplace_train_batch=train_batch, config=config,
@@ -6682,6 +7514,9 @@ def fit_ball_ssm(
                 ),
             },
         )
+        # Release this member's GPU tensors before the next member trains, so
+        # the deep ensemble does not accumulate device memory across members
+        # (the empirical full cohort is marginal on an 8 GB device).
         del gen, teacher_net, net
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -6842,7 +7677,14 @@ def fit_ball_ssm_distillation_decomposition(
     primary_full_ball: MethodResult | None = None,
     teacher_checkpoint_label: str | None = None,
 ) -> dict[str, MethodResult]:
-    """Fit three causal students against the same fitted teacher ensemble."""
+    """Fit three causal students against the same fitted teacher ensemble.
+
+    The inherited-dynamics arm uses the teacher-fitted generative and
+    measurement models with a causal variational objective and questionnaire
+    likelihood. The teacher-matching arm uses the anchored two-channel teacher
+    posterior alone. Full BALL combines teacher-to-student state matching with
+    posterior-predictive questionnaire re-anchoring.
+    """
 
     config = config or SSMConfig()
     _validate_training_artifact_contract(config)
@@ -7111,7 +7953,14 @@ def fit_ball_ssm_direct_causal(
     device: str | torch.device | None = None,
     prediction_split: str | None = "test",
 ) -> MethodResult:
-    """Fit the causal transformer directly, without a bidirectional teacher."""
+    """Fit the causal transformer directly, without a bidirectional teacher.
+
+    This comparator tests the complete teacher-student training strategy while
+    holding the prospective input history, encoder architecture, ensemble size,
+    and uncertainty construction constant. The mechanistic decomposition then
+    separates inherited dynamics, teacher-distribution matching, questionnaire
+    re-anchoring, and additional optimization.
+    """
 
     config = config or SSMConfig()
     _validate_training_artifact_contract(config)
@@ -7295,9 +8144,18 @@ def fit_ball_ssm_direct_causal(
     return result
 '''
 
-# simulations.run_ball_pipeline
+# --- simulations.run_ball_pipeline (simulations/run_ball_pipeline.py) ---
 SRC_SIMULATIONS_RUN_BALL_PIPELINE = r'''
-"""Run the end-to-end BALL latent-recovery pipeline."""
+"""Run the end-to-end BALL latent-recovery pipeline.
+
+This runner is the canonical math-spec pipeline wrapper for the measurement
+half of the appendix (Sec. 3 latent model, Sec. 4 two-stage inference, Sec. 5
+uncertainty). It produces the latent-recovery artifacts in one place:
+
+1. calibrated session-level severity intervals for z_d and z_p;
+2. per-patient time-varying alpha loading vectors;
+3. rho_RDoC, the share of recovery variance explained by RDoC features.
+"""
 
 from __future__ import annotations
 
@@ -7390,6 +8248,9 @@ METRIC_COLS = [
 ]
 
 
+# Minimum per-replicate scale for a run to feed the manuscript. Smoke/quick runs
+# fall below these and are published under a separate SMOKE prefix so they can
+# never overwrite the manuscript-grade latest_* artifacts or the Table 1 source.
 MANUSCRIPT_GRADE_MIN = {
     "n": 1000, "t": 84, "teacher_epochs": 100, "student_epochs": 100,
     "d_model": 96, "n_layers": 3, "members": 5,
@@ -7397,7 +8258,7 @@ MANUSCRIPT_GRADE_MIN = {
 
 
 def _is_manuscript_grade(args) -> bool:
-    """Check whether a run meets the full-analysis scale."""
+    """A run is manuscript-grade only if every scale knob meets the minimum."""
 
     return (
         int(args.n) >= MANUSCRIPT_GRADE_MIN["n"]
@@ -7429,8 +8290,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n", type=int, default=256)
     parser.add_argument("--t", type=int, default=42)
     parser.add_argument("--base-seed", type=int, default=21000)
+    # Moderate manuscript scale (3 layers, width 96, 150/150 teacher/student
+    # epochs). Appendix H states exactly these. Smoke runs must pass smaller
+    # values explicitly, which the manuscript-grade gate then rejects.
     parser.add_argument("--teacher-epochs", type=int, default=300)
     parser.add_argument("--student-epochs", type=int, default=300)
+    # The anchor-only warmup sets the latent scale/sign and is load-bearing for
+    # SSM recovery; the known-good archived run used 120. Keep it at 120 so the
+    # teacher trains properly rather than being starved of the warmup.
     parser.add_argument("--anchor-warmup-epochs", type=int, default=120,
                         help="Phase-1 anchor-only warmup epochs (sets latent scale/sign).")
     parser.add_argument("--kl-warmup-epochs", type=int, default=80,
@@ -7608,6 +8475,11 @@ def main() -> None:
             alpha=args.conformal_alpha,
         )
         structural_elapsed = perf_counter() - structural_start
+        # Spec requires three latent-coverage rows: raw posterior (what the model
+        # believes), anchor-residual split conformal (deployable, appendix Sec. 5
+        # form f_hat +/- q), and oracle latent-conformal (simulation-only
+        # ceiling). Reporting all three exposes the latent-calibration gap rather
+        # than a single conflated number.
         metric_rows.append(
             _metrics(replicate, data_seed, "structural_raw", structural_raw, data, structural_elapsed)
         )
@@ -7666,6 +8538,10 @@ def main() -> None:
             f"rep={replicate} data_seed={data_seed} training BALL SSM teacher+student ensemble K={args.members}",
             flush=True,
         )
+        # The transformer teacher (bidirectional smoother) is the PRIMARY model;
+        # the causal student is the deployable approximation distilled from it.
+        # return_teacher evaluates the same teachers used for distillation, so the
+        # teacher number costs only prediction, not extra training.
         student_raw, teacher_raw = fit_ball_ssm(
             data,
             ssm_config,
@@ -7834,6 +8710,9 @@ def main() -> None:
     aggregate.to_csv(run_dir / "pipeline_aggregate_mcse.csv", index=False)
     (run_dir / "pipeline_torch_configs.json").write_text(json.dumps(config_records, indent=2) + "\n", encoding="utf-8")
 
+    # Smoke isolation: only a manuscript-grade run may write the latest_* files
+    # the manuscript build reads. Sub-grade (smoke/quick) runs publish under a
+    # SMOKE prefix so they can never clobber the Table 1 / figure source.
     grade = _is_manuscript_grade(args)
     latest_prefix = "latest_ball_pipeline_" if grade else "latest_ball_pipeline_SMOKE_"
     latest_publish = {}
@@ -7956,9 +8835,14 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.run_battle_tests
+# --- simulations.run_battle_tests (simulations/run_battle_tests.py) ---
 SRC_SIMULATIONS_RUN_BATTLE_TESTS = r'''
-"""Repeatable scaffold hardening checks for the simulation code."""
+"""Repeatable scaffold hardening checks for the simulation code.
+
+This is not a replacement for the Scenario B pilot. It is a fast validation
+gate that checks the generated data, diagnostics, method result schemas, seed
+determinism, and the first-class r_ts knob before heavier model work begins.
+"""
 
 from __future__ import annotations
 
@@ -8108,7 +8992,18 @@ def _check_config_load() -> None:
 
 
 def _alpha_step_variance(data) -> float:
-    """Scale-invariant loading drift: variance of CONTINUING-ACTIVE alpha steps."""
+    """Scale-invariant loading drift: variance of CONTINUING-ACTIVE alpha steps
+    divided by the variance of active alpha levels.
+
+    Two DGP behaviors make the naive absolute step variance useless as a knob
+    check. First, the per-person slow-variance normalization rescales alpha so
+    that absolute step variance is nearly invariant to the innovation knobs.
+    Second, support toggling (inactive -> fresh loading) creates large jumps
+    governed by support_switch_prob, not by loading drift, and those jumps
+    dominate the naive measure. Restricting to steps where the dimension is
+    active on both days and normalizing by the active level variance restores a
+    measure that is monotone in the loading-innovation scale.
+    """
 
     step_values: list[float] = []
     level_values: list[float] = []
@@ -8172,6 +9067,7 @@ def _check_loading_drift_sd_knob() -> pd.DataFrame:
 
 def _assert_joint_decomposition(result: MethodResult, label: str) -> None:
     pred = result.predictions
+    # Spec decomposition has no intercept: L = slow + delta (level carried by delta).
     required = {"L_hat", "slow_hat", "delta_hat"}
     missing = required.difference(pred.columns)
     if missing:
@@ -8286,7 +9182,7 @@ def _check_causal_proxy_imputation_no_future_fill() -> None:
 
 
 def _check_structural_posterior_beats_s0() -> pd.DataFrame:
-    """Check that the structural posterior outperforms S0 on severity and calibration."""
+    """Protect the appendix-aligned severity/calibration smoke result."""
 
     config = SimulationConfig(n=120, t=42, seed=18400, double_anchor_latents=True)
     data = generate_dataset(config)
@@ -8331,6 +9227,12 @@ def _check_structural_posterior_beats_s0() -> pd.DataFrame:
     raw_row = pivot.loc["ball_structural_raw"]
     ball_row = pivot.loc["ball_structural_conformal"]
 
+    # Like-for-like arms: S0's intervals are raw Gaussian, so the coverage and
+    # width comparisons gate the RAW marginal-posterior arm. The anchor-conformal
+    # arm is the deployable guarantee; it overcovers on the latent BY DESIGN
+    # (its conformity scores include anchor measurement noise; see the
+    # masterclass conformal pitfall box), so it gets sanity checks rather than
+    # an S0 width comparison.
     failures = []
     if not ball_row["latent_rmse"] < s0_row["latent_rmse"] - 0.02:
         failures.append("latent RMSE did not improve over S0 by at least 0.02")
@@ -8362,7 +9264,14 @@ def _check_structural_posterior_beats_s0() -> pd.DataFrame:
 
 
 def _check_irt_anchor_mode() -> None:
-    """Gate the calibrated graded-response IRT anchor path at the DGP level."""
+    """Gate the calibrated graded-response IRT anchor path at the DGP level.
+
+    The fixed calibrated instrument must emit per-item responses on the calibrated
+    trait scale, leave unobserved anchors missing, stay de-saturated, and track the
+    windowed latent. The neural exact-GRM properties (fixed buffers, anchor batching,
+    exact likelihood, teacher/student execution, comparator symmetry) are covered by
+    validation/test_irt_calibration.py.
+    """
 
     n_items, kcut = 9, 3
     thresholds = tuple(tuple(float(x) for x in np.linspace(-2.0, 2.0, kcut)) for _ in range(n_items))
@@ -8392,7 +9301,13 @@ def _check_irt_anchor_mode() -> None:
 
 
 def _check_assignment_confounding() -> pd.DataFrame:
-    """Gate that the treatment-assignment knob induces severity dependence."""
+    """Gate that the treatment-assignment knob induces severity dependence.
+
+    With gamma = 0 (random) treatment timing is independent of the latent; with
+    strongly_adaptive it must depend on the within-person severity state. This
+    protects the confounding-by-indication scenario from silently regressing to
+    uniform assignment.
+    """
 
     rows = []
     for assignment in ["random", "strongly_adaptive"]:
@@ -8595,9 +9510,25 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.run_pilot_batch
+# --- simulations.run_pilot_batch (simulations/run_pilot_batch.py) ---
 SRC_SIMULATIONS_RUN_PILOT_BATCH = r'''
-"""Batch runner for the canonical BALL latent-recovery pilot."""
+"""Batch runner for the canonical BALL latent-recovery pilot.
+
+Runs the replicates as a small pool of concurrent single-replicate pipeline
+subprocesses (replicate-level parallelism: each replicate is independent, so
+this is embarrassingly parallel and avoids fine-grained per-patient overhead),
+then concatenates their per-replicate metrics and recomputes the aggregate Monte
+Carlo standard errors.
+
+Intended to run outside the interactive window. Progress is printed per
+replicate. A ``DONE`` marker is written only when every requested replicate
+finishes successfully; partial runs write ``PARTIAL`` and exit nonzero unless
+``--allow-partial`` is supplied.
+
+Example:
+    python simulations/run_pilot_batch.py --replicates 10 --concurrency 3 \
+        --members 5 --n 1000 --t 84 --student-epochs 120
+"""
 
 from __future__ import annotations
 
@@ -8637,6 +9568,10 @@ def _run_one_replicate(seed: int, args: argparse.Namespace) -> tuple[int, "pd.Da
     ]
     if args.skip_s0:
         cmd.append("--skip-s0")
+    # Cap each worker's native (BLAS/OpenMP) thread pools so that
+    # concurrency * threads stays near the core count; without this, many
+    # concurrent workers each spawn one thread per core and thrash, turning a
+    # ~2 min structural solve into a >30 min stall.
     env = dict(os.environ)
     env.update(
         {
@@ -8698,6 +9633,8 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     started = time.time()
     (out / "STARTED").write_text(time.strftime("%Y-%m-%d %H:%M:%S"), encoding="utf-8")
+    # Distinct, well-separated seeds so the replicates are independent draws.
+    # An explicit --seeds list overrides the generated range (used for backfill).
     if args.seeds:
         seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
         args.replicates = len(seeds)
@@ -8757,9 +9694,9 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.plotting
+# --- simulations.paper.plotting (simulations/paper/plotting.py) ---
 SRC_SIMULATIONS_PAPER_PLOTTING = r'''
-"""Matplotlib builders for simulation figures."""
+"""Matplotlib figure builders for the paper simulation figures."""
 
 from __future__ import annotations
 
@@ -8797,7 +9734,13 @@ def heatmap(ax, matrix, row_labels, col_labels, title, cbar_label, fmt="{:.2f}",
 
 
 def figure2_recoverability(grid, anchor_levels, daily_levels, out_path, markov_grid=None):
-    """grid[(anchor, daily)] = dict(latent_rmse=, coverage=)."""
+    """grid[(anchor, daily)] = dict(latent_rmse=, coverage=).
+
+    When markov_grid[(anchor, daily)] = dict(latent_rmse=) is supplied, a third
+    panel shows the Markov pattern-mixture comparator's latent RMSE on the same
+    grid so the classical and BALL recoverability maps can be read together on a
+    shared color scale.
+    """
 
     rmse = np.array([[grid[(a, d)]["latent_rmse"] for d in daily_levels] for a in anchor_levels])
     cov = np.array([[grid[(a, d)]["coverage"] for d in daily_levels] for a in anchor_levels])
@@ -8829,7 +9772,9 @@ def figure2_recoverability(grid, anchor_levels, daily_levels, out_path, markov_g
 
 
 def figure3_calibration(arm_summary, dist_strata, miss_strata, out_path):
-    """arm_summary includes latent and observable-anchor coverage and width."""
+    """arm_summary includes latent and observable-anchor coverage and width.
+    dist_strata, miss_strata: DataFrames with columns bin, coverage, rel_width.
+    """
 
     fig, axes = plt.subplots(2, 2, figsize=(8.0, 6.2))
     arms = list(arm_summary.keys())
@@ -8837,6 +9782,8 @@ def figure3_calibration(arm_summary, dist_strata, miss_strata, out_path):
     wid = [arm_summary[a]["rel_width"] for a in arms]
     observable_cov = [arm_summary[a].get("observable_anchor_coverage", np.nan) for a in arms]
     observable_wid = [arm_summary[a].get("observable_anchor_rel_width", np.nan) for a in arms]
+    # A fixed palette keyed by arm name so the Markov comparator is colored
+    # consistently when present; unknown arms fall back to a neutral gray.
     arm_colors = {
         "student raw": "#888", "student anchor conformal": "#3b7", "student oracle": "#37b",
         "Markov model-based": "#e73",
@@ -8902,7 +9849,10 @@ def figure3_calibration(arm_summary, dist_strata, miss_strata, out_path):
 
 
 def figure4_identifiability(leakage, info_limit, neg_controls, out_path):
-    """leakage: 2x2 matrix [[slow->slow, slow->fast],[fast->slow, fast->fast]]."""
+    """leakage: 2x2 matrix [[slow->slow, slow->fast],[fast->slow, fast->fast]].
+    info_limit: DataFrame with columns scenario, latent_rmse, rel_width.
+    neg_controls: DataFrame with columns scenario, slow_leakage, latent_rmse.
+    """
 
     fig, axes = plt.subplots(1, 3, figsize=(10.5, 3.4))
     im = axes[0].imshow(leakage, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
@@ -8917,6 +9867,8 @@ def figure4_identifiability(leakage, info_limit, neg_controls, out_path):
     x = np.arange(len(info_limit))
     has_markov = "markov_rmse" in info_limit.columns
     if has_markov:
+        # Grouped bars compare BALL and the Markov pattern-mixture comparator
+        # latent error under the same information-limit scenarios.
         w = 0.4
         axes[1].bar(x - w / 2, info_limit["latent_rmse"], width=w, color="#a33", alpha=0.8, label="BALL RMSE")
         axes[1].bar(x + w / 2, info_limit["markov_rmse"], width=w, color="#777", alpha=0.8, label="Markov RMSE")
@@ -8943,7 +9895,7 @@ def figure4_identifiability(leakage, info_limit, neg_controls, out_path):
     plt.close(fig)
 '''
 
-# simulations.paper.make_figure1
+# --- simulations.paper.make_figure1 (simulations/paper/make_figure1.py) ---
 SRC_SIMULATIONS_PAPER_MAKE_FIGURE1 = r'''
 """Figure 1. BALL model and inference schematic (four panels)."""
 
@@ -9031,9 +9983,21 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.scenarios
+# --- simulations.paper.scenarios (simulations/paper/scenarios.py) ---
 SRC_SIMULATIONS_PAPER_SCENARIOS = r'''
-"""Build simulation scenarios and evaluate fitted methods."""
+"""Scenario builders and the fit-and-evaluate harness for the paper figures.
+
+This layer sits on top of the simulation core. It builds the paper's scenario
+grid by combining config knobs that already exist (anchor error, missingness,
+slow fraction, proxy error, assignment) with a few post-hoc data corruptions
+that do not require changing the data-generating process. The corruptions are
+applied to a generated SimulationData and are clearly named.
+
+The fit-and-evaluate harness uses the BALL SSM causal transformer student as
+the primary method, with the Markov pattern-mixture model as the classical
+statistics comparator. The structural posterior can still be requested as an
+audit arm, but it is not the figure headline.
+"""
 
 from __future__ import annotations
 
@@ -9062,6 +10026,9 @@ from simulations.src.methods.ball_ssm import (
 from simulations.src import metrics as M
 
 
+# ---------------------------------------------------------------------------
+# Config knobs for the two recoverability axes and the stress conditions.
+# ---------------------------------------------------------------------------
 def anchor_quality_config(base: SimulationConfig, level: str) -> SimulationConfig:
     """Scale anchor error and missingness to set anchor quality."""
 
@@ -9074,11 +10041,17 @@ def anchor_quality_config(base: SimulationConfig, level: str) -> SimulationConfi
     return replace(base, y1=y1, y2=y2)
 
 
+# Daily-covariate informativeness is set post-hoc by inflating daily noise.
 DAILY_NOISE_SCALE = {"strong": 1.0, "moderate": 1.8, "noise": 6.0}
 
 
 def degrade_daily(data: SimulationData, scale: float, seed_key: str = "degrade_daily") -> SimulationData:
-    """Add Gaussian noise to the observed daily covariates to weaken their signal."""
+    """Add Gaussian noise to the observed daily covariates to weaken their signal.
+
+    scale = 1.0 leaves the data unchanged. Larger scales add proportional noise
+    to every observed X value, lowering its information about the latent state
+    without touching the latent state or the anchors.
+    """
 
     if scale <= 1.0:
         return data
@@ -9097,7 +10070,13 @@ def degrade_daily(data: SimulationData, scale: float, seed_key: str = "degrade_d
 
 
 def null_proxy(data: SimulationData, seed_key: str = "null_proxy") -> SimulationData:
-    """Replace the observed proxy B with pure noise (negative control)."""
+    """Replace the observed proxy B with pure noise (negative control).
+
+    The proxy columns B0..B{q-1} in the components table are overwritten with
+    Gaussian noise on the observed positions. The true slow process C is left
+    intact so that latent recovery from anchors and daily covariates still
+    works, but the proxy carries no information about C.
+    """
 
     rng = make_rng(data.config.seed, seed_key)
     comp = data.components.copy()
@@ -9112,7 +10091,12 @@ def null_proxy(data: SimulationData, seed_key: str = "null_proxy") -> Simulation
 
 
 def permute_proxy(data: SimulationData, seed_key: str = "permute_proxy") -> SimulationData:
-    """Permute proxy columns across patients so B no longer matches C (control)."""
+    """Permute proxy columns across patients so B no longer matches C (control).
+
+    Each patient's proxy block is replaced by a different patient's proxy block
+    of the same length. The proxy keeps realistic marginal structure but is
+    decoupled from this patient's true slow process.
+    """
 
     rng = make_rng(data.config.seed, seed_key)
     comp = data.components.sort_values(["id", "t"]).copy()
@@ -9132,6 +10116,9 @@ def permute_proxy(data: SimulationData, seed_key: str = "permute_proxy") -> Simu
     return replace(data, components=out)
 
 
+# ---------------------------------------------------------------------------
+# Fit and evaluate.
+# ---------------------------------------------------------------------------
 def fit_and_evaluate(data: SimulationData, split: str = "test",
                      include_baselines: bool = True,
                      include_arms: bool = True,
@@ -9140,7 +10127,13 @@ def fit_and_evaluate(data: SimulationData, split: str = "test",
                      include_structural_audit: bool = False,
                      ssm_config: SSMConfig | None = None,
                      device: str | None = None) -> pd.DataFrame:
-    """Fit the method set on one dataset and return a tidy metrics frame."""
+    """Fit the method set on one dataset and return a tidy metrics frame.
+
+    The Markov pattern-mixture comparator is the classical statistics arm of the
+    old-school-versus-machine-learning comparison. It is controlled separately by
+    include_markov so the figures can request it alongside the structural
+    posterior without also re-fitting the cheap baselines.
+    """
 
     truth = data.components
     ind = data.individuals
@@ -9308,9 +10301,14 @@ def primary_intervals(
     return raw, conf, oracle
 '''
 
-# simulations.paper.run_fig2_recoverability
+# --- simulations.paper.run_fig2_recoverability (simulations/paper/run_fig2_recoverability.py) ---
 SRC_SIMULATIONS_PAPER_RUN_FIG2_RECOVERABILITY = r'''
-"""Figure 2. Recoverability map over anchor quality x daily-covariate signal."""
+"""Figure 2. Recoverability map over anchor quality x daily-covariate signal.
+
+Sweeps a grid of anchor quality and daily informativeness, fits the BALL SSM
+causal transformer student per cell across replicates, and records test latent
+RMSE and anchor-conformal latent coverage. Writes the cell table and heatmap.
+"""
 
 from __future__ import annotations
 
@@ -9425,13 +10423,21 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.run_fig3_calibration
+# --- simulations.paper.run_fig3_calibration (simulations/paper/run_fig3_calibration.py) ---
 SRC_SIMULATIONS_PAPER_RUN_FIG3_CALIBRATION = r'''
-"""Figure 3. Interval calibration and the latent-calibration gap."""
+"""Figure 3. Interval calibration and the latent-calibration gap.
+
+Fits the primary direct-transition BALL student on the linear scenario across
+replicates and reports, for the three interval arms (raw, anchor conformal,
+oracle), latent coverage and relative width. It also reports the raw arm's
+coverage and width stratified by days to the nearest observed anchor and by
+daily-covariate missingness.
+"""
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -9451,12 +10457,33 @@ from simulations.src.model_utils import SimulationConfig, marginal_anchor_sd
 from simulations.src.dgp import generate_dataset
 from simulations.src import metrics as M
 from simulations.src.methods.ball_ssm import SSMConfig
-from simulations.src.methods.markov_pattern_mixture import fit_markov_pattern_mixture
 from simulations.paper.scenarios import primary_intervals
 from simulations.paper import plotting
 
 DEFAULT_OUT = Path(__file__).resolve().parent / "outputs" / "publication_calibration_20260805_v3"
 SPLIT = "test"
+
+
+def calibration_configs(args, seed: int):
+    """Match the primary simulation model and its linear 10% signal condition."""
+    simulation = SimulationConfig(
+        n=args.n, t=args.t, seed=seed, slow_fraction=0.75,
+        delta_ar=(0.3, 0.3, 0.3), rdoc_drift_share=0.10,
+        rdoc_drift_active_dims=3, rdoc_drift_beta_seed=31011,
+        rdoc_drift_min_abs=0.35,
+    )
+    model = SSMConfig(
+        d_model=args.d_model, n_layers=args.n_layers, n_heads=4,
+        teacher_epochs=args.teacher_epochs, student_epochs=args.student_epochs,
+        anchor_warmup_epochs=args.anchor_warmup, kl_warmup_epochs=args.kl_warmup,
+        batch_size=args.batch_size, ensemble_size=args.members,
+        max_individuals=args.n, seed=seed + 91_000,
+        use_alpha_slow=False, rdoc_drift_head=True, delta_phi=0.3,
+        anchor_weight=40.0, student_anchor_weight=5.0,
+        student_distill_weight=1.0, student_init_mode="teacher",
+        student_kl_direction="teacher_to_student",
+    )
+    return simulation, model
 
 
 def observable_anchor_interval_metrics(result, data, split: str) -> dict[str, float]:
@@ -9546,6 +10573,10 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--out", type=Path, default=DEFAULT_OUT)
+    p.add_argument("--anchor-warmup", type=int, default=120)
+    p.add_argument("--kl-warmup", type=int, default=80)
+    p.set_defaults(replicates=3, base_seed=2027, teacher_epochs=300,
+                   student_epochs=300, d_model=96, n_layers=3)
     args = p.parse_args()
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
@@ -9553,35 +10584,35 @@ def main() -> None:
     arm_rows, dist_rows, miss_rows = [], [], []
     for r in range(args.replicates):
         seed = args.base_seed + 1000 * r
-        data = generate_dataset(SimulationConfig(n=args.n, t=args.t, seed=seed))
+        simulation_config, model_config = calibration_configs(args, seed)
+        data = generate_dataset(simulation_config)
         truth, ind = data.components, data.individuals
-        ssm_config = SSMConfig(
-            d_model=args.d_model,
-            n_layers=args.n_layers,
-            teacher_epochs=args.teacher_epochs,
-            student_epochs=args.student_epochs,
-            batch_size=args.batch_size,
-            ensemble_size=args.members,
-            max_individuals=args.n,
-            seed=seed + 91_000,
+        signature = hashlib.sha256(json.dumps({
+            "source": hashlib.sha256((ROOT / "BALL.py").read_bytes()).hexdigest(),
+            "simulation": dataclasses.asdict(simulation_config),
+            "model": dataclasses.asdict(model_config),
+        }, sort_keys=True, default=str).encode()).hexdigest()
+        ssm_config = dataclasses.replace(
+            model_config,
             checkpoint_dir=str(out / "member_checkpoints"),
             checkpoint_label=f"calibration_replicate_{r:03d}_seed_{seed}",
-            checkpoint_signature=(
-                f"calibration_monitoring_v2|seed={seed}|n={args.n}|t={args.t}|"
-                f"teacher={args.teacher_epochs}|student={args.student_epochs}|members={args.members}"
-            ),
+            checkpoint_signature=signature,
             resume_member_checkpoints=True,
             require_training_checkpoints=True,
         )
         raw, conf, oracle = primary_intervals(data, ssm_config, device=args.device)
-        markov = fit_markov_pattern_mixture(data)
-        for arm, res in [("student raw", raw), ("student anchor conformal", conf), ("student oracle", oracle),
-                         ("Markov model-based", markov)]:
+        # This sensitivity compares three interval constructions for the same
+        # prospective BALL predictions; it is not a model-ranking experiment.
+        for arm, res in [("student raw", raw), ("student anchor conformal", conf), ("student oracle", oracle)]:
             observable = observable_anchor_interval_metrics(res, data, SPLIT)
             arm_rows.append({"replicate": r, "arm": arm,
                              "coverage": M.coverage(res.intervals, truth, ind, SPLIT),
                              "rel_width": M.latent_relative_width(res.intervals, truth, ind, SPLIT),
                              **observable})
+        # Stratify the raw posterior arm to diagnose whether the learned
+        # ensemble-plus-Laplace scale itself responds to information density.
+        # The conformal arm now preserves that local scale through a single
+        # patient-balanced cluster-weighted normalized multiplier and is evaluated separately.
         d = M.coverage_by_anchor_distance(raw.intervals, truth, data.anchors, ind, SPLIT)
         d["replicate"] = r
         dist_rows.append(d)
@@ -9602,6 +10633,7 @@ def main() -> None:
                        "observable_anchor_coverage": float(g["observable_anchor_coverage"].mean()),
                        "observable_anchor_rel_width": float(g["observable_anchor_rel_width"].mean())}
                    for a, g in arms.groupby("arm")}
+    # keep arm display order
     arm_summary = {
         a: arm_summary[a]
         for a in ["student raw", "student anchor conformal", "student oracle", "Markov model-based"]
@@ -9619,6 +10651,8 @@ def main() -> None:
         json.dumps(
             {
                 "analysis": "manuscript-grade uncertainty calibration",
+                "simulation_config": dataclasses.asdict(simulation_config),
+                "model_config": dataclasses.asdict(model_config),
                 "ball_py_sha256": digest,
                 "args": vars(args),
                 "elapsed_seconds": time.perf_counter() - started_at,
@@ -9648,9 +10682,17 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.run_fig4_identifiability
+# --- simulations.paper.run_fig4_identifiability (simulations/paper/run_fig4_identifiability.py) ---
 SRC_SIMULATIONS_PAPER_RUN_FIG4_IDENTIFIABILITY = r'''
-"""Figure 4. Identifiability diagnostics, information limits, negative controls."""
+"""Figure 4. Identifiability diagnostics, information limits, negative controls.
+
+Panel A. Recovery and leakage correlations between the recovered and true slow
+and fast components on the default scenario.
+Panel B. Latent error and relative interval width in information-limit
+scenarios in which anchors and daily covariates are jointly weakened.
+Panel C. Absolute slow-component leakage correlation in negative controls with
+a null proxy, a permuted proxy, and noise-only daily covariates.
+"""
 
 from __future__ import annotations
 
@@ -9731,6 +10773,7 @@ def main() -> None:
             seed=seed + 91_000,
         )
 
+    # Panel A. Default-scenario recovery and leakage correlations.
     leak = {"slow_recovery_corr": [], "fast_recovery_corr": [],
             "slow_to_fast_leakage": [], "fast_to_slow_leakage": []}
     for r in range(args.replicates):
@@ -9752,6 +10795,7 @@ def main() -> None:
     ])
     print("panel A done", flush=True)
 
+    # Panel B. Information-limit scenarios.
     info_rows = []
     for name, builder in _info_limit_builders().items():
         rmses, widths, markov_rmses = [], [], []
@@ -9777,6 +10821,7 @@ def main() -> None:
         print(f"info-limit {name!r} done", flush=True)
     info_df = pd.DataFrame(info_rows)
 
+    # Panel C. Negative controls.
     neg_rows = []
     for name, builder in _neg_control_builders().items():
         leaks, rmses = [], []
@@ -9811,9 +10856,17 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.run_rts_identification
+# --- simulations.paper.run_rts_identification (simulations/paper/run_rts_identification.py) ---
 SRC_SIMULATIONS_PAPER_RUN_RTS_IDENTIFICATION = r'''
-"""Time-scale-ratio identification sweep (Proposition A2 test)."""
+"""Time-scale-ratio identification sweep (Proposition A2 test).
+
+Sweeps the loading-to-residual innovation-variance ratio r_ts and reports, for
+the BALL SSM causal transformer student, the within-person recovery correlations of the slow
+and fast components and the cross leakage correlations. Proposition A2 predicts
+that as r_ts increases toward 1 the two components move on similar time scales,
+component recovery degrades, and leakage rises. Outputs a table with Monte
+Carlo standard errors and a figure.
+"""
 
 from __future__ import annotations
 
@@ -9837,6 +10890,9 @@ from simulations.src.methods.ball_ssm import SSMConfig, fit_ball_ssm
 
 OUT = Path(__file__).resolve().parent / "outputs"
 OUT.mkdir(parents=True, exist_ok=True)
+# Sweep into the regime where the loading innovation overtakes the residual
+# innovation (around r_ts = 9), which is where Proposition A2 predicts the
+# time-scale separation collapses and leakage rises.
 R_TS = [0.03, 0.3, 1.0, 3.0, 10.0, 30.0]
 SPLIT = "test"
 
@@ -9922,9 +10978,15 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.run_stress_panels
+# --- simulations.paper.run_stress_panels (simulations/paper/run_stress_panels.py) ---
 SRC_SIMULATIONS_PAPER_RUN_STRESS_PANELS = r'''
-"""Generate Supplementary Table 2 stress-panel aggregates."""
+"""Generate Supplementary Table 2 stress-panel aggregates.
+
+Each panel is a simulation scenario fit with the BALL SSM causal transformer
+student, Markov pattern-mixture comparator, S0, and cheap point baselines. The
+aggregate files are intentionally named to match the table builder's expected
+post-2026-06-12 stress-panel source pattern.
+"""
 
 from __future__ import annotations
 
@@ -10020,6 +11082,9 @@ def main() -> None:
             cfg = _panel_config(panel, seed, args.n, args.t)
             data = generate_dataset(cfg)
             if panel == "low_anchor":
+                # Low-anchor is already weak on the anchor axis; mildly weaken
+                # daily covariates too so the panel is an actual information
+                # stress test rather than just a missing-anchor variant.
                 data = degrade_daily(data, 1.8)
             ssm_config = SSMConfig(
                 d_model=args.d_model,
@@ -10066,9 +11131,18 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.make_tables
+# --- simulations.paper.make_tables (simulations/paper/make_tables.py) ---
 SRC_SIMULATIONS_PAPER_MAKE_TABLES = r'''
-"""Generate Table 1 and Supplementary Table 2 from run aggregates."""
+"""Generate Table 1 and Supplementary Table 2 from run aggregates.
+
+Table 1 reads the primary-comparison aggregate (the pilot, or the 100-replicate
+main grid once it finishes) and emits a tidy CSV and a Markdown table with the
+method rows the manuscript uses. Supplementary Table 2 reads the post-2026-06-12
+stress-panel aggregates.
+
+The main grid path is checked first. If its aggregate is absent or stale, the
+script falls back to the corrected pilot aggregate and labels the source.
+"""
 
 from __future__ import annotations
 
@@ -10090,6 +11164,9 @@ LATEST_PIPELINE = ROOT / "simulations" / "outputs" / "ball_pipeline" / "latest_b
 STRESS_DIR = ROOT / "simulations" / "outputs" / "ball_pipeline"
 DONE_RE = re.compile(r"ok=(\d+)/(\d+)")
 
+# Role -> manuscript label for Table 1, ordered with the PRIMARY deployable
+# transformer student first. The bidirectional teacher is a transformer smoother
+# diagnostic, not the lead result. Classical comparators follow.
 TABLE1_ROLES = {
     "student_ensemble": "BALL transformer student (deployable), anchor conformal",
     "ssm_teacher": "BALL transformer teacher (smoother diagnostic), anchor conformal",
@@ -10129,7 +11206,14 @@ def _min_metric_n(df: pd.DataFrame, roles: set[str], metric: str = "latent_rmse"
 
 
 def _is_fresh_main_grid(expected_replicates: int) -> bool:
-    """Use the main grid only if its current run has actually finished."""
+    """Use the main grid only if its current run has actually finished.
+
+    The directory can hold stale aggregates from an earlier (pre-fix) run while
+    a new run is still in progress. We require a DONE marker that postdates the
+    STARTED marker, reports exact completion, and an aggregate file written at
+    or after STARTED. The aggregate also must contain every manuscript Table 1
+    role with at least the expected number of latent-RMSE replicates.
+    """
 
     if not MAIN_GRID.exists():
         return False
@@ -10183,7 +11267,10 @@ def _source_label(source: Path, df: pd.DataFrame, expected_main_replicates: int)
 
 
 def _latest_pipeline_is_grade() -> bool:
-    """Check whether the latest completed pipeline meets the full-analysis scale."""
+    """The latest BALL pipeline aggregate may feed the manuscript only if its run
+    was manuscript-grade. Smoke/quick runs publish under a SMOKE prefix and set
+    manuscript_grade=False, so a stale sub-grade latest can never become Table 1.
+    """
 
     import json
     manifest = LATEST_PIPELINE.parent / "latest_ball_pipeline_manifest.json"
@@ -10230,6 +11317,8 @@ def make_table1(expected_main_replicates: int) -> None:
     label = _source_label(source, df, expected_main_replicates)
     metrics = ["latent_rmse", "slow_rmse", "delta_rmse", "coverage", "mean_width", "interval_score"]
     rows = []
+    # Roles that intentionally estimate only the composite severity, so their
+    # slow and fast component columns are not applicable rather than pending.
     composite_only_roles = {"markov_pattern_mixture"}
     for role, name in TABLE1_ROLES.items():
         vals = _pivot(df, role, metrics)
@@ -10244,6 +11333,8 @@ def make_table1(expected_main_replicates: int) -> None:
             "mean_width": f"{vals['mean_width'][0]:.3f}" if np.isfinite(vals["mean_width"][0]) else "[pending]",
             "interval_score": f"{vals['interval_score'][0]:.3f}" if np.isfinite(vals["interval_score"][0]) else "[pending]",
         })
+    # Baselines are point methods. Their latent RMSE comes from battle/pilot
+    # baseline rows where available; otherwise left as the documented pilot values.
     baseline_rmse = {"Linear interpolation": 1.30, "Last observation carried forward": 1.51,
                      "Anchor-only windowed mean": 0.97}
     for name, rmse in baseline_rmse.items():
@@ -10312,9 +11403,22 @@ if __name__ == "__main__":
     main()
 '''
 
-# simulations.paper.run_all
+# --- simulations.paper.run_all (simulations/paper/run_all.py) ---
 SRC_SIMULATIONS_PAPER_RUN_ALL = r'''
-"""Run all simulation tables and figures."""
+"""Orchestrate all simulation tables and figures for the paper.
+
+Runs Table 1 and Supplementary Table 2 (cheap, read from aggregates), then the
+three simulation figures (Figure 2 recoverability, Figure 3 calibration, Figure
+4 identifiability). Figures fit the structural posterior per cell, so they are
+the expensive step. Use --quick for a fast small-scale draft, or pass full
+arguments for the manuscript-scale run.
+
+Manuscript-scale invocation (heavy):
+    python simulations/paper/run_all.py --replicates 10 --n 1000 --t 84
+
+Quick draft:
+    python simulations/paper/run_all.py --quick
+"""
 
 from __future__ import annotations
 
@@ -10379,9 +11483,17 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.assemble_rdoc_llm
+# --- empirical.assemble_rdoc_llm (empirical/assemble_rdoc_llm.py) ---
 SRC_EMPIRICAL_ASSEMBLE_RDOC_LLM = r'''
-"""Assemble empirical RDoC scores from raw/RDoC_LLM_scorer.csv."""
+"""Assemble empirical RDoC scores from raw/RDoC_LLM_scorer.csv.
+
+The empirical example uses the LLM-constructed RDoC feature file as the sole
+RDoC source. The raw file is a long note-field table with two independent LLM
+score sets per domain. This command keeps rows for patients in the empirical
+rTMS session cohort and averages the two model scores for each domain. It does
+not standardize across the full cohort. Scaling is learned inside each training
+fold of the post hoc transition analysis.
+"""
 
 from __future__ import annotations
 
@@ -10535,9 +11647,22 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.build_rdoc_proxy
+# --- empirical.build_rdoc_proxy (empirical/build_rdoc_proxy.py) ---
 SRC_EMPIRICAL_BUILD_RDOC_PROXY = r'''
-"""Carry RDoC note scores forward to a per-session six-dimensional proxy B(t)."""
+"""Carry RDoC note scores forward to a per-session six-dimensional proxy B(t).
+
+The RDoC scores live on the patient day-axis at the days notes were written.
+The proxy B(t) at a session day is the most recent note's RDoC profile strictly
+before that day. This is a last-observation-carried-forward on the day-axis.
+Session days before a patient's first scored note receive a zero placeholder
+and are flagged as having no prior note. Those placeholders are excluded from
+the transition analysis.
+
+Output is empirical/derived/sessions_with_rdoc.csv with columns id, session,
+day, B0..B5, rdoc_days_stale (days since the note that supplied the proxy), and
+rdoc_observed (whether any prior note existed). B0..B5 map to the six RDoC
+domains in the order of RDOC_TERMS in rdoc_score.py.
+"""
 
 from __future__ import annotations
 
@@ -10585,13 +11710,17 @@ def main() -> None:
     scores = scores.dropna(subset=["day", "id"]).copy()
     scores["day"] = scores["day"].astype(int)
     scores["id"] = scores["id"].astype(int)
+    # Average scores of notes written on the same patient-day.
     notes = scores.groupby(["id", "day"])[RDOC_COLS].mean().reset_index()
     notes["day"] = notes["day"].astype(int)
     notes["note_day"] = notes["day"]
+    # merge_asof requires both frames globally sorted by the on key.
     notes = notes.sort_values("day").reset_index(drop=True)
 
     sess = _session_axis().sort_values("day").reset_index(drop=True)
 
+    # Per-patient backward as-of merge: each session day takes the most recent
+    # note strictly before it. Same-day order is unavailable in the extract.
     merged = pd.merge_asof(
         sess, notes, on="day", by="id", direction="backward", suffixes=("", "_note"),
         allow_exact_matches=False,
@@ -10605,6 +11734,7 @@ def main() -> None:
     out = merged[keep].copy()
     out.to_csv(OUT / "sessions_with_rdoc.csv", index=False)
 
+    # Within-patient variability of the proxy, to quantify how slowly it varies.
     b_cols = [f"B{j}" for j in range(6)]
     within_sd = out[out["rdoc_observed"]].groupby("id")[b_cols].std().mean().mean()
     between_sd = out[out["rdoc_observed"]].groupby("id")[b_cols].mean().std().mean()
@@ -10638,9 +11768,41 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.build_sparse_anchors
+# --- empirical.build_sparse_anchors (empirical/build_sparse_anchors.py) ---
 SRC_EMPIRICAL_BUILD_SPARSE_ANCHORS = r'''
-"""Build the BALL empirical illustration dataset from the rTMS cohort."""
+"""Build the BALL empirical illustration dataset from the rTMS cohort.
+
+Reads only the isolated working copy in empirical/data/, never the protected
+source. Produces sparse-anchor datasets mapped to the BALL general
+simulation objects:
+
+  Y1/Y2/Y3 sparse anchors <- PHQ-9, GAD-7, BDI. Each scale is genuinely measured
+                            at a high per-session rate in this cohort (PHQ-9
+                            ~85%, BDI ~72%, GAD-7 ~42%), so each is artificially
+                            sparsified to a target cadence. The genuine
+                            measurements NOT chosen as anchors are retained as a
+                            held-out recovery-validation target -- a quasi-latent
+                            the empirical study can actually score recovery
+                            against, which a truly unobservable latent cannot.
+  a_im treatment events   <- rTMS protocol action_id per session.
+  X(t) daily state        <- session-level covariates.
+  B(t) RDoC proxy         <- notes-derived McCoy/Perlis LLM RDoC profile
+                            (6-dim), used in the empirical direct-transition
+                            coefficient analysis.
+
+Two modes:
+  (default)   build one anchor set at --cadence-days (weekly by default).
+  --sweep     build anchor sets at several cadences for the recovery-vs-sparsity
+              sensitivity analysis; each cadence held-out eval set lets us trace
+              latent-recovery quality as anchors get sparser.
+
+Outputs to empirical/derived/:
+  anchors_sparse[_<cadence>d].csv   id, anchor, session, date, value,
+                                    window_start_day, window_end_day,
+                                    role in {anchor, heldout_eval}, cadence_days
+  sessions.csv                      id, session, date, action_id, covariates
+  build_manifest.json               counts per cadence, provenance, rules
+"""
 
 from __future__ import annotations
 
@@ -10657,11 +11819,12 @@ OUT = ROOT / "derived"
 OUT.mkdir(parents=True, exist_ok=True)
 SESSION_DATA = DATA / "rtms_paper_analytic_sessions.csv"
 
+# Standard empirical questionnaire recall windows in calendar days.
 RECALL_WINDOW_DAYS = {"PHQ9": 14, "GAD7": 14, "BDI": 14}
 SCALES = ("PHQ9", "GAD7", "BDI")
 VALUE_RANGE = {"PHQ9": [0, 27], "GAD7": [0, 21], "BDI": [0, 63]}
 DEFAULT_CADENCE = 7
-SWEEP_CADENCES = (7, 14, 21, 28)
+SWEEP_CADENCES = (7, 14, 21, 28)  # weekly -> 4-weekly anchor spacing
 
 
 def _load() -> pd.DataFrame:
@@ -10704,7 +11867,12 @@ def _value(df: pd.DataFrame, scale: str) -> pd.Series:
 
 
 def _sparsify(df: pd.DataFrame, genuine: pd.Series, cadence_days: int) -> pd.Series:
-    """Retain the first genuine instrument event in each patient cadence interval."""
+    """Retain the first genuine instrument event in each patient cadence interval.
+
+    Returns a role Series over the genuine rows ('anchor' / 'heldout_eval');
+    non-genuine rows are NaN. The held-out genuine measurements at finer
+    resolution are the empirical recovery-validation target.
+    """
 
     role = pd.Series(np.nan, index=df.index, dtype=object)
     g = df[genuine].copy()
@@ -10843,9 +12011,19 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.build_comorbidities
+# --- empirical.build_comorbidities (empirical/build_comorbidities.py) ---
 SRC_EMPIRICAL_BUILD_COMORBIDITIES = r'''
-"""Build strictly prior, session-level psychiatric diagnosis features."""
+"""Build strictly prior, session-level psychiatric diagnosis features.
+
+The input diagnosis text and the patient-level output are protected data. This
+command therefore refuses to write inside a Git working tree. It emits only
+numeric indicators and counts. It never writes diagnosis strings, ICD codes,
+calendar dates, appointment identifiers, or raw EHR field values.
+
+For a session on calendar date d, a diagnosis record contributes only when its
+recorded ServiceDate is strictly earlier than d. Same-day records are excluded
+because the available extracts do not contain a reliable within-day timestamp.
+"""
 
 from __future__ import annotations
 
@@ -10987,6 +12165,7 @@ def classify_diagnosis(value: object) -> set[str]:
     text = str(value).strip()
     if not text:
         return set()
+    # Split exports that concatenate adjacent codes, such as F33.2F41.1.
     code_text = re.sub(r"(?<=[0-9])(?=[A-Z][0-9]{2})", " ", text.upper())
     out: set[str] = set()
     for code in _CODE_RE.findall(code_text):
@@ -11022,6 +12201,8 @@ def _read_diagnosis_events(raw_dir: Path, patient_ids: set[int]) -> pd.DataFrame
     if not frames:
         return pd.DataFrame(columns=keep)
     events = pd.concat(frames, ignore_index=True)
+    # The raw export can repeat records across SAS parts. Prefer the stable field
+    # value identifier, then remove exact duplicate fallbacks.
     uid_present = events["FieldValue_UID"].notna()
     with_uid = events[uid_present].drop_duplicates("FieldValue_UID", keep="first")
     without_uid = events[~uid_present].drop_duplicates(
@@ -11047,6 +12228,8 @@ def construct_session_features(sessions: pd.DataFrame, events: pd.DataFrame) -> 
         active_categories: set[str] = set()
         record_count = 0
         for session in sess_group.sort_values("session", kind="mergesort").itertuples(index=False):
+            # Strict inequality is intentional. Same-day records could have been
+            # entered after treatment and are therefore not available as features.
             while event_pos < len(diagnoses) and diagnoses.iloc[event_pos]["ServiceDate"] < session.ServiceDate:
                 event = diagnoses.iloc[event_pos]
                 active_categories.update(event["categories"])
@@ -11137,9 +12320,224 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.fit_empirical
+# --- empirical.fit_empirical (empirical/fit_empirical.py) ---
+SRC_EMPIRICAL_PROSPECTIVE_CLASSICAL = r'''
+"""Development-fitted Gaussian and history-stratified Markov forward filters.
+
+Full development records may estimate parameters. Evaluation predictions use
+only the current structured record, lagged treatment, and questionnaires from
+strictly earlier sessions. Issued latent estimates are never revised when
+forming the same recall-window endpoint used for the causal BALL student.
+"""
+from __future__ import annotations
+import numpy as np
+import pandas as pd
+
+
+def prior_counts(anchors, n):
+    times = np.sort(anchors.loc[anchors.observed.astype(bool), 't'].to_numpy(int))
+    return np.searchsorted(times, np.arange(n), side='left')
+
+
+def pattern_groups(anchors, n, edges):
+    return np.searchsorted(edges, prior_counts(anchors, n), side='right')
+
+
+def update_gaussian(mean, covariance, indices, weights, value, variance):
+    cross = covariance[:, indices] @ weights
+    residual_variance = float(weights @ cross[indices] + variance)
+    if not np.isfinite(residual_variance) or residual_variance <= 0:
+        raise ValueError('Invalid Gaussian observation variance.')
+    mean = mean + cross * ((value - weights @ mean[indices]) / residual_variance)
+    covariance = covariance - np.outer(cross, cross) / residual_variance
+    return mean, (covariance + covariance.T) * .5
+
+
+def forward_filter(drift, persistence, innovation_variance, daily, daily_observed,
+                   daily_variance, anchors, prior_variance, observation_update=None):
+    """Append states in session order, assimilating each anchor one session late.
+
+    The growing covariance retains the correlations needed for recall-window
+    measurements. Past internal states can update, but past issued estimates
+    stay fixed. No backward pass is performed on evaluation records.
+    """
+    n = len(daily)
+    issued = np.empty(n); issued_variance = np.empty(n)
+    mean = np.empty(0); covariance = np.empty((0, 0))
+    by_time = {}
+    for r in anchors.itertuples(index=False):
+        if bool(r.observed):
+            by_time.setdefault(int(r.t), []).append(r)
+    for k in range(n):
+        if k:
+            for r in by_time.get(k-1, []):
+                if observation_update is not None:
+                    mean, covariance = observation_update(mean, covariance, r)
+                    continue
+                start = max(0, int(r.window_start))
+                end = min(k-1, int(r.window_end), int(r.t))
+                if end < start:
+                    raise ValueError('Empty retained questionnaire recall window.')
+                idx = np.arange(start, end+1)
+                weights = np.full(len(idx), float(r.loading)/len(idx))
+                mean, covariance = update_gaussian(
+                    mean, covariance, idx, weights,
+                    float(r.value)-float(getattr(r, 'intercept', 0.)),
+                    float(r.observation_sd)**2)
+            a = persistence[k-1]
+            cross = covariance[:, -1]*a
+            new = np.empty((k+1, k+1))
+            new[:-1, :-1] = covariance
+            new[:-1, -1] = cross; new[-1, :-1] = cross
+            new[-1, -1] = a*a*covariance[-1, -1]+innovation_variance[k-1]
+            mean = np.r_[mean, a*mean[-1]+drift[k-1]]
+            covariance = new
+        else:
+            mean = np.zeros(1); covariance = np.array([[prior_variance]], float)
+        if daily_observed[k] and np.isfinite(daily[k]):
+            mean, covariance = update_gaussian(mean, covariance, np.array([k]),
+                np.ones(1), float(daily[k]), daily_variance)
+        issued[k] = mean[k]; issued_variance[k] = covariance[k, k]
+    return issued, issued_variance
+
+
+def person_arrays(data, pid, readout, channel, E):
+    comp = data.components[data.components.id.eq(pid)].sort_values('t').copy()
+    if 'session_observed' in comp:
+        comp = comp[comp.session_observed.astype(bool)]
+    daily = data.daily[data.daily.id.eq(pid) & data.daily.t.isin(comp.t)].sort_values('t')
+    all_anchors = data.anchors[data.anchors.id.eq(pid)].copy()
+    anchors = all_anchors[all_anchors.anchor.eq(channel)].copy()
+    # Same-day sessions after the questionnaire are outside its recall window.
+    anchors['window_end'] = np.minimum(anchors.window_end, anchors.t)
+    b = comp[[f'B{j}' for j in range(data.config.q)]].astype(float).ffill().fillna(0.).to_numpy()
+    cols = [f'X{j}' for j in range(data.config.p_daily)]
+    maskcols = [f'input_{c}' for c in cols]
+    if not set(maskcols).issubset(daily): maskcols = [f'obs_{c}' for c in cols]
+    x = daily[cols].to_numpy(float); mask = daily[maskcols].to_numpy(bool) & np.isfinite(x)
+    intercept, beta, means, sd = readout
+    predicted = intercept + np.where(mask, x, means[None, :]) @ beta
+    features = E._dc_transition_features(b, comp.a.to_numpy(int),
+        comp.recent_treatment.to_numpy(float), comp.treatment_burden.to_numpy(float),
+        data.config.n_treatment_types, basis='linear')
+    gaps = comp.dt.to_numpy(float)[:-1]
+    if np.any(gaps < 0): raise ValueError('Negative elapsed time.')
+    return dict(comp=comp, anchors=anchors, all_anchors=all_anchors,
+                daily=predicted, daily_observed=mask.any(axis=1), daily_variance=sd**2,
+                features=features, gaps=gaps)
+
+
+def transition_arrays(person, model, args):
+    features = person['features']; gaps = person['gaps']
+    theta = model['theta']; nbase = features.shape[1]
+    drift = features @ theta[:nbase]
+    phi = np.zeros(len(gaps))
+    if model['kind'] == 'markov':
+        group = pattern_groups(person['all_anchors'], len(gaps)+1, model['edges'])[1:]
+        drift += theta[nbase + group]
+        phi = np.clip(theta[nbase+args.markov_strata+group], -.95, .05)
+    persistence = np.exp(phi*gaps)
+    scale = gaps.copy()
+    nz = np.abs(phi) >= 1e-8
+    scale[nz] = np.expm1(phi[nz]*gaps[nz])/phi[nz]
+    return drift*scale, persistence, args.transition_sd**2*gaps
+
+
+def smooth_development(person, model, args):
+    """Complete-record fitting restricted by the caller to development patients."""
+    n = len(person['daily']); rows = []; targets = []
+    def add(idx, weight, target, variance):
+        row = np.zeros(n); sd = np.sqrt(max(variance, 1e-10))
+        row[idx] = np.asarray(weight)/sd; rows.append(row); targets.append(target/sd)
+    add([0], [1.], 0., args.prior_sd**2)
+    for r in person['anchors'].itertuples(index=False):
+        if not r.observed: continue
+        idx = np.arange(max(0, int(r.window_start)), min(n-1, int(r.window_end), int(r.t))+1)
+        add(idx, np.full(len(idx), r.loading/len(idx)),
+            r.value-getattr(r, 'intercept', 0.), r.observation_sd**2)
+    for k in np.flatnonzero(person['daily_observed']):
+        add([k], [1.], person['daily'][k], person['daily_variance'])
+    drift, persistence, variance = transition_arrays(person, model, args)
+    for k in range(1, n):
+        add([k-1, k], [-persistence[k-1], 1.], drift[k-1], variance[k-1])
+    return np.linalg.lstsq(np.asarray(rows), np.asarray(targets), rcond=None)[0]
+
+
+def fit_models(data, E, args=None):
+    args = E._dc_args('linear') if args is None else args
+    if args.s0_basis != 'linear':
+        raise ValueError('The finalized prospective empirical comparators use the linear basis.')
+    train_ids = sorted(data.individuals.loc[data.individuals.split.eq('train'), 'id'].astype(int))
+    models = {}
+    for channel in ['Y1', 'Y2']:
+        readout = E._dc_fit_daily_readout(data, set(train_ids), args.daily_ridge, anchor_name=channel)
+        people = {pid: person_arrays(data, pid, readout, channel, E) for pid in train_ids}
+        nbase = next(iter(people.values()))['features'].shape[1]
+        counts = np.concatenate([prior_counts(p['all_anchors'], len(p['daily'])) for p in people.values()])
+        edges = np.quantile(counts, np.arange(1, args.markov_strata)/args.markov_strata)
+        lg = dict(kind='linear_gaussian', theta=np.zeros(nbase), readout=readout, edges=edges)
+        for _ in range(args.iters):
+            xblocks = []; yblocks = []
+            for person in people.values():
+                z = smooth_development(person, lg, args); ok = person['gaps'] > 0
+                if ok.any():
+                    xblocks.append(person['features'][ok]); yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+            x = np.vstack(xblocks); y = np.concatenate(yblocks)
+            penalty = args.beta_ridge*np.eye(nbase); penalty[0, 0] = 0.
+            lg['theta'] = np.linalg.solve(x.T@x+penalty, x.T@y)
+        markov = dict(kind='markov', theta=np.r_[lg['theta'], np.zeros(2*args.markov_strata)],
+                      readout=readout, edges=edges)
+        for _ in range(args.markov_iters):
+            xblocks = []; yblocks = []
+            for person in people.values():
+                z = smooth_development(person, markov, args); ok = person['gaps'] > 0
+                groups = pattern_groups(person['all_anchors'], len(z), edges)[1:]
+                onehot = np.eye(args.markov_strata)[groups]
+                xblocks.append(np.column_stack([person['features'], onehot, onehot*z[:-1, None]])[ok])
+                yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+            x = np.vstack(xblocks); y = np.concatenate(yblocks)
+            penalty = args.markov_ridge*np.eye(x.shape[1]); penalty[0, 0] = 0.
+            theta = np.linalg.solve(x.T@x+penalty, x.T@y)
+            theta[nbase+args.markov_strata:] = np.clip(theta[nbase+args.markov_strata:], -.95, .05)
+            markov['theta'] = theta
+        models[channel] = dict(lg=lg, markov=markov)
+    return models, args, train_ids
+
+
+def predict_patient(data, pid, model, channel, args, E):
+    person = person_arrays(data, pid, model['readout'], channel, E)
+    drift, persistence, variance = transition_arrays(person, model, args)
+    return forward_filter(drift, persistence, variance, person['daily'],
+        person['daily_observed'], person['daily_variance'], person['anchors'], args.prior_sd**2)
+
+'''
+
 SRC_EMPIRICAL_FIT_EMPIRICAL = r'''
-"""Empirical BALL held-out recovery analysis on the rTMS cohort."""
+"""Empirical BALL held-out recovery analysis on the rTMS cohort.
+
+Implements the deployable empirical estimator. For each patient it recovers a
+recall-windowed latent severity trajectory from the retained sparse anchors and
+a slow smoothing prior, then predicts the held-out genuine measurements. The
+prediction of a held-out anchor is the mean of the recovered latent over that
+anchor's recall window. Recovery is scored against the held-out measurements and
+compared with prospective statistical and machine learning models on the identical held-out set. Errors are stratified
+by days since the last prior retained anchor. Split conformal intervals are calibrated
+on a held-out-anchor calibration fold and evaluated for coverage. The whole
+analysis is repeated across the anchor-cadence sweep.
+
+Two channels are modeled. The depression channel is anchored by PHQ-9 and BDI.
+The anxiety channel is anchored by GAD-7. Each instrument uses a prespecified
+range transform based only on its possible minimum and maximum. No cohort,
+cadence, held-out, or future values determine the empirical anchor scale.
+
+The same recovered trajectories are also used for a descriptive empirical
+direct-RDoC transition analysis. That analysis regresses adjacent-session latent
+change on the six note-derived RDoC proxy dimensions, adjusted for current
+latent level, inter-session gap, and proxy staleness, and reports a permutation
+control. Because the empirical data do not contain a true transition beta, this
+is an observable association and predictive-increment check rather than a
+parameter-recovery claim.
+"""
 
 from __future__ import annotations
 
@@ -11168,6 +12566,8 @@ import torch.nn.functional as F
 
 import dataclasses as _dataclasses
 
+# Sleep is used only for brief checkpoint-file replacement retries when Dropbox
+# or antivirus software holds a destination file momentarily on Windows.
 from time import sleep
 
 from simulations.src.model_utils import AnchorSpec, SimulationConfig, SimulationData, marginal_anchor_sd
@@ -11180,10 +12580,14 @@ from simulations.src.methods.ball_ssm import (
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / "derived"
+# Cadence controls only how often a genuine questionnaire event is retained as
+# an anchor. Every questionnaire continues to summarize the preceding 14 days.
 CADENCES = [7, 14, 21, 28]
+# Channel membership and anchor noise (standardized scale). PHQ-9 is the
+# depression reference. GAD-7 is anxiety. BDI joins depression.
 CHANNELS = {"depression": ["PHQ9", "BDI"], "anxiety": ["GAD7"]}
-SMOOTH_SD = 0.7
-ANCHOR_SD = 0.6
+SMOOTH_SD = 0.7          # random-walk smoothing scale on the latent (z units)
+ANCHOR_SD = 0.6          # anchor measurement noise (z units)
 CONFORMAL_ALPHA = 0.05
 GAP_BINS = [0, 1, 2, 4, 7, 1000]
 GAP_LABELS = ["0-1", "1-2", "2-4", "4-7", "7+"]
@@ -11192,6 +12596,9 @@ RDOC_NUISANCE_COLS = ["L_current", "dt", "rdoc_days_stale"]
 RDOC_RIDGE = 1.0
 RDOC_FOLDS = 5
 RDOC_PERMUTATIONS = 200
+# The source cohort was selected from 25 clinics with harmonized EHR fields.
+# The analysis extract contains 23 observed facility strings, which reconcile to
+# 19 canonical clinic groups for the frozen 10/3/6 development and test split.
 SOURCE_NETWORK_CLINIC_COUNT = 25
 COMORBIDITY_CATEGORY_COLS = [
     "dx_depression",
@@ -11249,6 +12656,14 @@ def _canonical_empirical_clinic(value) -> str:
             return upper[len(prefix):]
     return upper
 
+# Markov pattern-mixture comparator (classical statistics arm). A finite mixture
+# of linear-Gaussian Markov trajectory classes is pooled across patients within a
+# channel, fit by EM on the anchor marginal likelihood, with class membership
+# conditioned on each patient's retained-anchor count (the pattern-mixture
+# structure). Each patient's latent is the responsibility-weighted posterior mean
+# of a level (random walk) plus fast (AR1) state-space smoother. Held-out
+# measurements are predicted by the recall-window mean of the recovered latent,
+# the same prediction rule used for every other method.
 MARKOV_K = 3
 MARKOV_STRATA = 3
 MARKOV_EM_ITERS = 6
@@ -11259,7 +12674,7 @@ MARKOV_MAX_SCALE = 6.0
 MARKOV_MIN_PHI = -0.95
 MARKOV_MAX_PHI = 0.95
 MARKOV_JITTER = 1e-6
-MARKOV_MAX_FIT_PATIENTS = 200
+MARKOV_MAX_FIT_PATIENTS = 200  # cap patients used for EM parameter fitting (applied to all)
 EMPIRICAL_SEED = 41421
 FIT_FINAL_FILES = [
     "empirical_recovery_overall.csv",
@@ -11356,11 +12771,11 @@ def _m_params_to_theta(p: _MClass) -> np.ndarray:
 
 @dataclass
 class _MPatient:
-    design: np.ndarray
-    values: np.ndarray
+    design: np.ndarray      # (W, S) windowed-mean anchor design over session positions
+    values: np.ndarray      # (W,) standardized retained anchor values
     n_sess: int
-    min_grid: np.ndarray
-    lag_grid: np.ndarray
+    min_grid: np.ndarray    # (S, S) min(s, t)
+    lag_grid: np.ndarray    # (S, S) |s - t|
     stratum: int
 
 
@@ -11460,7 +12875,12 @@ def _m_smooth(patient: _MPatient, p: _MClass) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _fit_markov_channel(patients: list[_MPatient]) -> tuple[list[_MClass], np.ndarray]:
-    """EM over class dynamics and stratum-conditional mixing for one channel."""
+    """EM over class dynamics and stratum-conditional mixing for one channel.
+
+    Parameter fitting is capped at MARKOV_MAX_FIT_PATIENTS deterministically
+    sampled patients for runtime; the fitted classes and mixing weights are then
+    applied to every patient in the channel.
+    """
 
     level_prior_var = MARKOV_LEVEL_PRIOR_SD**2
     all_vals = np.concatenate([p.values for p in patients]) if patients else np.array([])
@@ -11560,7 +12980,12 @@ def _patient_balanced_conformal_quantile(
     alpha: float,
     default: float = float("nan"),
 ) -> tuple[float, int]:
-    """Weighted quantile where every patient contributes total weight one."""
+    """Weighted quantile where every patient contributes total weight one.
+
+    The caller supplies measurements from one questionnaire instrument, so a
+    patient with ``m_im`` eligible measurements of instrument ``m`` receives
+    weight ``1 / m_im`` on each of those measurements.
+    """
 
     required = {"id", "normalized_score"}
     if not required.issubset(scores.columns):
@@ -11927,7 +13352,12 @@ def _empirical_neural_dataset(
     max_patients: int | None = None,
     patient_splits: dict[int, str] | None = None,
 ) -> tuple[SimulationData, dict[int, np.ndarray]]:
-    """Build the rectangular empirical tensor consumed by the BALL SSM."""
+    """Build the rectangular empirical tensor consumed by the BALL SSM.
+
+    The retained sparse anchors are the only symptom-scale values supplied to
+    the model. Held-out genuine measurements stay out of this object and are
+    used only in the downstream recovery evaluation.
+    """
 
     sessions = _coerce_sessions(sessions_full)
     if "split" in sessions.columns:
@@ -11998,6 +13428,9 @@ def _empirical_neural_dataset(
     else:
         rdoc_by = {}
 
+    # Learn the action vocabulary from the training partition only whenever a
+    # true patient-held-out split is supplied. Test-only categories map to the
+    # reserved unknown action rather than defining the embedding vocabulary.
     action_source = sessions
     if patient_splits:
         training_ids = {
@@ -12009,6 +13442,8 @@ def _empirical_neural_dataset(
         if action_col in action_source.columns:
             action_values.extend(action_source[action_col].dropna().unique().tolist())
     action_values = sorted(set(action_values))
+    # Raw indices are shifted by one during batching, which reserves embedding
+    # index zero for missing or development-unseen categories.
     action_map = {value: index for index, value in enumerate(action_values)}
     n_actions = max(len(action_map), 1)
 
@@ -12037,6 +13472,8 @@ def _empirical_neural_dataset(
             row = g.iloc[tpos] if real else None
             day = int(row["day"]) if real else int(tpos)
             session_index = int(row["session"]) if real else int(tpos)
+            # A pure chronological count. It is never divided by a completed
+            # course length and never read from a future-derived course field.
             session_number = float(tpos + 1) if real else 0.0
             dx_row = comorbidity_by.get((pid, session_index)) if real else None
             rdoc_row = rdoc_by.get((pid, day))
@@ -12048,6 +13485,10 @@ def _empirical_neural_dataset(
                 rdoc_observed = float(bool(getattr(rdoc_row, "rdoc_observed", False)))
                 stale_val = getattr(rdoc_row, "rdoc_days_stale", 0.0)
                 stale = float(stale_val) if stale_val is not None and np.isfinite(stale_val) else 0.0
+            # The current treatment can govern the transition from this session
+            # to the next one. The causal encoder receives only the previous
+            # session's treatment, which was known before the current symptom
+            # measurement and cannot leak a same-session treatment decision.
             action_raw = row.get("action_id") if real and "action_id" in g.columns else None
             previous_action_raw = (
                 row.get("prev_action_id") if real and "prev_action_id" in g.columns else None
@@ -12070,6 +13511,10 @@ def _empirical_neural_dataset(
                 "z_d": 0.0, "z_p": 0.0,
                 "L": 0.0, "slow": 0.0, "delta": 0.0, "proxy_observed": bool(rdoc_observed),
                 "dt": next_gap, "session_observed": bool(real),
+                # Fields the fair direct comparators (S0/Markov) read; the empirical
+                # tensor must carry the same covariate streams BALL gets so the
+                # comparison is input-matched. recent_treatment/treatment_burden are
+                # not available empirically and are set to zero (an honest absence).
                 "subtype": 0, "recent_treatment": recent_tx, "treatment_burden": burden,
             }
             for j, col in enumerate(RDOC_COLS):
@@ -12720,6 +14165,10 @@ def _fit_empirical_teacher_student(
     data, session_days = _empirical_neural_dataset(
         anchors,
         sessions_full,
+        # The primary empirical latent trajectory must be constructed without
+        # the RDoC exposure later tested in the transition analysis.  Keeping
+        # this tensor identically zero removes the circular path in which RDoC
+        # could influence both the recovered outcome and the post hoc exposure.
         None,
         comorbidity_sessions,
         measurement_calibration,
@@ -12774,6 +14223,9 @@ def _fit_empirical_teacher_student(
         diagnostics_every_epochs=int(args.diagnostics_every_epochs),
         state_checkpoint_every_epochs=int(args.checkpoint_every_epochs),
     )
+    # Global parameters are fit only on development patients. The evaluation
+    # batch contains the held-out-clinic patients so their retained prior anchors
+    # can condition causal filtering without contributing to parameter fitting.
     primary_cfg = _empirical_checkpointed_config(
         cfg,
         checkpoint_directory,
@@ -12995,6 +14447,9 @@ def _fit_empirical_teacher_student(
     no_dense_ehr = None
     if args.dense_ehr_ablation and int(cadence) == 14:
         stage_started = perf_counter()
+        # Preserve raw session number and prior-treatment context but remove all
+        # diagnosis/comorbidity covariates. Anchors remain unchanged and the
+        # transformer architecture and training schedule match the full model.
         ablated_daily = data.daily.copy()
         for j in range(1, data.config.p_daily):
             col = f"X{j}"
@@ -13052,6 +14507,9 @@ def _fit_empirical_teacher_student(
     ball_anchor_only = None
     if args.anchor_only_ablation and int(cadence) == 14:
         stage_started = perf_counter()
+        # The causal BALL architecture and training schedule are retained while
+        # structured covariates and treatment categories are removed. Calendar
+        # gaps and retained prior anchors still define the measurement problem.
         anchor_daily = data.daily.copy()
         for j in range(data.config.p_daily):
             col = f"X{j}"
@@ -13323,6 +14781,9 @@ def _fit_empirical_teacher_student(
         },
     }
     manifest_dir.mkdir(parents=True, exist_ok=True)
+    # Fit each classical comparator separately by latent channel. Pooling Y1 and
+    # Y2 into one scalar trajectory would unfairly mix depression and anxiety and
+    # would not estimate the same target as BALL's channel-specific predictions.
     stage_started = perf_counter()
     _write_empirical_stage_status(
         manifest_dir,
@@ -13572,7 +15033,12 @@ def _select_empirical_gp_kernel(
     *,
     fixed_auxiliary_weight: float = GP_AUXILIARY_WEIGHT,
 ) -> dict[str, object]:
-    """Select channel-specific time kernels in model-selection clinics."""
+    """Select channel-specific time kernels in model-selection clinics.
+
+    The auxiliary covariance weight is fixed to the same prespecified value
+    used by the simulation Gaussian-process comparator. Only the slow and fast
+    calendar-time length scales are selected from the development clinics.
+    """
 
     train_ids = sorted(int(value) for value in selection_ids)
     candidates = [
@@ -13737,6 +15203,9 @@ def _fit_empirical_gp_channel(
         filtered = prior_mean.copy()
         measurement_positions = np.asarray(measurement_positions, dtype=int)
         for step in range(count):
+            # The strict prospective target is defined immediately before the
+            # questionnaire encounter, so only earlier recorded sessions can
+            # condition the filtered estimate at this step.
             eligible = measurement_positions < step
             if eligible.any():
                 conditioned = _gp_conditioned_mean(
@@ -14368,7 +15837,11 @@ def _predict_lookup_window_sd(
 
 
 def _solve_patient(sess_days: np.ndarray, retained: pd.DataFrame, stats: dict):
-    """Recover the latent severity over a patient's session days."""
+    """Recover the latent severity over a patient's session days.
+
+    Returns (L_hat, raw_sd) arrays aligned to sess_days, or (None, None) if the
+    patient has fewer than two retained anchors.
+    """
 
     S = len(sess_days)
     if S == 0 or len(retained) < 2:
@@ -14386,6 +15859,7 @@ def _solve_patient(sess_days: np.ndarray, retained: pd.DataFrame, stats: dict):
         targets.append(target * w)
         r += 1
 
+    # Anchor rows: windowed mean of latent equals the standardized anchor value.
     for row in retained.itertuples(index=False):
         mu, sd = stats[row.anchor]
         z = (float(row.value) - mu) / sd
@@ -14397,6 +15871,7 @@ def _solve_patient(sess_days: np.ndarray, retained: pd.DataFrame, stats: dict):
         coeff = 1.0 / len(win)
         add([(j, coeff) for j in win], z, ANCHOR_SD)
 
+    # Random-walk smoothing on the latent.
     for i in range(1, S):
         add([(i, 1.0), (i - 1, -1.0)], 0.0, SMOOTH_SD)
 
@@ -14404,6 +15879,7 @@ def _solve_patient(sess_days: np.ndarray, retained: pd.DataFrame, stats: dict):
     b = np.asarray(targets, dtype=float)
     sol = lsqr(A, b, atol=1e-7, btol=1e-7, iter_lim=2000)
     L = sol[0]
+    # Diagonal precision approximation for the raw interval.
     prec = np.asarray(A.power(2).sum(axis=0)).ravel()
     raw_sd = 1.0 / np.sqrt(np.maximum(prec, 1e-8))
     return L, raw_sd
@@ -14415,6 +15891,21 @@ def _predict_window(L: np.ndarray, sess_days: np.ndarray, w0: int, w1: int, day:
         return float(L[int(np.argmin(np.abs(sess_days - day)))])
     return float(win.mean())
 
+
+# ---------------------------------------------------------------------------
+# Fair direct-RDoC comparators for the EMPIRICAL recovery: S0 direct LGSSM and
+# Markov direct transition. Faithful ports of the simulation benchmark
+# comparators (validation/direct_rdoc_fair_comparator.py fit_direct_map and
+# validation/direct_rdoc_benchmark.py fit_markov_direct) so the empirical S0/Markov
+# use the same retained anchors and frozen questionnaire links. The transition
+# equations use elapsed time and lagged treatment context, while the fourteen
+# structured covariates enter a separate development-fitted severity readout.
+# The empirical RDoC tensor is identically zero. They run on the empirical
+# SimulationData from _empirical_neural_dataset and return a latent
+# trajectory per (id, session index), windowed for held-out measurements exactly
+# like the BALL predictions. A fixed linear basis matches the simulation's fair
+# default, so the comparators face the same mis-specification the transformer does.
+# ---------------------------------------------------------------------------
 
 class _DCArgs:
     def __init__(self, **kw):
@@ -14428,9 +15919,7 @@ def _dc_args(basis: str = "linear") -> "_DCArgs":
 
 
 def _dc_impute_by_time(frame: pd.DataFrame, cols: list[str]) -> np.ndarray:
-    vals = frame[cols].astype(float).interpolate(limit_direction="both")
-    vals = vals.fillna(vals.mean()).fillna(0.0)
-    return vals.to_numpy(dtype=float)
+    return frame[cols].astype(float).ffill().fillna(0.0).to_numpy(dtype=float)
 
 
 def _dc_fit_daily_readout(data, train_ids, ridge: float = 1.0, *, anchor_name: str | None = None):
@@ -14645,22 +16134,38 @@ def _dc_fit_direct_map_channel(data, args, *, anchor_name: str):
     return preds, theta
 
 
+_PROSPECTIVE_CLASSICAL_CACHE = None
+
+def _dc_prospective_predictions(data, args, kind):
+    """Fit only development patients and issue forward estimates for each session."""
+    import sys
+    from empirical.prospective_classical import fit_models, predict_patient
+    global _PROSPECTIVE_CLASSICAL_CACHE
+    signature = tuple(sorted(vars(args).items()))
+    cache = _PROSPECTIVE_CLASSICAL_CACHE
+    if cache is None or cache[0] is not data or cache[1] != signature:
+        models, settings, train_ids = fit_models(data, sys.modules[__name__], args)
+        _PROSPECTIVE_CLASSICAL_CACHE = (data, signature, models, settings)
+    else:
+        _, _, models, settings = cache
+    frames = []
+    for pid in sorted(data.individuals.id.astype(int)):
+        values = {}
+        for channel, column in [('Y1', 'z_d_hat'), ('Y2', 'z_p_hat')]:
+            values[column] = predict_patient(data, pid, models[channel][kind],
+                channel, settings, sys.modules[__name__])[0]
+        frame = pd.DataFrame(values)
+        frame['id'] = pid
+        frame['t'] = np.arange(len(frame))
+        frame['L_hat'] = .5 * (frame.z_d_hat + frame.z_p_hat)
+        frames.append(frame)
+    predictions = pd.concat(frames, ignore_index=True)
+    parameters = {label: models[channel][kind]['theta']
+        for label, channel in [('depression', 'Y1'), ('anxiety', 'Y2')]}
+    return predictions, parameters
+
 def _dc_fit_direct_map(data, args):
-    depression, depression_theta = _dc_fit_direct_map_channel(
-        data, args, anchor_name="Y1"
-    )
-    anxiety, anxiety_theta = _dc_fit_direct_map_channel(
-        data, args, anchor_name="Y2"
-    )
-    merged = depression[["id", "t", "L_hat"]].rename(
-        columns={"L_hat": "z_d_hat"}
-    ).merge(
-        anxiety[["id", "t", "L_hat"]].rename(columns={"L_hat": "z_p_hat"}),
-        on=["id", "t"],
-        validate="one_to_one",
-    )
-    merged["L_hat"] = 0.5 * (merged["z_d_hat"] + merged["z_p_hat"])
-    return merged, {"depression": depression_theta, "anxiety": anxiety_theta}
+    return _dc_prospective_predictions(data, args, 'lg')
 
 
 def _dc_anchor_pattern_strata(data, n_strata, fit_ids=None):
@@ -14810,21 +16315,9 @@ def _dc_fit_markov_direct_channel(data, args, *, basis, anchor_name):
 
 
 def _dc_fit_markov_direct(data, args, *, basis):
-    depression = _dc_fit_markov_direct_channel(
-        data, args, basis=basis, anchor_name="Y1"
-    )
-    anxiety = _dc_fit_markov_direct_channel(
-        data, args, basis=basis, anchor_name="Y2"
-    )
-    merged = depression[["id", "t", "L_hat"]].rename(
-        columns={"L_hat": "z_d_hat"}
-    ).merge(
-        anxiety[["id", "t", "L_hat"]].rename(columns={"L_hat": "z_p_hat"}),
-        on=["id", "t"],
-        validate="one_to_one",
-    )
-    merged["L_hat"] = 0.5 * (merged["z_d_hat"] + merged["z_p_hat"])
-    return merged
+    if basis != 'linear':
+        raise ValueError('The finalized prospective empirical Markov model uses the linear basis.')
+    return _dc_prospective_predictions(data, args, 'markov')[0]
 
 
 def _dc_predictions(preds: pd.DataFrame, column: str = "L_hat") -> dict[int, np.ndarray]:
@@ -14843,15 +16336,29 @@ def _channel_eval(
     session_days_by_id: dict[int, np.ndarray] | None = None,
     measurement_calibration: dict | None = None,
 ) -> pd.DataFrame:
-    """Held-out recovery rows for one channel, all methods."""
+    """Held-out recovery rows for one channel, all methods.
+
+    BALL, the direct causal transformer, the Gaussian
+    process, the exponential-decay GRU and the channel-specific statistical comparators are
+    evaluated on the same genuine questionnaire events omitted by the cadence schedule.
+    The BALL interval scale comes from its deep ensemble and last-layer Laplace
+    predictive standard deviation.
+    """
 
     predictions = neural_predictions or {}
     has_neural = "student" in predictions
+    if not has_neural:
+        raise ValueError("Forward student predictions are required for prospective evaluation.")
     patients: list[dict] = []
     for pid, ach in anchors_ch.groupby("id"):
         sess = sessions[sessions["id"] == pid]
         if sess.empty:
             continue
+        # Per-session-row days in the SAME order the model produced its latents
+        # (sort by session then day, duplicates kept). The prediction arrays are
+        # indexed by session-row position, so the lookup must use this array, not
+        # a unique-day reconstruction, or duplicate calendar days shift every
+        # later position onto the wrong day.
         if session_days_by_id is not None and int(pid) in session_days_by_id:
             sess_days = np.asarray(session_days_by_id[int(pid)], dtype=int)
         else:
@@ -14862,6 +16369,11 @@ def _channel_eval(
         heldout = ach[ach["evaluation_role"] == "withheld_eligible"]
         if heldout.empty:
             continue
+        # The deployed neural estimators and prospective anchor baselines do not
+        # require any retained anchor in the completed treatment course. Do not
+        # condition evaluation eligibility on measurements that may occur after
+        # the time of estimation. The legacy reconstruction is needed only
+        # when this routine is called without neural predictions.
         if has_neural:
             L, raw_sd = None, None
         else:
@@ -14896,7 +16408,7 @@ def _channel_eval(
         baseline_by_anchor = baseline_rows["value"].to_dict()
         baseline_day_by_anchor = baseline_rows["day"].to_dict()
         patients.append({
-            "id": int(pid), "sess_days": sess_days, "heldout": heldout, "L": L, "raw_sd": raw_sd,
+            "id": int(pid), "sess_days": sess_days, "sess_sessions": sess.sort_values(["session", "day"])["session"].to_numpy(), "heldout": heldout, "L": L, "raw_sd": raw_sd,
             "ret_days_s": ret_days[order], "ret_sessions_s": ret_sessions[order], "ret_z_s": ret_z[order],
             "baseline_by_anchor": baseline_by_anchor,
             "baseline_day_by_anchor": baseline_day_by_anchor,
@@ -14944,44 +16456,48 @@ def _channel_eval(
             if np.isfinite(baseline_day) and baseline_day > day:
                 raise AssertionError("A clinical classification baseline occurs after its target.")
             target_session = int(h.session)
+            position = np.flatnonzero(p["sess_sessions"] == target_session)
+            if len(position) != 1:
+                raise ValueError("Questionnaire target must map to exactly one recorded session.")
+            prediction_days = sess_days[:int(position[0])+1]
             prior_mask = ret_sessions_s < target_session
             prior_anchor_count = int(np.sum(prior_mask))
+            # Gap means elapsed time since the most recent prior anchor. It must
+            # never look ahead to a later retained measurement. Cold-start rows
+            # have no such gap and are reported in their own stratum.
             gap = float(day - np.max(ret_days_s[prior_mask])) if prior_anchor_count else float("nan")
             if has_neural:
                 ball = to_measurement_scale(
-                    _predict_lookup_window(predictions["student"], pid, sess_days, w0, w1, day)
-                )
-                ball_teacher = to_measurement_scale(
-                    _predict_lookup_window(predictions["teacher"], pid, sess_days, w0, w1, day)
+                    _predict_lookup_window(predictions["student"], pid, prediction_days, w0, w1, day)
                 )
                 ball_direct_causal = (
                     to_measurement_scale(
-                        _predict_lookup_window(predictions["direct_causal"], pid, sess_days, w0, w1, day)
+                        _predict_lookup_window(predictions["direct_causal"], pid, prediction_days, w0, w1, day)
                     )
                     if "direct_causal" in predictions else float("nan")
                 )
                 ball_no_dense_ehr = (
                     to_measurement_scale(
-                        _predict_lookup_window(predictions["no_dense_ehr"], pid, sess_days, w0, w1, day)
+                        _predict_lookup_window(predictions["no_dense_ehr"], pid, prediction_days, w0, w1, day)
                     )
                     if "no_dense_ehr" in predictions else float("nan")
                 )
                 gp_causal = (
                     to_measurement_scale(
-                        _predict_lookup_window(predictions["gp_causal"], pid, sess_days, w0, w1, day)
+                        _predict_lookup_window(predictions["gp_causal"], pid, prediction_days, w0, w1, day)
                     )
                     if "gp_causal" in predictions else float("nan")
                 )
                 ode_rnn = (
                     to_measurement_scale(
-                        _predict_lookup_window(predictions["ode_rnn"], pid, sess_days, w0, w1, day)
+                        _predict_lookup_window(predictions["ode_rnn"], pid, prediction_days, w0, w1, day)
                     )
                     if "ode_rnn" in predictions else float("nan")
                 )
                 focused_predictions = {
                     method: to_measurement_scale(
                         _predict_lookup_window(
-                            predictions[method], pid, sess_days, w0, w1, day
+                            predictions[method], pid, prediction_days, w0, w1, day
                         )
                     )
                     for method in (
@@ -14994,7 +16510,7 @@ def _channel_eval(
                     if method in predictions
                 }
                 latent_window_sd = (
-                    _predict_lookup_window_sd(predictions["student_sd"], pid, sess_days, w0, w1, day)
+                    _predict_lookup_window_sd(predictions["student_sd"], pid, prediction_days, w0, w1, day)
                     if "student_sd" in predictions else float("nan")
                 )
                 ball_sd = float(
@@ -15007,7 +16523,6 @@ def _channel_eval(
                     raise AssertionError("BALL predictive standard deviation must be finite and positive.")
             else:
                 ball = to_measurement_scale(_predict_window(L, sess_days, w0, w1, day))
-                ball_teacher = float("nan")
                 ball_direct_causal = float("nan")
                 ball_no_dense_ehr = float("nan")
                 gp_causal = float("nan")
@@ -15017,38 +16532,19 @@ def _channel_eval(
                 ball_sd = float(raw_sd[si])
             if "s0" in predictions:
                 s0 = to_measurement_scale(
-                    _predict_lookup_window(predictions["s0"], pid, sess_days, w0, w1, day)
+                    _predict_lookup_window(predictions["s0"], pid, prediction_days, w0, w1, day)
                 )
             elif L is not None:
                 s0 = to_measurement_scale(_predict_window(L, sess_days, w0, w1, day))
             else:
+                # Neural-only sensitivity analyses do not fit a statistical
+                # comparator, and their reporting does not use it.
                 s0 = float("nan")
-            markov = (to_measurement_scale(_predict_lookup_window(predictions["markov"], pid, sess_days, w0, w1, day))
+            markov = (to_measurement_scale(_predict_lookup_window(predictions["markov"], pid, prediction_days, w0, w1, day))
                       if "markov" in predictions else float("nan"))
-            interp = to_measurement_scale(float(np.interp(day, ret_days_s, ret_z_s))) if ret_days_s.size else float("nan")
-            prior_z = ret_z_s[prior_mask]
-            development_mean_normalized = float(
-                measurement_calibration["development_data"]["normalized_score_mean_by_instrument"][h.anchor]
-                if measurement_calibration is not None else 0.0
-            )
-            development_mean_latent = (
-                development_mean_normalized - instrument_intercept
-            ) / instrument_loading
-            locf = to_measurement_scale(
-                float(prior_z[-1]) if prior_z.size else development_mean_latent
-            )
-            causal_anchor_mean = to_measurement_scale(
-                float(prior_z.mean()) if prior_z.size else development_mean_latent
-            )
-            locf_reference_origin = to_measurement_scale(
-                float(prior_z[-1]) if prior_z.size else 0.0
-            )
-            causal_anchor_mean_reference_origin = to_measurement_scale(
-                float(prior_z.mean()) if prior_z.size else 0.0
-            )
             ball_anchor_only = (
                 to_measurement_scale(
-                    _predict_lookup_window(predictions["ball_anchor_only"], pid, sess_days, w0, w1, day)
+                    _predict_lookup_window(predictions["ball_anchor_only"], pid, prediction_days, w0, w1, day)
                 )
                 if "ball_anchor_only" in predictions else float("nan")
             )
@@ -15058,15 +16554,12 @@ def _channel_eval(
                 "prior_anchor_count": prior_anchor_count,
                 "cold_start": bool(prior_anchor_count < 2),
                 "z_true": z_true,
-                "ball": ball, "ball_teacher": ball_teacher, "s0_direct_lgssm": s0,
+                "ball": ball, "s0_direct_lgssm": s0,
                 "ball_direct_causal": ball_direct_causal,
                 "ball_no_dense_ehr": ball_no_dense_ehr,
                 "gp_causal_filter": gp_causal,
                 "exponential_decay_gru": ode_rnn,
-                "markov_direct_transition": markov, "interpolation": interp, "locf": locf,
-                "causal_anchor_mean": causal_anchor_mean,
-                "locf_reference_origin": locf_reference_origin,
-                "causal_anchor_mean_reference_origin": causal_anchor_mean_reference_origin,
+                "markov_direct_transition": markov,
                 "ball_anchor_only": ball_anchor_only,
                 "ball_sd": float(ball_sd),
                 **focused_predictions,
@@ -15333,6 +16826,10 @@ def _channel_transition_rows(
         if rd.empty:
             continue
         if use_neural and int(pid) in session_days_by_id:
+            # Student latents are indexed by session-row position in the model's
+            # tensor order. Use the canonical per-row days and fetch each row's
+            # RDoC proxy by (id, day) exactly as the tensor did (rdoc_by, last
+            # row wins per duplicate day), so L[i] and b_mat[i] stay aligned.
             L_full = neural_predictions["student"].get(int(pid))
             if L_full is None:
                 continue
@@ -15448,6 +16945,8 @@ def _cv_error(frame: pd.DataFrame, features: list[str]) -> tuple[float, float]:
         if len(train) <= len(features) + 1 or test.empty:
             continue
         pred, _ = _ridge_predict(train, test, features)
+        # Model total adjacent-session change.  Elapsed time enters explicitly
+        # through the raw dt covariate; the outcome is never divided by days.
         y_all.append(test["delta"].to_numpy(dtype=float))
         pred_all.append(pred)
     if not y_all:
@@ -15491,6 +16990,10 @@ def _transition_one_group(
             ),
         }, []
 
+    # The primary decomposition uses the mean of strictly earlier profiles, so
+    # the current profile and every later note remain outside its reference
+    # value. A full-record patient mean is retained as a retrospective
+    # sensitivity and written to separate output files.
     between_cols, within_cols = [], []
     note_profiles = (
         frame[["id", "rdoc_note_day", *RDOC_COLS]]
@@ -15539,6 +17042,8 @@ def _transition_one_group(
     if np.isfinite(improvement):
         for _ in range(RDOC_PERMUTATIONS):
             perm = frame.copy()
+            # Circular shifts preserve each patient's marginal RDoC profile and
+            # serial structure while breaking alignment with adjacent changes.
             for _, idx in perm.groupby("id", sort=False).groups.items():
                 idx = np.asarray(list(idx), dtype=int)
                 if len(idx) < 2:
@@ -15890,7 +17395,15 @@ def _write_fit_run_manifest(
 def _primary_empirical_partitions(
     sessions_full: pd.DataFrame,
 ) -> tuple[dict[int, str], dict[int, str], dict]:
-    """Create the frozen clinic-held-out model and interval partitions."""
+    """Create the frozen clinic-held-out model and interval partitions.
+
+    The source training and validation clinics form the final development set.
+    Any patient observed in clinics assigned to more than one source partition
+    is excluded before fitting. The remaining patients confined to the six
+    source test clinics remain wholly unseen during global parameter fitting and
+    are deterministically divided into calibration and final-evaluation groups
+    for cluster conformal inference.
+    """
 
     if not {"id", "split"}.issubset(sessions_full.columns):
         raise ValueError("Empirical primary evaluation requires patient id and source split columns.")
@@ -16037,7 +17550,13 @@ def _generalization_split_maps(sessions_full: pd.DataFrame) -> dict[str, dict[in
     sessions = sessions_full.copy()
     if "split" not in sessions.columns or "date" not in sessions.columns:
         return {}
-    sessions = sessions[sessions["split"].astype(str).isin(["train", "val"])].copy()
+    # The forward-time analysis stays within the thirteen development clinics,
+    # so it changes calendar period while holding the clinic network constant.
+    primary_model_splits, _, _ = _primary_empirical_partitions(sessions_full)
+    development_ids = {
+        int(pid) for pid, split in primary_model_splits.items() if split == "train"
+    }
+    sessions = sessions[sessions["id"].astype(int).isin(development_ids)].copy()
     dates = pd.to_datetime(sessions["date"], errors="coerce")
     patient_dates = sessions.assign(_date=dates).groupby("id")["_date"].agg(
         first_date="min", last_date="max"
@@ -16055,6 +17574,8 @@ def _generalization_split_maps(sessions_full: pd.DataFrame) -> dict[str, dict[in
             if pd.notna(row["first_date"]) and row["first_date"] >= cutoff
         }
     )
+    # Patients with records on both sides of the cutoff satisfy neither rule,
+    # so the temporal evaluation is independent in both patient and calendar time.
     return {"forward_2025": temporal_split}
 
 
@@ -16074,8 +17595,12 @@ def _fit_generalization_sensitivities(
         if not train_ids or not test_ids:
             continue
         anchors_use = anchors
+        primary_model_splits, _, _ = _primary_empirical_partitions(sessions_full)
+        development_ids = {
+            int(pid) for pid, split in primary_model_splits.items() if split == "train"
+        }
         development_network_sessions = sessions_full[
-            sessions_full["split"].astype(str).isin(["train", "val"])
+            sessions_full["id"].astype(int).isin(development_ids)
         ].copy()
         sessions_use = development_network_sessions
         comorbidity_use = comorbidity_sessions
@@ -16203,6 +17728,9 @@ def _fit_generalization_sensitivities(
             started_at=validation_started,
             details=_result_training_details(student, "student"),
         )
+        classical_args = _dc_args('linear')
+        classical_lg, _ = _dc_fit_direct_map(data, classical_args)
+        classical_markov = _dc_fit_markov_direct(data, classical_args, basis='linear')
         frames = []
         for channel, scales in CHANNELS.items():
             value_col = "z_d_hat" if channel == "depression" else "z_p_hat"
@@ -16210,7 +17738,8 @@ def _fit_generalization_sensitivities(
             predictions = {
                 "student": _prediction_lookup(student.predictions, value_col),
                 "student_sd": _prediction_lookup(student.intervals, sd_col),
-                "teacher": {},
+                "s0": _dc_predictions(classical_lg, value_col),
+                "markov": _dc_predictions(classical_markov, value_col),
             }
             sub = anchors[
                 anchors["anchor"].isin(scales) & anchors["id"].astype(int).isin(test_ids)
@@ -16276,7 +17805,7 @@ def _fit_generalization_sensitivities(
             temporal_width_fractions.append(
                 float(test_instrument.groupby("id")["width_fraction"].mean().mean())
             )
-        for method in ("ball", "locf", "interpolation", "causal_anchor_mean"):
+        for method in ("ball", "s0_direct_lgssm", "markov_direct_transition"):
             per_patient = _development_scaled_squared_error(ev_test, method).groupby(ev_test["id"]).mean()
             native = (
                 ev_test[method] * ev_test["scale_half_range"] + ev_test["scale_center"]
@@ -16314,7 +17843,11 @@ def _fit_generalization_sensitivities(
                 "selected_questionnaire_weight": float(temporal_args.anchor_weight),
                 "selected_student_questionnaire_weight": float(temporal_args.student_anchor_weight),
                 "measurement_calibration_scope": "all pre-2025 genuine questionnaire events from the ten training clinics",
-                "hyperparameter_selection_scope": "pre-2025 training clinics fitted and pre-2025 model-selection clinics scored",
+                "hyperparameter_selection_scope": (
+                    "pre-2025 training clinics fitted and pre-2025 model-selection clinics scored"
+                    if args.select_core_hyperparameters else
+                    "fixed earlier development-selected settings, with no temporal retuning"
+                ),
                 "training_time_rule": "last observed session before 2025-01-01",
                 "test_time_rule": "first observed session on or after 2025-01-01",
                 "spanning_patients_excluded": int(
@@ -16344,14 +17877,8 @@ def _empirical_input_contract_table() -> pd.DataFrame:
         ("ball_direct_causal", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("exponential_decay_gru", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("gp_causal_filter", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw calendar days"),
-        ("locf", "causal", "most recent questionnaire from a strictly earlier recorded session", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("causal_anchor_mean", "causal", "questionnaire events from strictly earlier recorded sessions", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("locf_reference_origin", "causal sensitivity", "most recent questionnaire from a strictly earlier recorded session, with reference-origin cold start", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("causal_anchor_mean_reference_origin", "causal sensitivity", "questionnaire events from strictly earlier recorded sessions, with reference-origin cold start", "questionnaire history", "questionnaire history", "raw calendar days"),
-        ("ball_teacher", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
-        ("s0_direct_lgssm", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
-        ("markov_direct_transition", "retrospective", "all retained anchors", "all structured features", "recorded treatment history", "raw elapsed days"),
-        ("interpolation", "retrospective", "nearest retained anchors on both sides", "questionnaire history", "questionnaire history", "raw calendar days"),
+        ("s0_direct_lgssm", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
+        ("markov_direct_transition", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
         ("ball_no_dense_ehr", "causal", "questionnaire events from strictly earlier recorded sessions", "raw session number", "previous-session treatment", "raw elapsed days"),
         ("ball_anchor_only", "causal", "questionnaire events from strictly earlier recorded sessions", "questionnaire history", "questionnaire history", "raw elapsed days"),
         ("ball_inherited_dynamics_only", "causal", "questionnaire events from strictly earlier recorded sessions", "all structured features", "previous-session treatment", "raw elapsed days"),
@@ -16371,7 +17898,7 @@ def _empirical_input_contract_table() -> pd.DataFrame:
         "gp_causal_filter": "candidate kernels fitted in ten training clinics, selected in three model-selection clinics, then refitted in all thirteen development clinics",
         "exponential_decay_gru": "architecture, smoothness weight, and optimization settings fixed before held-out evaluation",
         "s0_direct_lgssm": "transition and regularization settings fixed before held-out evaluation",
-        "markov_direct_transition": "three availability strata and regularization settings fixed before held-out evaluation",
+        "markov_direct_transition": "three groups based on prior questionnaire counts, with boundaries fitted in development; regularization fixed before held-out evaluation",
     }
     return pd.DataFrame(
         [
@@ -16528,7 +18055,7 @@ def main() -> None:
     parser.add_argument("--progress-every-epochs", type=int, default=10)
     parser.add_argument("--diagnostics-every-epochs", type=int, default=5)
     parser.add_argument("--checkpoint-every-epochs", type=int, default=10)
-    parser.add_argument("--members", type=int, default=5)
+    parser.add_argument("--members", type=int, default=5)  # deep ensemble K (spec Sec. 5)
     parser.add_argument("--d-model", type=int, default=96)
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=3)
@@ -16705,11 +18232,7 @@ def main() -> None:
     )
     rdoc_sessions = _load_rdoc_sessions() if args.rdoc_transition_analysis else None
     comorbidity_sessions = _load_comorbidity_sessions(args.comorbidity_features)
-    methods = [
-        "ball", "ball_teacher", "s0_direct_lgssm", "markov_direct_transition",
-        "interpolation", "locf", "causal_anchor_mean",
-        "locf_reference_origin", "causal_anchor_mean_reference_origin",
-    ]
+    methods = ["ball", "s0_direct_lgssm", "markov_direct_transition"]
     if args.direct_causal_ablation:
         methods.insert(1, "ball_direct_causal")
     if args.dense_ehr_ablation:
@@ -16948,7 +18471,6 @@ def main() -> None:
             neural_predictions = {
                 "student": _prediction_lookup(student_result.predictions, value_col),
                 "student_sd": _prediction_lookup(student_result.intervals, sd_col),
-                "teacher": _prediction_lookup(teacher_result.predictions, value_col),
                 "s0": s0_pred[ch],
                 "markov": markov_pred[ch],
             }
@@ -17098,8 +18620,8 @@ def main() -> None:
                 "ball_anchor_only",
                 "gp_causal_filter",
                 "exponential_decay_gru",
-                "locf",
-                "causal_anchor_mean",
+                "s0_direct_lgssm",
+                "markov_direct_transition",
             )
             if method in cadence_methods
         ]
@@ -17111,6 +18633,7 @@ def main() -> None:
             )
         )
 
+        # Overall held-out RMSE per method (patient-clustered mean of squared error).
         per_pt_se = {}
         for m in cadence_methods:
             err2 = _development_scaled_squared_error(ev, m)
@@ -17195,94 +18718,31 @@ def main() -> None:
                             "n_patients": int(context_ev["id"].nunique()),
                         }
                     )
+        # Patient-clustered bootstrap CIs for the prespecified head-to-heads.
+        # Resample patients and recompute the patient-weighted RMSE per method.
         pts = per_pt_se["ball"].index.to_numpy()
         rng = np.random.default_rng(101)
-        diffs_interp, diffs_markov, diffs_locf, diffs_direct, diffs_no_dense = [], [], [], [], []
-        diffs_anchor_ball, diffs_anchor_mean = [], []
         pairwise_methods = [method for method in cadence_methods if method != "ball"]
         pairwise_differences = {method: [] for method in pairwise_methods}
         for _ in range(2000):
-            samp = rng.choice(pts, size=len(pts), replace=True)
-            rb = float(np.sqrt(per_pt_se["ball"].reindex(samp).mean()))
+            sample = rng.choice(pts, size=len(pts), replace=True)
+            reference_rmse = float(np.sqrt(per_pt_se["ball"].reindex(sample).mean()))
             for method in pairwise_methods:
-                comparator_rmse = float(np.sqrt(per_pt_se[method].reindex(samp).mean()))
-                pairwise_differences[method].append(rb - comparator_rmse)
-            ri = float(np.sqrt(per_pt_se["interpolation"].reindex(samp).mean()))
-            rm = float(np.sqrt(per_pt_se["markov_direct_transition"].reindex(samp).mean()))
-            rl = float(np.sqrt(per_pt_se["locf"].reindex(samp).mean()))
-            diffs_interp.append(rb - ri)
-            diffs_markov.append(rb - rm)
-            diffs_locf.append(rb - rl)
-            rac = float(np.sqrt(per_pt_se["causal_anchor_mean"].reindex(samp).mean()))
-            diffs_anchor_mean.append(rb - rac)
-            if "ball_direct_causal" in per_pt_se:
-                rd = float(np.sqrt(per_pt_se["ball_direct_causal"].reindex(samp).mean()))
-                diffs_direct.append(rb - rd)
-            if "ball_no_dense_ehr" in per_pt_se:
-                rn = float(np.sqrt(per_pt_se["ball_no_dense_ehr"].reindex(samp).mean()))
-                diffs_no_dense.append(rb - rn)
-            if "ball_anchor_only" in per_pt_se:
-                ra = float(np.sqrt(per_pt_se["ball_anchor_only"].reindex(samp).mean()))
-                diffs_anchor_ball.append(rb - ra)
-        diffs_interp = np.array(diffs_interp)
-        diffs_markov = np.array(diffs_markov)
-        diffs_locf = np.array(diffs_locf)
-        diffs_direct = np.array(diffs_direct)
-        diffs_no_dense = np.array(diffs_no_dense)
-        diffs_anchor_ball = np.array(diffs_anchor_ball)
-        diffs_anchor_mean = np.array(diffs_anchor_mean)
+                other_rmse = float(np.sqrt(per_pt_se[method].reindex(sample).mean()))
+                pairwise_differences[method].append(reference_rmse - other_rmse)
+        boot_row = {"cadence": cad, "n_patients": int(len(pts))}
         for method, differences in pairwise_differences.items():
-            distribution = np.asarray(differences, dtype=float)
-            pairwise_bootstrap_rows.append(
-                {
-                    "cadence": int(cad),
-                    "reference": "ball",
-                    "comparator": method,
-                    "rmse_difference": float(
-                        np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se[method].mean())
-                    ),
-                    "ci_lo": float(np.quantile(distribution, 0.025)),
-                    "ci_hi": float(np.quantile(distribution, 0.975)),
-                    "n_patients": int(len(pts)),
-                    "bootstrap_replicates": 2000,
-                }
-            )
-        boot_row = {"cadence": cad,
-                    "ball_minus_interp_rmse": float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["interpolation"].mean())),
-                    "ci_lo": float(np.quantile(diffs_interp, 0.025)),
-                    "ci_hi": float(np.quantile(diffs_interp, 0.975)),
-                    "ball_minus_markov_rmse": float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["markov_direct_transition"].mean())),
-                    "markov_ci_lo": float(np.quantile(diffs_markov, 0.025)),
-                    "markov_ci_hi": float(np.quantile(diffs_markov, 0.975)),
-                    "ball_minus_locf_rmse": float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["locf"].mean())),
-                    "locf_ci_lo": float(np.quantile(diffs_locf, 0.025)),
-                    "locf_ci_hi": float(np.quantile(diffs_locf, 0.975)),
-                    "ball_minus_direct_causal_rmse": (
-                        float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["ball_direct_causal"].mean()))
-                        if "ball_direct_causal" in per_pt_se else float("nan")
-                    ),
-                    "direct_causal_ci_lo": float(np.quantile(diffs_direct, 0.025)) if diffs_direct.size else float("nan"),
-                    "direct_causal_ci_hi": float(np.quantile(diffs_direct, 0.975)) if diffs_direct.size else float("nan"),
-                    "ball_minus_no_dense_ehr_rmse": (
-                        float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["ball_no_dense_ehr"].mean()))
-                        if "ball_no_dense_ehr" in per_pt_se else float("nan")
-                    ),
-                    "no_dense_ehr_ci_lo": float(np.quantile(diffs_no_dense, 0.025)) if diffs_no_dense.size else float("nan"),
-                    "no_dense_ehr_ci_hi": float(np.quantile(diffs_no_dense, 0.975)) if diffs_no_dense.size else float("nan"),
-                    "ball_minus_anchor_only_ball_rmse": (
-                        float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["ball_anchor_only"].mean()))
-                        if "ball_anchor_only" in per_pt_se else float("nan")
-                    ),
-                    "anchor_only_ball_ci_lo": float(np.quantile(diffs_anchor_ball, 0.025)) if diffs_anchor_ball.size else float("nan"),
-                    "anchor_only_ball_ci_hi": float(np.quantile(diffs_anchor_ball, 0.975)) if diffs_anchor_ball.size else float("nan"),
-                    "ball_minus_causal_anchor_mean_rmse": float(
-                        np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se["causal_anchor_mean"].mean())
-                    ),
-                    "causal_anchor_mean_ci_lo": float(np.quantile(diffs_anchor_mean, 0.025)),
-                    "causal_anchor_mean_ci_hi": float(np.quantile(diffs_anchor_mean, 0.975)),
-                    "n_patients": int(len(pts))}
+            delta = float(np.sqrt(per_pt_se["ball"].mean()) - np.sqrt(per_pt_se[method].mean()))
+            lo, hi = np.quantile(differences, [.025, .975])
+            pairwise_bootstrap_rows.append(dict(cadence=int(cad), reference="ball",
+                comparator=method, rmse_difference=delta, ci_lo=float(lo), ci_hi=float(hi),
+                n_patients=int(len(pts)), bootstrap_replicates=2000))
+            boot_row[f"ball_minus_{method}_rmse"] = delta
+            boot_row[f"{method}_ci_lo"] = float(lo)
+            boot_row[f"{method}_ci_hi"] = float(hi)
         boot_rows.append(boot_row)
         cad_boot_rows.append(boot_row)
+        # Gap-stratified RMSE per method.
         for m in cadence_methods:
             for lab in GAP_LABELS:
                 mask = ev["gap_bin"] == lab
@@ -17297,6 +18757,10 @@ def main() -> None:
                 all_strata.append(row)
                 cad_strata.append(row)
 
+        # Instrument-specific patient-balanced weighted conformal calibration.
+        # Repeated questionnaire residuals remain within patient clusters and
+        # every patient contributes total weight one. A patient-maximum score is
+        # reported as a conservative cluster-level sensitivity.
         cal = calibration_ev
         tst = ev
         if len(cal) and len(tst):
@@ -17564,6 +19028,11 @@ def main() -> None:
             )
         print(f"cadence {cad}d: wrote per-cadence outputs to {run_dir}", flush=True)
 
+        # Release this cadence's GPU allocations before the next cadence builds
+        # its tensors. The 8 GB device is marginal for the full cohort; the
+        # caching allocator otherwise fragments across cadences (14d fits, 21d
+        # OOMs). gc.collect() drops the now-unreferenced models from the
+        # just-returned fit_ball_ssm call so empty_cache can actually free them.
         import gc as _gc
         import torch as _torch
         del student_result, teacher_result, direct_causal_result, no_dense_ehr_result, ball_anchor_only_result
@@ -17701,7 +19170,7 @@ def main() -> None:
         rdoc_sessions=rdoc_sessions,
         comorbidity_sessions=comorbidity_sessions,
     )
-    print("\n=== BALL minus interpolation and BALL minus Markov RMSE, patient-clustered bootstrap 95% CI ===")
+    print("\n=== BALL minus prospective comparator RMSE, patient-clustered bootstrap 95% CI ===")
     print(boot.round(4).to_string(index=False))
     print("\n=== overall held-out RMSE (z units) by cadence and method ===")
     print(overall.pivot(index="cadence", columns="method", values="rmse").round(3).to_string())
@@ -17718,7 +19187,7 @@ if __name__ == "__main__":
     main()
 '''
 
-# empirical.make_figureS5
+# --- empirical.make_figureS5 (empirical/make_figureS5.py) ---
 SRC_EMPIRICAL_MAKE_FIGURES5 = r'''
 """Supplementary Figure 5. Empirical held-out recovery and calibration."""
 
@@ -17740,20 +19209,22 @@ FIGOUT.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({"font.family": "serif", "font.size": 9, "savefig.dpi": 200})
 
-METHODS = ["ball", "ball_direct_causal", "gp_causal_filter", "exponential_decay_gru", "locf"]
+METHODS = ["ball", "ball_direct_causal", "s0_direct_lgssm", "markov_direct_transition", "gp_causal_filter", "exponential_decay_gru"]
 LABELS = {
     "ball": "BALL",
     "ball_direct_causal": "direct causal transformer",
     "gp_causal_filter": "causal Gaussian process",
     "exponential_decay_gru": "exponential-decay GRU",
-    "locf": "last observation carried forward",
+    "s0_direct_lgssm": "linear Gaussian filter",
+    "markov_direct_transition": "Markov filter",
 }
 COLORS = {
     "ball": "#3377bb",
     "ball_direct_causal": "#8844aa",
     "gp_causal_filter": "#22aa77",
     "exponential_decay_gru": "#dd9900",
-    "locf": "#777777",
+    "s0_direct_lgssm": "#777777",
+    "markov_direct_transition": "#aa4444",
 }
 
 
@@ -17765,9 +19236,10 @@ def main() -> None:
 
     fig, axes = plt.subplots(1, 3, figsize=(11.0, 3.4))
 
+    # Panel A. Overall held-out RMSE by method across cadences.
     ax = axes[0]
     x = np.arange(len(cads))
-    w = 0.16
+    w = 0.13
     offset = (len(METHODS) - 1) / 2.0
     for k, m in enumerate(METHODS):
         vals = [overall[(overall.cadence == c) & (overall.method == m)]["rmse"].iloc[0] for c in cads]
@@ -17777,6 +19249,7 @@ def main() -> None:
     ax.set_title("A. Held-out recovery by method")
     ax.legend(fontsize=7, loc="upper left")
 
+    # Panel B. Gap-stratified RMSE at the sparsest cadence.
     ax = axes[1]
     cad = max(cads)
     sub = strata[strata.cadence == cad]
@@ -17790,6 +19263,7 @@ def main() -> None:
     ax.set_title(f"B. By anchor distance ({cad}d cadence)")
     ax.legend(fontsize=7)
 
+    # Panel C. BALL conformal calibration by cadence.
     ax = axes[2]
     calibration_summary = calib.groupby("cadence", as_index=False).agg(
         coverage=("coverage", "mean"),
@@ -17850,6 +19324,7 @@ MODULE_SOURCES = {
     'empirical.build_comorbidities': ('empirical/build_comorbidities.py', SRC_EMPIRICAL_BUILD_COMORBIDITIES),
     'empirical.build_rdoc_proxy': ('empirical/build_rdoc_proxy.py', SRC_EMPIRICAL_BUILD_RDOC_PROXY),
     'empirical.build_sparse_anchors': ('empirical/build_sparse_anchors.py', SRC_EMPIRICAL_BUILD_SPARSE_ANCHORS),
+    'empirical.prospective_classical': ('empirical/prospective_classical.py', SRC_EMPIRICAL_PROSPECTIVE_CLASSICAL),
     'empirical.fit_empirical': ('empirical/fit_empirical.py', SRC_EMPIRICAL_FIT_EMPIRICAL),
     'empirical.make_figureS5': ('empirical/make_figureS5.py', SRC_EMPIRICAL_MAKE_FIGURES5),
 }

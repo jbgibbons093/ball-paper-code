@@ -5,3 +5,4 @@ scikit-learn==1.6.1
 torch==2.10.0
 matplotlib==3.10.7
 PyYAML==6.0.3
+Pillow==12.0.0

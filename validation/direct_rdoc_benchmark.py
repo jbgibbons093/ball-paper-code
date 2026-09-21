@@ -1,5 +1,21 @@
 #!/usr/bin/env python
-'''Compare BALL with matched models on direct RDoC transition recovery.'''
+"""Consolidated direct-RDoC benchmark: BALL transformer vs fair comparators.
+
+This runner is the mirror-image comparison harness for the direct RDoC drift
+estimand. For each generated dataset, it fits:
+
+  - BALL teacher/student transformer: explicit neural transition beta head.
+  - Direct causal transformer: the student architecture trained directly on anchors.
+  - Direct LGSSM: explicit classical linear-Gaussian transition beta.
+  - Markov direct transition: explicit beta plus observed-pattern Markov terms.
+  - Causal Gaussian-process estimator with two time scales.
+  - Causal exponential-decay GRU: learned decay over elapsed time.
+
+All methods see the same observed anchors, daily covariates, treatments, and
+observed/noisy RDoC proxy B. Every trajectory estimator is scored against the
+same latent truth. Methods with an explicit coefficient are also scored against
+the same true beta, with truth used only for evaluation.
+"""
 
 from __future__ import annotations
 
@@ -78,7 +94,7 @@ def _best_effort_live_json(path: Path, payload: dict) -> None:
 
 
 def _replace_with_retry(temporary: Path, destination: Path) -> None:
-    """Replace a file despite brief file locks."""
+    """Replace a file despite brief Dropbox or antivirus locks on Windows."""
 
     last_error = None
     for attempt in range(40):
@@ -355,10 +371,9 @@ def _cell_raw_signal(comp_i: pd.DataFrame, beta: np.ndarray, cell: str, args) ->
         tanh_proj = tanh_proj - float(np.mean(tanh_proj))
         return proj + float(args.nonlinear_strength) * tanh_proj
     if cell == "heterogeneous":
-        subtype = int(comp_i["subtype"].iloc[0]) if "subtype" in comp_i.columns and len(comp_i) else 0
-        midpoint = max((args.n_subtypes_for_scale - 1) / 2.0, 1.0)
-        scale = 1.0 + float(args.heterogeneity_strength) * ((subtype - midpoint) / midpoint)
-        return scale * proj
+        # Apply the subtype multiplier after per-patient standardization below;
+        # multiplying here would be canceled by division by the signal SD.
+        return proj
     return proj
 
 
@@ -389,12 +404,39 @@ def _inject_benchmark_cell(data, cell: str, share: float, args):
     beta = np.asarray(data.metadata.get("rdoc_drift_beta_unit", []), dtype=float)
     scales = []
     level_frames = []
+    subtype_scales = {}
+    if cell == "heterogeneous":
+        # A single cohort normalization retains the programmed variance share
+        # in pooled, within-patient change while preserving subtype contrasts.
+        base_variances = []
+        weighted_variances = []
+        for pid, person in comp.groupby("id", sort=False):
+            person = person.sort_values("t")
+            subtype = int(person["subtype"].iloc[0])
+            midpoint = max((args.n_subtypes_for_scale - 1) / 2.0, 1.0)
+            multiplier = 1.0 + float(args.heterogeneity_strength) * ((subtype - midpoint) / midpoint)
+            if multiplier <= 0:
+                raise ValueError("Subtype signal multipliers must be positive.")
+            raw = _cell_raw_signal(person, beta, cell, args)
+            variance = float(np.var(np.diff(person["L"].to_numpy(dtype=float))))
+            eligible = float(np.std(raw)) > 1e-8 and variance > 1e-12
+            # All patients have the same follow-up length in this experiment.
+            base_variances.append(variance if eligible else 0.0)
+            weighted_variances.append(variance * multiplier ** 2 if eligible else 0.0)
+            subtype_scales[int(pid)] = multiplier
+        normalization = np.sqrt(sum(base_variances) / sum(weighted_variances)) if sum(weighted_variances) > 0 else 1.0
+        subtype_scales = {pid: value * normalization for pid, value in subtype_scales.items()}
     for pid, comp_i in comp.groupby("id", sort=False):
         comp_i = comp_i.sort_values("t")
         idx = comp_i.index
         raw = _cell_raw_signal(comp_i, beta, cell, args)
         base_latent = comp.loc[idx, "L"].to_numpy(dtype=float)
         signal, level, scale = _scaled_signal_level(raw, base_latent, share)
+        if cell == "heterogeneous":
+            multiplier = subtype_scales[int(pid)]
+            signal = signal * multiplier
+            level = level * multiplier
+            scale = scale * multiplier
         scales.append(float(scale))
         comp.loc[idx, "rdoc_direct_signal"] = signal
         comp.loc[idx, "rdoc_direct_level"] = level
@@ -427,6 +469,10 @@ def _inject_benchmark_cell(data, cell: str, share: float, args):
             "direct_rdoc_cell": cell,
             "rdoc_drift_share": float(share),
             "rdoc_drift_scale_mean": float(np.mean(scales)) if scales else 0.0,
+            "heterogeneity_scaling": (
+                "subtype multiplier after within-patient standardization, followed by one cohort normalization"
+                if cell == "heterogeneous" else None
+            ),
             "direct_rdoc_cell_note": (
                 "Benchmark-local direct-RDoC cell injection. The sparse beta direction is unchanged; "
                 "cell-specific drift modifies the one-step RDoC signal before integration into latent level."
@@ -437,7 +483,13 @@ def _inject_benchmark_cell(data, cell: str, share: float, args):
 
 
 def _apply_measurement_evaluation_mask(data):
-    '''Create separate questionnaire targets for model selection and testing.'''
+    """Create separate model-selection and test questionnaire targets.
+
+    The last observed questionnaire for each instrument is hidden in validation
+    patients for persistence selection and independently hidden in test patients
+    for final questionnaire evaluation.  Every retained questionnaire whose
+    recall window overlaps either target is hidden from every estimator.
+    """
 
     anchors = data.anchors.copy()
     anchors["measurement_selection"] = False
@@ -761,10 +813,16 @@ def score(data, preds: pd.DataFrame, beta_hat: np.ndarray, *, method: str, cell:
         anxiety_latent_rmse,
     )
     if irt:
-        # Held-out fit goes through the calibrated link.
+        # Held-out fit goes through the calibrated link; latent RMSE and beta magnitude
+        # are also reported on the declared trait scale (trait = (latent - loc) / scale,
+        # so beta_trait = beta_raw / scale). The Gaussian val-anchor RMSE is undefined.
         scale = float(getattr(data.config, "irt_scale", 1.0)) or 1.0
         item_nll, etot_rmse = irt_holdout_metrics(data, preds, H.EVAL_SPLIT)
-        # Combine depression and anxiety errors before taking RMSE.
+        # The item-response instruments measure the two modeled channels.  The
+        # primary trait-scale recovery metric therefore combines squared error
+        # across depression and anxiety before taking the square root.  The
+        # averaged-channel composite is retained separately because opposing
+        # channel errors can cancel in that summary.
         latent_trait = joint_channel_latent_rmse / scale
         composite_latent_trait = latent_raw / scale
         beta_norm_trait = float(np.linalg.norm(beta_hat)) / scale
@@ -838,7 +896,9 @@ def _matched_s0_basis(cell: str) -> str:
         "missingness": "linear",
         "interaction": "interaction",
         "nonlinear": "nonlinear",
-        # Do not provide simulated patient subtype to any model.
+        # Patient subtype is latent in the heterogeneous data-generating
+        # condition and is not supplied to BALL or the other comparators.
+        # The classical estimators therefore use the observable linear basis.
         "heterogeneous": "linear",
     }.get(cell, "linear")
 
@@ -1098,7 +1158,7 @@ def _gp_auxiliary_design(
         [
             np.asarray(b, dtype=float),
             action_onehot,
-            np.asarray(recent, dtype=float),
+            np.r_[0., np.asarray(recent, dtype=float)[:-1]],
             np.asarray(burden, dtype=float),
         ]
     )
@@ -2171,7 +2231,9 @@ def run_ball(data, args, cell: str, seed: int, share: float) -> list[dict]:
             rdoc_drift_adaptive=False,
             rdoc_drift_weights=(),
         )
-        # Estimate adaptive weights from the teacher fit.
+        # The drift beta belongs to the shared generative model and is not updated
+        # during student distillation, so a teacher-only pilot is identical for the
+        # adaptive weights and avoids an unnecessary full student training pass.
         pilot = fit_ball_ssm(
             data, pilot_cfg, device=args.device, causal=False, prediction_split=None,
         )
@@ -2631,7 +2693,11 @@ def main() -> None:
     parser.add_argument(
         "--s0-basis",
         choices=["matched", "linear", "interaction", "nonlinear", "heterogeneous", "full"],
-        # Use a fixed linear transition for every classical comparator.
+        # Fair mirror-image default: the classical comparators use a FIXED linear B*beta
+        # transition in every cell, so they face the same functional mis-specification the
+        # transformer does in the interaction/nonlinear/heterogeneous cells (the transformer
+        # is never told the cell form either). "matched" is retained only as a best-case
+        # classical sensitivity, not the default.
         default="linear",
     )
     parser.add_argument("--skip-markov", action="store_true", help="Skip the native direct-transition Markov comparator")
@@ -3213,8 +3279,8 @@ def main() -> None:
                     "ball_full_decomposition": "Teacher-initialized causal encoder trained with anchored two-channel teacher matching and posterior-predictive questionnaire re-anchoring",
                     "ball_student_transition_only": "BALL student with the observed RDoC profile removed from the inference encoder while correlated structured proxies remain",
                     "ball_student_transition_only_strict": "BALL student with the observed RDoC profile and its four correlated structured proxies removed from the inference encoder and neural nuisance inputs while RDoC remains in the explicit transition",
-                    "s0_direct_lgssm": f"Classical two-channel state-space smoother with {args.s0_basis} transition basis, frozen development-selected persistence, posterior-uncertainty-aware innovation updates, and the natural questionnaire likelihood",
-                    "markov_direct_transition": f"Pattern-stratified extension of the classical two-channel state-space smoother with {args.s0_basis} transition basis, questionnaire-frequency persistence and intercepts, posterior-uncertainty-aware innovation updates, and one shared RDoC coefficient",
+                    "s0_direct_lgssm": f"Classical two-channel forward state-space filter with {args.s0_basis} transition basis, frozen development-selected persistence, development-fitted innovation updates, and the natural questionnaire likelihood",
+                    "markov_direct_transition": f"History-stratified extension of the classical two-channel forward filter with {args.s0_basis} transition basis, prior-questionnaire-count groups, development-fitted innovation updates, and one shared RDoC coefficient",
                     "gp_causal_filter": (
                         "Causal Gaussian-process filter with development-selected radial-basis and Ornstein-Uhlenbeck time kernels, "
                         "a training-patient structured-input mean function, and only questionnaire measurements available by each estimation time"
@@ -3241,8 +3307,10 @@ def main() -> None:
                         "ball_student_transition_only_strict",
                         "gp_causal_filter",
                         "exponential_decay_gru",
+                        "s0_direct_lgssm",
+                        "markov_direct_transition",
                     ],
-                    "retrospective_smoothers": ["ball_teacher_smoother", "s0_direct_lgssm", "markov_direct_transition"],
+                    "training_only_teacher": ["ball_teacher_smoother"],
                     "measurement_selection": "last observed validation questionnaire per patient and instrument, hidden with every overlapping recall window and used only for model selection",
                     "measurement_evaluation": "last observed test questionnaire per patient and instrument, hidden with every overlapping recall window and reserved for final scoring",
                     "latent_evaluation": "test-patient latent trajectories",
@@ -3281,7 +3349,9 @@ def main() -> None:
     )
 
     irt = str(getattr(args, "anchor_observation", "gaussian")).lower() == "irt"
-    # Score held-out item responses through the frozen IRT link.
+    # Under IRT the held-out fit is item NLL + expected-total RMSE through the calibrated
+    # link, and latent/beta magnitude are on the declared trait scale; the Gaussian
+    # val-anchor RMSE is undefined and would print as NaN.
     if irt:
         head_metrics = ["beta_cosine_mean", "beta_topk_f1_mean", "beta_hat_norm_trait_mean",
                         "latent_rmse_trait_mean", "irt_item_nll_mean", "irt_expected_total_rmse_mean"]

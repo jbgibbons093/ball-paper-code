@@ -1,5 +1,11 @@
 #!/usr/bin/env python
-'''Run negative controls for direct RDoC transition recovery.'''
+"""Negative controls for direct RDoC drift recovery.
+
+The primary benchmark asks whether each method can recover a sparse RDoC drift
+direction when the latent trajectory actually contains a direct C_t beta drift.
+This runner tests the complementary safety property: beta recovery should
+collapse when the direct signal is absent or the observed RDoC proxy is broken.
+"""
 
 from __future__ import annotations
 
@@ -219,7 +225,11 @@ def main() -> None:
                         continue
                     row["control"] = control
                     row["control_label"] = CONTROL_LABELS[control]
-                    # Compare null estimates with the positive-control coefficient template.
+                    # In the null condition the true direct coefficient is zero,
+                    # so a cosine with the data-generating coefficient is
+                    # undefined. The reported directional and support metrics
+                    # intentionally compare estimates with the prespecified
+                    # positive-control coefficient template.
                     row["coefficient_reference"] = "positive_control_coefficient_template"
                     row["data_generating_direct_signal_present"] = bool(control != "null")
                     rows.append(row)

@@ -1,5 +1,22 @@
 #!/usr/bin/env python
-'''Fit the linear Gaussian comparator for direct RDoC transition recovery.'''
+"""Fair old-school comparator for direct RDoC drift recovery.
+
+The comparator is a linear-Gaussian MAP smoother with the same explicit target
+as the transformer direct head:
+
+    L[t] - L[t-1] = B[t-1] beta + nuisance[t-1] gamma + noise
+
+It uses only observed anchors, observed daily covariates, treatments, and the
+observed/noisy RDoC proxy B. It does not see the simulated latent L except for
+evaluation. Estimation alternates:
+
+  1. smooth per-person L trajectories given beta/gamma;
+  2. refit global beta/gamma on train-patient smoothed transitions.
+
+This is the fair S0-style comparator for the new direct-RDoC estimand. The old
+S0/Markov arms remain useful severity comparators, but they are not fair beta
+comparators because they do not estimate direct RDoC drift parameters.
+"""
 
 from __future__ import annotations
 
@@ -95,7 +112,17 @@ def mcse(vals: np.ndarray) -> float:
 
 
 # --------------------------------------------------------------------------- #
-# Use the same frozen IRT calibration for every model.
+# Graded-response IRT anchor observation (calibrated-instrument sensitivity).
+#
+# When anchor_observation="irt", every method uses the SAME frozen calibrated
+# instrument. The per-item ordered thresholds and discriminations and the affine
+# trait map trait = (windowed_latent - loc) / scale are fixed in advance
+# (validation/irt_calibration.json) and carried on data.config. Item parameters are
+# NOT learned, which is what identifies the latent scale. Each observed anchor enters
+# as the exact per-item graded-response likelihood, linearized at the current trait
+# estimate by Fisher scoring and expressed on the raw latent scale so it composes
+# with the transition and daily rows. The exact total-score distribution by
+# convolution is available for totals-only inputs (grm_total_logpmf).
 # --------------------------------------------------------------------------- #
 
 
@@ -148,7 +175,15 @@ def _anchor_trait_mle(items, disc: np.ndarray, thresholds, iters: int = 6) -> fl
 
 
 def irt_anchor_pseudo_observation(row, data) -> tuple[float, float] | None:
-    '''Map an item-response questionnaire to the calibrated latent scale.'''
+    """Map one observed item-response anchor to the calibrated raw latent scale.
+
+    The point estimate is the unit-information-prior Fisher-scoring estimate on
+    the frozen trait scale.  The returned standard deviation uses the local
+    posterior information and is transformed through the frozen affine map.
+    This supplies an identical, prespecified item-response measurement bridge
+    to trajectory comparators that do not optimize the graded-response
+    likelihood directly.
+    """
 
     items = getattr(row, "irt_items", None)
     if items is None:
@@ -221,12 +256,18 @@ def anchor_constraint(row, t_count: int, data, args, irt_state):
     if info < 1e-3:
         return None                                           # uninformative anchor (items saturated)
     trait_target = z0 + score / info                          # Fisher-scoring (likelihood-only) step
-    # Express the questionnaire row on the raw latent scale.
+    # Express on the raw latent scale (u = trait * scale + loc) so the row composes with
+    # the transition and daily rows: mean(u over window) = trait_target * scale + loc.
+    # Information is the anchor likelihood only; the trajectory prior supplies shrinkage.
     raw_target = trait_target * scale + loc
     anchor_weight = float(getattr(args, "classical_anchor_weight", 1.0))
     if anchor_weight <= 0.0:
         raise ValueError("The classical questionnaire weight must be positive.")
-    # Apply the questionnaire weight to the IRT information.
+    # Multiplying the item log likelihood by the same prespecified weight used
+    # by BALL multiplies Fisher information by that weight.  Dividing the local
+    # Gaussian standard deviation by its square root is the corresponding
+    # iteratively reweighted least-squares update and leaves the frozen item
+    # parameters unchanged.
     raw_sd = float(scale / np.sqrt(info * anchor_weight))
     return [(k, 1.0 / len(window)) for k in window], raw_target, raw_sd
 
@@ -251,7 +292,13 @@ def update_irt_zbar(irt_state, anchors_i, sol: np.ndarray, t_count: int) -> None
 
 
 def irt_holdout_metrics(data, preds, split: str = "validation") -> tuple[float, float]:
-    '''Score held-out item responses through the frozen calibration.'''
+    """Held-out IRT anchor fit through the FIXED calibrated link.
+
+    The predicted windowed latent is mapped to the calibrated trait scale, then the
+    held-out anchor's item responses are scored exactly. Returns the mean per-item
+    negative log-likelihood and the expected-total RMSE on the given split's observed
+    anchors. This replaces the Gaussian val-anchor RMSE, which is undefined under IRT.
+    """
 
     cfg = data.config
     if str(getattr(cfg, "anchor_observation", "gaussian")).lower() != "irt":
@@ -311,8 +358,7 @@ def irt_holdout_metrics(data, preds, split: str = "validation") -> tuple[float, 
 
 
 def impute_by_time(frame: pd.DataFrame, cols: list[str]) -> np.ndarray:
-    vals = frame[cols].astype(float).interpolate(limit_direction="both")
-    vals = vals.fillna(vals.mean()).fillna(0.0)
+    vals = frame[cols].astype(float).ffill().fillna(0.0)
     return vals.to_numpy(dtype=float)
 
 
@@ -362,8 +408,9 @@ def fit_daily_readout(
     anc_by = dict(tuple(data.anchors.groupby("id", sort=True)))
     x_blocks, o_blocks, y_blocks = [], [], []
 
-    # Under IRT the readout targets the GRM-implied latent (per-anchor trait MLE on the
-    # calibrated scale).
+    # Under IRT the readout targets the GRM-implied latent (per-anchor trait MLE on
+    # the calibrated scale), not the standardized total, so the comparator still uses
+    # the daily covariates with the same observed inputs as BALL.
     _daily_irt = None
     if str(getattr(data.config, "anchor_observation", "gaussian")).lower() == "irt":
         _daily_irt = (
@@ -428,7 +475,10 @@ def fit_daily_readout(
     y = np.concatenate(y_blocks)
     means = np.array([x[obs[:, j] > 0.5, j].mean() if (obs[:, j] > 0.5).any() else 0.0 for j in range(x.shape[1])])
     x_imp = np.where(obs > 0.5, x, means[None, :])
-    # Include missingness indicators with imputed daily values.
+    # Availability indicators are observed inputs in their own right.  They are
+    # included beside the imputed values so the classical comparator receives
+    # the same informative missingness signal supplied to the neural and
+    # Gaussian-process comparators in the missingness stress condition.
     design = np.column_stack([np.ones(len(x_imp)), x_imp, obs])
     penalty = ridge * np.eye(design.shape[1])
     penalty[0, 0] = 0.0
@@ -592,11 +642,10 @@ def _classical_gap_factors(rho: float, gaps: np.ndarray) -> tuple[np.ndarray, np
     """Persistence and accumulated-drift factors for unequal elapsed days."""
 
     gaps = np.asarray(gaps, dtype=float)
-    persistence = np.power(float(rho), gaps)
-    if abs(float(rho) - 1.0) < 1e-8:
-        drift = gaps.copy()
-    else:
-        drift = (1.0 - persistence) / (1.0 - float(rho))
+    rho = np.asarray(rho, dtype=float)
+    persistence = np.power(rho, gaps)
+    drift = np.divide(1.0-persistence, 1.0-rho,
+        out=np.asarray(gaps, dtype=float).copy(), where=np.abs(1.0-rho)>=1e-8)
     return persistence, drift
 
 
@@ -606,23 +655,10 @@ def _classical_pattern_strata(
     *,
     fit_ids: set[int] | None = None,
 ) -> dict[int, int]:
-    ids = sorted(data.individuals["id"].astype(int).tolist())
-    counts = data.anchors.loc[data.anchors["observed"].astype(bool)].groupby("id").size()
-    values = np.asarray([float(counts.get(pid, 0.0)) for pid in ids], dtype=float)
-    n_strata = max(1, int(n_strata))
-    if n_strata == 1 or len(np.unique(values)) <= 1:
-        return {pid: 0 for pid in ids}
-    edge_values = np.asarray(
-        [value for pid, value in zip(ids, values) if fit_ids is None or pid in fit_ids],
-        dtype=float,
-    )
-    if edge_values.size == 0:
-        raise ValueError("Pattern-mixture strata require at least one fitting patient.")
-    edges = np.quantile(edge_values, np.linspace(0.0, 1.0, n_strata + 1)[1:-1])
-    return {
-        pid: int(np.searchsorted(edges, values[index], side="right"))
-        for index, pid in enumerate(ids)
-    }
+    from prospective_simulation_filter import history_strata
+    if fit_ids is None:
+        raise ValueError("History strata require explicit development patients.")
+    return history_strata(data, n_strata, fit_ids)
 
 
 def _classical_measurement_score(
@@ -642,9 +678,8 @@ def _classical_measurement_score(
     if anchor_name is not None:
         targets = targets.loc[targets["anchor"].astype(str).eq(str(anchor_name))]
     if strata is not None and stratum is not None:
-        targets = targets.loc[
-            targets["id"].astype(int).map(strata).eq(int(stratum))
-        ]
+        from prospective_simulation_filter import event_strata
+        targets = targets.loc[event_strata(targets, strata).eq(int(stratum))]
     if targets.empty:
         return float("nan")
 
@@ -744,7 +779,8 @@ def _solve_two_channel_person(
     )
     transition_mean = base_features @ theta[: base_features.shape[1]]
     if n_strata > 0:
-        transition_mean = transition_mean + float(theta[base_features.shape[1] + int(stratum)])
+        groups = np.broadcast_to(np.asarray(stratum, int), (t_count,))[1:]
+        transition_mean = transition_mean + theta[base_features.shape[1] + groups]
 
     rows: list[np.ndarray] = []
     targets: list[float] = []
@@ -770,11 +806,14 @@ def _solve_two_channel_person(
         if "dt" in comp_i.columns
         else np.ones(t_count, dtype=float)
     )
-    gap_persistence, drift_scale = _classical_gap_factors(persistence, gaps)
+    rho = np.broadcast_to(np.asarray(persistence, float), (t_count,))
+    # Transition k -> k+1 uses the history available at k+1.
+    rho = np.r_[rho[1:], rho[-1]]
+    gap_persistence, drift_scale = _classical_gap_factors(rho, gaps)
     innovation_multiplier = np.sqrt(
         np.maximum(
-            (1.0 - np.power(float(persistence), 2.0 * gaps))
-            / max(1.0 - float(persistence) ** 2, 1e-8),
+            (1.0 - np.power(rho, 2.0 * gaps))
+            / np.maximum(1.0 - rho ** 2, 1e-8),
             0.0,
         )
     )
@@ -823,7 +862,15 @@ def _solve_two_channel_person(
 
 
 def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
-    '''Fit both latent channels with one shared RDoC coefficient.'''
+    """Fit two channel-specific trajectories with one shared RDoC coefficient.
+
+    Transition coefficients are estimated from training patients.  Daily
+    persistence is selected by patient-balanced questionnaire prediction in the
+    validation patients, whose selection questionnaires remain hidden from the
+    trajectory fit.  The pattern-mixture comparator assigns a separate
+    persistence value and transition intercept to each questionnaire-frequency
+    stratum and latent channel.
+    """
 
     train_ids = set(
         data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int)
@@ -921,7 +968,8 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
                 valid = gaps_use > 0
                 if not valid.any():
                     continue
-                rho = float(candidate_persistence[channel_index, strata[pid]])
+                groups = np.broadcast_to(np.asarray(strata[pid], int), (len(solution),))[1:count+1]
+                rho = candidate_persistence[channel_index, groups]
                 gap_persistence, drift = _classical_gap_factors(rho, gaps_use)
                 raw_difference = (
                     solution[1 : count + 1]
@@ -939,14 +987,14 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
                 innovation_multiplier = np.sqrt(
                     np.maximum(
                         (1.0 - np.power(rho, 2.0 * gaps_use))
-                        / max(1.0 - rho**2, 1e-8),
+                        / np.maximum(1.0 - rho**2, 1e-8),
                         0.0,
                     )
                 )
                 channel_features = features[:count]
                 if n_strata:
                     pattern = np.zeros((count, n_strata), dtype=float)
-                    pattern[:, strata[pid]] = 1.0
+                    pattern[np.arange(count), groups] = 1.0
                     channel_features = np.column_stack([channel_features, pattern])
                 design_blocks.append(channel_features[valid])
                 target_blocks.append(outcome[valid])
@@ -1050,6 +1098,7 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
         candidate_innovation,
         *,
         irt_states=None,
+        prospective=False,
     ):
         states = irt_states or [init_irt_state(data, args), init_irt_state(data, args)]
         fitted_state: dict[tuple[int, int], tuple] = {}
@@ -1058,18 +1107,22 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
             channel_values: list[np.ndarray] = []
             time_values = None
             for channel_index, anchor_name in enumerate(anchor_names):
-                solution_and_inputs = _solve_two_channel_person(
+                from prospective_simulation_filter import filter_person
+                causal = prospective or pid not in train_ids
+                solver = filter_person if causal else _solve_two_channel_person
+                extra = {"helpers": sys.modules[__name__]} if causal else {"irt_state": states[channel_index]}
+                solution_and_inputs = solver(
                     data,
                     pid,
                     candidate_theta[channel_index],
                     readouts[anchor_name],
                     args,
                     anchor_name=anchor_name,
-                    persistence=float(candidate_persistence[channel_index, strata[pid]]),
+                    persistence=candidate_persistence[channel_index, strata[pid]],
                     innovation_sd=float(candidate_innovation[channel_index]),
                     stratum=strata[pid],
                     n_strata=n_strata,
-                    irt_state=states[channel_index],
+                    **extra,
                 )
                 fitted_state[(channel_index, pid)] = solution_and_inputs
                 solution = solution_and_inputs[0]
@@ -1256,7 +1309,11 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
 
     persistence_selection_converged = True
     if len(persistence_grid) == 1:
-        # Select persistence once in development and freeze it for evaluation.
+        # Definitive analyses use one persistence value selected once in a
+        # separate development exercise and frozen before the evaluation
+        # seeds are generated.  A fixed value turns each classical comparator
+        # into one converged fit per replicate instead of repeating the full
+        # latent-trajectory fit for a persistence grid inside every replicate.
         frozen_persistence = float(persistence_grid[0])
         selected = np.full(
             (2, persistence_strata),
@@ -1378,9 +1435,7 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
                     stratum_patient_count = int(
                         selection_targets.loc[
                             selection_targets["anchor"].astype(str).eq(anchor_name)
-                            & selection_targets["id"].astype(int).map(strata).eq(
-                                stratum_index
-                            ),
+                            & __import__('prospective_simulation_filter').event_strata(selection_targets, strata).eq(stratum_index),
                             "id",
                         ].nunique()
                     )
@@ -1488,6 +1543,7 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
             persistence,
             innovation_sd,
             irt_states=final_states,
+            prospective=True,
         )
 
     stratum_persistence = {
@@ -1514,6 +1570,8 @@ def fit_two_channel_direct_map(data, args, *, pattern_mixture: bool = False):
     )
     predictions.attrs["shared_beta"] = theta[0][1 : 1 + q].copy()
     predictions.attrs["pattern_mixture"] = bool(pattern_mixture)
+    predictions.attrs["information_set"] = "prospective; prior sessions only; no backward evaluation pass"
+    predictions.attrs["pattern_definition"] = "prior observed questionnaire count at each session"
     predictions.attrs["converged"] = bool(converged)
     predictions.attrs["iterations_completed"] = int(iterations_completed)
     predictions.attrs["maximum_iterations"] = int(maximum_iterations)

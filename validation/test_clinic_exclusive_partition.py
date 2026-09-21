@@ -74,19 +74,19 @@ class ClinicExclusivePartitionTests(unittest.TestCase):
         self.assertEqual(_canonical_empirical_clinic("GRAPEVINE"), "GRAPEVINE_GRP")
 
     def test_forward_split_excludes_patients_spanning_the_cutoff(self) -> None:
-        sessions = pd.DataFrame(
-            [
-                {"id": 1, "split": "train", "date": "2024-01-01"},
-                {"id": 1, "split": "train", "date": "2024-12-31"},
-                {"id": 2, "split": "val", "date": "2025-01-01"},
-                {"id": 2, "split": "val", "date": "2025-02-01"},
-                {"id": 3, "split": "train", "date": "2024-12-15"},
-                {"id": 3, "split": "train", "date": "2025-01-15"},
-            ]
-        )
+        sessions, crossing_patient = self._sessions()
+        sessions['date'] = '2024-12-01'
+        eligible = sorted(set(sessions.loc[sessions.split.isin(['train', 'val']), 'id']) - {crossing_patient})
+        later_patient, spanning_patient = eligible[:2]
+        sessions.loc[sessions.id.eq(later_patient), 'date'] = '2025-01-01'
+        sessions.loc[sessions.id.eq(spanning_patient) & sessions.session.eq(1), 'date'] = '2025-01-15'
         split = _generalization_split_maps(sessions)["forward_2025"]
-        self.assertEqual(split, {1: "train", 2: "test"})
-        self.assertNotIn(3, split)
+        expected = {pid: 'train' for pid in eligible if pid != spanning_patient}
+        expected[later_patient] = 'test'
+        self.assertEqual(split, expected)
+        self.assertNotIn(spanning_patient, split)
+        self.assertNotIn(crossing_patient, split)
+        self.assertFalse(set(sessions.loc[sessions.split.eq('test'), 'id']) & set(split))
 
     def test_gaussian_process_uses_training_clinics_for_fit_and_validation_clinics_for_selection(self) -> None:
         data = SimpleNamespace(

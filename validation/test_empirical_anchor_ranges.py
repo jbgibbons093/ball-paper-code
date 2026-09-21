@@ -76,7 +76,7 @@ def test_sparsification_and_event_accounting_are_instrument_specific() -> None:
     assert not anchors.duplicated(["id", "session", "anchor"]).any()
 
 
-def test_cross_instrument_baselines_use_the_frozen_measurement_link() -> None:
+def test_model_predictions_use_instrument_specific_frozen_measurement_links() -> None:
     anchors = pd.DataFrame(
         [
             {
@@ -126,27 +126,31 @@ def test_cross_instrument_baselines_use_the_frozen_measurement_link() -> None:
             "normalized_score_sd_by_instrument": {"PHQ9": 1.0, "BDI": 1.0, "GAD7": 1.0},
         },
     }
-    zero = {1: np.zeros(3, dtype=float)}
+    second_target = anchors.iloc[-1].copy()
+    second_target['anchor'] = 'BDI'
+    second_target['value'] = 31.5
+    anchors = pd.concat([anchors, second_target.to_frame().T], ignore_index=True)
+    latent = {1: np.full(3, 0.4, dtype=float)}
     result = _channel_eval(
         anchors,
         sessions,
         {"PHQ9": (13.5, 13.5), "BDI": (31.5, 31.5), "GAD7": (10.5, 10.5)},
         neural_predictions={
-            "student": zero,
-            "teacher": zero,
-            "s0": zero,
+            "student": latent,
+            "s0": latent,
+            "markov": latent,
             "student_sd": {1: np.full(3, 0.1, dtype=float)},
         },
         session_days_by_id={1: np.array([0, 10, 30], dtype=int)},
         measurement_calibration=measurement,
     )
-    assert len(result) == 1
-    # Normalized BDI=0 corresponds to latent depression (0 - -0.2) / 0.5 = 0.4,
-    # which maps to normalized PHQ-9=0.4 through its reference link.
-    assert float(result.iloc[0]["locf"]) == 0.4
-    # The cumulative mean averages the earlier PHQ-9 latent value 0.0 and the
-    # later BDI-II latent value 0.4 on the common depression scale.
-    assert float(result.iloc[0]["causal_anchor_mean"]) == 0.2
+    assert len(result) == 2
+    # The same depression state maps to different questionnaire scores.
+    result = result.set_index('anchor')
+    for method in ('ball', 's0_direct_lgssm', 'markov_direct_transition'):
+        assert np.isclose(result.loc['PHQ9', method], 0.4)
+        assert np.isclose(result.loc['BDI', method], 0.0)
+    assert 'locf' not in result and 'causal_anchor_mean' not in result
 
 
 def test_recurrent_comparator_lags_consecutive_instrument_events_without_false_duplicates() -> None:

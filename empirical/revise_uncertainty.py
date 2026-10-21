@@ -176,28 +176,34 @@ def replay(args, prepared=None, verify_frozen=True):
                 baseline_score=(float(same.value.iloc[0])-r.center)/r.half_range if len(same) else np.nan,
                 same_channel_prior_count=len(same_channel)))
         rows=pd.concat([rows,pd.DataFrame(histories)],axis=1)
+        # Fits made before the September 2026 duplicate-day correction averaged the whole calendar recall window.
+        # Later fits average only the sessions through the target. The replay must reproduce one exactly.
+        errors={}
         if not verify_frozen:
             # Fresh patient-excluded ensembles have no original prediction
             # artifact to reproduce. Their partition audit is performed by
             # the cross-fitting runner before this replay.
-            err=None
+            pass
         elif getattr(args,'temporal',False):
             verify=rows[rows.role.eq('test')].copy()
             scale=verify.anchor.map(measurement['development_data']['normalized_score_sd_by_instrument'])
-            se=((verify.old_window_ball-verify.target)/scale)**2
-            score=float(np.sqrt(se.groupby(verify.id).mean().mean()))
             frozen=pd.read_csv(args.frozen_run/'empirical_generalization_complete.csv')
             expected=float(frozen[frozen.method.eq('ball')].rmse.iloc[0])
-            err=abs(score-expected)
+            for definition,column in [('calendar_window','old_window_ball'),('sessions_through_target','ball')]:
+                se=((verify[column]-verify.target)/scale)**2
+                errors[definition]=abs(float(np.sqrt(se.groupby(verify.id).mean().mean()))-expected)
         else:
             frozen=pd.read_csv(args.frozen_run/'empirical_prediction_rows_complete.csv',
                                usecols=['cadence','id','session','anchor','ball'],low_memory=False)
             verify=rows.merge(frozen[frozen.cadence.eq(cadence)],on=['cadence','id','session','anchor'],suffixes=('','_frozen'))
-            err=np.max(abs(verify.old_window_ball-verify.ball_frozen))
+            errors={'calendar_window':float(np.max(abs(verify.old_window_ball-verify.ball_frozen))),
+                    'sessions_through_target':float(np.max(abs(verify.ball-verify.ball_frozen)))}
+        matched=min(errors,key=errors.get) if errors else None
         if verify_frozen:
-            assert err<2e-5,('Frozen checkpoint replay failed',float(err))
+            assert errors[matched]<2e-5,('Frozen checkpoint replay failed',errors)
         rows.to_csv(destination,index=False)
-        print(json.dumps({'cadence':cadence,'events':len(rows),'frozen_point_max_error':float(err) if err is not None else None,
+        print(json.dumps({'cadence':cadence,'events':len(rows),'frozen_point_max_error':errors.get(matched),
+                          'frozen_window_definition':matched,'frozen_errors_by_definition':errors,
                           'frozen_prediction_comparison_performed':bool(verify_frozen),
                           'later_same_day_window_fraction':float((rows.excluded_later_same_day_sessions>0).mean())}),flush=True)
 

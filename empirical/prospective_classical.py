@@ -19,24 +19,37 @@ def pattern_groups(anchors, n, edges):
     return np.searchsorted(edges, prior_counts(anchors, n), side='right')
 
 
-def update_gaussian(mean, covariance, indices, weights, value, variance):
+TRANSITION_SD_BOUNDS = (0.005, 1.0)   # daily SD search range on the -1 to 1 questionnaire scale
+TRANSITION_SD_RELATIVE_TOLERANCE = 1e-3
+MAX_TRANSITION_SD_ROUNDS = 5
+
+
+def update_gaussian(mean, covariance, indices, weights, value, variance, loglik=None):
     cross = covariance[:, indices] @ weights
     residual_variance = float(weights @ cross[indices] + variance)
     if not np.isfinite(residual_variance) or residual_variance <= 0:
         raise ValueError('Invalid Gaussian observation variance.')
-    mean = mean + cross * ((value - weights @ mean[indices]) / residual_variance)
+    residual = value - weights @ mean[indices]
+    if loglik is not None:   # one term of the prediction-error decomposition
+        loglik[0] -= .5 * (np.log(2 * np.pi * residual_variance) + residual**2 / residual_variance)
+    mean = mean + cross * (residual / residual_variance)
     covariance = covariance - np.outer(cross, cross) / residual_variance
     return mean, (covariance + covariance.T) * .5
 
 
 def forward_filter(drift, persistence, innovation_variance, daily, daily_observed,
-                   daily_variance, anchors, prior_variance, observation_update=None):
+                   daily_variance, anchors, prior_variance, observation_update=None, loglik=None):
     """Append states in session order, assimilating each anchor one session late.
 
     The growing covariance retains the correlations needed for recall-window
     measurements. Past internal states can update, but past issued estimates
-    stay fixed. No backward pass is performed on evaluation records.
+    stay fixed. No backward pass is performed on evaluation records. When
+    ``loglik`` is a one-element list, it accumulates the Gaussian log-likelihood
+    of every observation given earlier ones, including questionnaires from the
+    final session, which prediction never needs.
     """
+    if loglik is not None and observation_update is not None:
+        raise ValueError('The likelihood is defined only for Gaussian questionnaire updates.')
     n = len(daily)
     issued = np.empty(n); issued_variance = np.empty(n)
     mean = np.empty(0); covariance = np.empty((0, 0))
@@ -44,22 +57,25 @@ def forward_filter(drift, persistence, innovation_variance, daily, daily_observe
     for r in anchors.itertuples(index=False):
         if bool(r.observed):
             by_time.setdefault(int(r.t), []).append(r)
+
+    def assimilate(r, k, mean, covariance):
+        start = max(0, int(r.window_start))
+        end = min(k-1, int(r.window_end), int(r.t))
+        if end < start:
+            raise ValueError('Empty retained questionnaire recall window.')
+        idx = np.arange(start, end+1)
+        weights = np.full(len(idx), float(r.loading)/len(idx))
+        return update_gaussian(mean, covariance, idx, weights,
+                               float(r.value)-float(getattr(r, 'intercept', 0.)),
+                               float(r.observation_sd)**2, loglik)
+
     for k in range(n):
         if k:
             for r in by_time.get(k-1, []):
                 if observation_update is not None:
                     mean, covariance = observation_update(mean, covariance, r)
                     continue
-                start = max(0, int(r.window_start))
-                end = min(k-1, int(r.window_end), int(r.t))
-                if end < start:
-                    raise ValueError('Empty retained questionnaire recall window.')
-                idx = np.arange(start, end+1)
-                weights = np.full(len(idx), float(r.loading)/len(idx))
-                mean, covariance = update_gaussian(
-                    mean, covariance, idx, weights,
-                    float(r.value)-float(getattr(r, 'intercept', 0.)),
-                    float(r.observation_sd)**2)
+                mean, covariance = assimilate(r, k, mean, covariance)
             a = persistence[k-1]
             cross = covariance[:, -1]*a
             new = np.empty((k+1, k+1))
@@ -72,8 +88,11 @@ def forward_filter(drift, persistence, innovation_variance, daily, daily_observe
             mean = np.zeros(1); covariance = np.array([[prior_variance]], float)
         if daily_observed[k] and np.isfinite(daily[k]):
             mean, covariance = update_gaussian(mean, covariance, np.array([k]),
-                np.ones(1), float(daily[k]), daily_variance)
+                np.ones(1), float(daily[k]), daily_variance, loglik)
         issued[k] = mean[k]; issued_variance[k] = covariance[k, k]
+    if loglik is not None:
+        for r in by_time.get(n-1, []):
+            mean, covariance = assimilate(r, n, mean, covariance)
     return issued, issued_variance
 
 
@@ -116,7 +135,9 @@ def transition_arrays(person, model, args):
     scale = gaps.copy()
     nz = np.abs(phi) >= 1e-8
     scale[nz] = np.expm1(phi[nz]*gaps[nz])/phi[nz]
-    return drift*scale, persistence, args.transition_sd**2*gaps
+    # Models fitted before the variance was estimated carry no transition_sd and use the fixed setting.
+    transition_sd = model.get('transition_sd', args.transition_sd)
+    return drift*scale, persistence, transition_sd**2*gaps
 
 
 def smooth_development(person, model, args):
@@ -139,7 +160,35 @@ def smooth_development(person, model, args):
     return np.linalg.lstsq(np.asarray(rows), np.asarray(targets), rcond=None)[0]
 
 
-def fit_models(data, E, args=None):
+def development_loglik(people, model, args, transition_sd):
+    """Gaussian log-likelihood of all development observations under one daily transition SD."""
+    trial = dict(model, transition_sd=transition_sd)
+    total = [0.]
+    for person in people.values():
+        drift, persistence, variance = transition_arrays(person, trial, args)
+        forward_filter(drift, persistence, variance, person['daily'], person['daily_observed'],
+                       person['daily_variance'], person['anchors'], args.prior_sd**2, loglik=total)
+    return total[0]
+
+
+def estimate_transition_sd(people, model, args):
+    """Maximize the development log-likelihood over the daily transition SD, holding drift fixed."""
+    from scipy.optimize import minimize_scalar
+    bounds = np.log(TRANSITION_SD_BOUNDS)
+    result = minimize_scalar(lambda log_sd: -development_loglik(people, model, args, float(np.exp(log_sd))),
+                             bounds=tuple(bounds), method='bounded', options={'xatol': 1e-3})
+    if not result.success:
+        raise RuntimeError(f'Transition SD estimation failed: {result.message}')
+    return float(np.exp(result.x)), -float(result.fun)
+
+
+def fit_models(data, E, args=None, estimate_transition_variance=True):
+    """Fit both comparators per channel; the daily transition SD is estimated by maximum likelihood.
+
+    The drift coefficients and the transition SD are updated in turn. With
+    ``estimate_transition_variance=False`` the SD stays at ``args.transition_sd``,
+    which reproduces the comparators fitted before the variance was estimated.
+    """
     args = E._dc_args('linear') if args is None else args
     if args.s0_basis != 'linear':
         raise ValueError('The finalized prospective empirical comparators use the linear basis.')
@@ -151,31 +200,58 @@ def fit_models(data, E, args=None):
         nbase = next(iter(people.values()))['features'].shape[1]
         counts = np.concatenate([prior_counts(p['all_anchors'], len(p['daily'])) for p in people.values()])
         edges = np.quantile(counts, np.arange(1, args.markov_strata)/args.markov_strata)
-        lg = dict(kind='linear_gaussian', theta=np.zeros(nbase), readout=readout, edges=edges)
-        for _ in range(args.iters):
-            xblocks = []; yblocks = []
-            for person in people.values():
-                z = smooth_development(person, lg, args); ok = person['gaps'] > 0
-                if ok.any():
-                    xblocks.append(person['features'][ok]); yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
-            x = np.vstack(xblocks); y = np.concatenate(yblocks)
-            penalty = args.beta_ridge*np.eye(nbase); penalty[0, 0] = 0.
-            lg['theta'] = np.linalg.solve(x.T@x+penalty, x.T@y)
+
+        def fit_lg_drift(lg):
+            for _ in range(args.iters):
+                xblocks = []; yblocks = []
+                for person in people.values():
+                    z = smooth_development(person, lg, args); ok = person['gaps'] > 0
+                    if ok.any():
+                        xblocks.append(person['features'][ok]); yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+                x = np.vstack(xblocks); y = np.concatenate(yblocks)
+                penalty = args.beta_ridge*np.eye(nbase); penalty[0, 0] = 0.
+                lg['theta'] = np.linalg.solve(x.T@x+penalty, x.T@y)
+
+        def fit_markov_drift(markov):
+            for _ in range(args.markov_iters):
+                xblocks = []; yblocks = []
+                for person in people.values():
+                    z = smooth_development(person, markov, args); ok = person['gaps'] > 0
+                    groups = pattern_groups(person['all_anchors'], len(z), edges)[1:]
+                    onehot = np.eye(args.markov_strata)[groups]
+                    xblocks.append(np.column_stack([person['features'], onehot, onehot*z[:-1, None]])[ok])
+                    yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+                x = np.vstack(xblocks); y = np.concatenate(yblocks)
+                penalty = args.markov_ridge*np.eye(x.shape[1]); penalty[0, 0] = 0.
+                theta = np.linalg.solve(x.T@x+penalty, x.T@y)
+                theta[nbase+args.markov_strata:] = np.clip(theta[nbase+args.markov_strata:], -.95, .05)
+                markov['theta'] = theta
+
+        def alternate(model, fit_drift):
+            fit_drift(model)
+            if not estimate_transition_variance:
+                return
+            model['transition_sd_trace'] = []
+            for _ in range(MAX_TRANSITION_SD_ROUNDS):
+                previous = model['transition_sd']
+                model['transition_sd'], model['development_loglik'] = estimate_transition_sd(people, model, args)
+                model['transition_sd_trace'].append(model['transition_sd'])
+                fit_drift(model)
+                if abs(model['transition_sd'] - previous) / previous < TRANSITION_SD_RELATIVE_TOLERANCE:
+                    break
+            model['development_loglik'] = development_loglik(people, model, args, model['transition_sd'])
+            model['development_loglik_fixed_sd'] = development_loglik(people, model, args, args.transition_sd)
+            model['transition_sd_at_bound'] = bool(np.isclose(model['transition_sd'], TRANSITION_SD_BOUNDS, rtol=1e-2).any())
+
+        lg = dict(kind='linear_gaussian', theta=np.zeros(nbase), readout=readout, edges=edges,
+                  transition_sd=float(args.transition_sd))
+        alternate(lg, fit_lg_drift)
         markov = dict(kind='markov', theta=np.r_[lg['theta'], np.zeros(2*args.markov_strata)],
-                      readout=readout, edges=edges)
-        for _ in range(args.markov_iters):
-            xblocks = []; yblocks = []
-            for person in people.values():
-                z = smooth_development(person, markov, args); ok = person['gaps'] > 0
-                groups = pattern_groups(person['all_anchors'], len(z), edges)[1:]
-                onehot = np.eye(args.markov_strata)[groups]
-                xblocks.append(np.column_stack([person['features'], onehot, onehot*z[:-1, None]])[ok])
-                yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
-            x = np.vstack(xblocks); y = np.concatenate(yblocks)
-            penalty = args.markov_ridge*np.eye(x.shape[1]); penalty[0, 0] = 0.
-            theta = np.linalg.solve(x.T@x+penalty, x.T@y)
-            theta[nbase+args.markov_strata:] = np.clip(theta[nbase+args.markov_strata:], -.95, .05)
-            markov['theta'] = theta
+                      readout=readout, edges=edges, transition_sd=float(lg['transition_sd']))
+        alternate(markov, fit_markov_drift)
+        if not estimate_transition_variance:   # keep the fitted models identical to the earlier fixed-SD fits
+            for model in (lg, markov):
+                del model['transition_sd']
         models[channel] = dict(lg=lg, markov=markov)
     return models, args, train_ids
 

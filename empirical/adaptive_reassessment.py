@@ -28,6 +28,14 @@ def main():
     p.add_argument('--cadence',type=int,default=14)
     p.add_argument('--device',default='cuda')
     p.add_argument('--policies',nargs='+',choices=list(POLICIES),default=list(POLICIES))
+    # Random requests matched on count: each eligible opportunity is requested with this probability,
+    # ignoring BALL's uncertainty. Replicates are written to a subfolder so policy summaries skip them.
+    p.add_argument('--random-probability',type=float)
+    p.add_argument('--random-replicates',type=int,default=0)
+    p.add_argument('--random-first-replicate',type=int,default=0)
+    p.add_argument('--random-seed',type=int,default=20261017)
+    p.add_argument('--random-folder',default='random_matched')
+    p.add_argument('--member-archives',type=Path,help='folder holding session_member archives, if not --output')
     args=p.parse_args();args.output.mkdir(parents=True,exist_ok=True)
     if args.output.resolve().is_relative_to(Path(__file__).resolve().parents[1]):
         raise ValueError('Patient-level outputs must be outside the source repository.')
@@ -43,7 +51,7 @@ def main():
     for member in range(5):
         _,net=load_member(args,args.cadence,member,data,train,cfg,device)
         models.append(net)
-        archive=np.load(args.output/f'session_member_{args.cadence}d_{member}.npz')
+        archive=np.load((args.member_archives or args.output)/f'session_member_{args.cadence}d_{member}.npz')
         covariances.append(archive['weight_covariance']);biases.append(float(archive['bias_variance']))
     session_map={int(pid):g.sort_values(['session','day']).session.to_numpy() for pid,g in sessions.groupby('id') if int(pid) in idrow}
     position={(pid,int(s)):i for pid,values in session_map.items() for i,s in enumerate(values)}
@@ -60,11 +68,11 @@ def main():
        'evaluation':'all common withheld events, scored before any reveal; queried events remain in evaluation',
        'model_members':5,'no_test_outcome_used_for_decision':True,
        'baseline':'original retained questionnaires are always available on their original schedule'}
-    (args.output/f'adaptive_specification_{args.cadence}d.json').write_text(json.dumps(specification,indent=2))
-    for policy in args.policies:
-        dest=args.output/f'adaptive_events_{args.cadence}d_{policy}.csv'
-        if dest.exists():print(f'{policy} existing replay retained',flush=True);continue
-        threshold=POLICIES[policy]
+    spec_path=args.output/f'adaptive_specification_{args.cadence}d.json'
+    if args.random_probability is None or not spec_path.exists():
+        spec_path.write_text(json.dumps(specification,indent=2))
+
+    def replay(dest,policy,decide,extra):
         batch=dataclasses.replace(test,**{f:getattr(test,f).clone().to(device) for f in M._B_FIELDS})
         mu_history=np.zeros((5,B,T,2),dtype=np.float32)
         var_history=np.zeros_like(mu_history)
@@ -99,7 +107,7 @@ def main():
                 observation_variance=pars['observation_sd']**2
                 gain=expected_fractional_variance_reduction(latent_var,pars['loading'],pars['observation_sd'])
                 eligible=(r.day-last_day[i,j])>=7
-                query=threshold is not None and eligible and gain>=threshold
+                query=decide(gain,eligible)
                 # No r.value appears above this line: the decision is made first.
                 target=(r.value-transform['midpoint'])/transform['half_range']
                 prediction=pars['intercept']+pars['loading']*latent_mean
@@ -108,7 +116,7 @@ def main():
                     gain=gain,query=query,eligible_after_cooldown=eligible,prior_count=int(prior_count[i].sum()),
                     same_instrument_prior_count=int(prior_count[i,j]),same_channel_prior_count=int(prior_count[i,channels==ch].sum()),
                     gap=float(r.day-np.max(last_day[i])) if np.isfinite(last_day[i]).any() else np.nan,
-                    last_score=last_score[i,j],baseline_score=baseline_score[i,j],window_n_sessions=len(window)))
+                    last_score=last_score[i,j],baseline_score=baseline_score[i,j],window_n_sessions=len(window),**extra))
                 if query:newly_selected.append((r,i,j,target))
             # Reveal all selected outcomes together after every prediction at
             # this session. Shifted input prevents same-session cross-instrument leakage.
@@ -129,5 +137,19 @@ def main():
         assert len(result)==len(targets)
         result.to_csv(dest,index=False)
         print(f'{args.cadence}d {policy}: complete, {len(result)} predictions, {int(result["query"].sum())} extra measurements',flush=True)
+
+    for policy in args.policies if args.random_probability is None else []:
+        dest=args.output/f'adaptive_events_{args.cadence}d_{policy}.csv'
+        if dest.exists():print(f'{policy} existing replay retained',flush=True);continue
+        threshold=POLICIES[policy]
+        replay(dest,policy,lambda gain,eligible,threshold=threshold:threshold is not None and eligible and gain>=threshold,{})
+    if args.random_probability is not None:
+        folder=args.output/args.random_folder;folder.mkdir(exist_ok=True)
+        for rep in range(args.random_first_replicate,args.random_first_replicate+args.random_replicates):
+            dest=folder/f'adaptive_events_{args.cadence}d_random_matched_r{rep:03d}.csv'
+            if dest.exists():print(f'random replicate {rep} existing replay retained',flush=True);continue
+            rng=np.random.default_rng([args.random_seed,args.cadence,rep])
+            replay(dest,'random_matched',lambda gain,eligible,rng=rng:bool(eligible and rng.random()<args.random_probability),
+                   dict(replicate=rep,request_probability=args.random_probability))
 
 if __name__=='__main__':main()

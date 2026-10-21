@@ -6,6 +6,9 @@ import numpy as np
 import pandas as pd
 from revise_uncertainty import E
 
+SCHEDULE_COMPARISONS = 4   # the four prespecified questionnaire schedules
+ADJUSTED_ALPHA = .05/SCHEDULE_COMPARISONS   # Bonferroni adjustment across schedules
+
 def main():
     p=argparse.ArgumentParser();p.add_argument('--run',type=Path,required=True)
     p.add_argument('--frozen-run',type=Path,required=True);p.add_argument('--output',type=Path,required=True)
@@ -47,8 +50,11 @@ def main():
             other=errors[method].reindex(patients).to_numpy()
             delta=np.sqrt(ball[draws].mean(axis=1))-np.sqrt(other[draws].mean(axis=1))
             lo,hi=np.quantile(delta,[.025,.975])
+            adj_lo,adj_hi=np.quantile(delta,[ADJUSTED_ALPHA/2,1-ADJUSTED_ALPHA/2])
             pairwise.append(dict(cadence=cad,reference='ball',comparator=method,
-                rmse_difference=float(np.sqrt(ball.mean())-np.sqrt(other.mean())),ci_lo=lo,ci_hi=hi,n_patients=len(patients),bootstrap_replicates=2000))
+                rmse_difference=float(np.sqrt(ball.mean())-np.sqrt(other.mean())),ci_lo=lo,ci_hi=hi,
+                ci_lo_bonferroni_schedules=adj_lo,ci_hi_bonferroni_schedules=adj_hi,
+                n_patients=len(patients),bootstrap_replicates=2000))
         classification.extend(E._workload_classification_rows(ev,cad,[m for m in ['ball','ball_direct_causal','ball_no_dense_ehr','ball_anchor_only','gp_causal_filter','exponential_decay_gru','causal_anchor_mean'] if m in methods]))
         intervals=pd.read_csv(interval_run/f'revised_intervals_{cad}d.csv')
         intervals=intervals[intervals.method.eq('conditional_quantiles')]

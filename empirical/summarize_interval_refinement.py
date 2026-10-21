@@ -27,6 +27,7 @@ def main():
             r=g[g.comparator.eq(name)].iloc[0]
             row['ball_minus_'+alias+'_rmse']=r.rmse_difference
             row[alias+'_ci_lo']=r.ci_lo;row[alias+'_ci_hi']=r.ci_hi
+            row[alias+'_ci_lo_bonferroni']=r.ci_lo_bonferroni_schedules;row[alias+'_ci_hi_bonferroni']=r.ci_hi_bonferroni_schedules
         rows.append(row)
     pd.DataFrame(rows).to_csv(out/'empirical_bootstrap_diff_complete.csv',index=False)
     temporal=pd.read_csv(args.frozen_run/'empirical_generalization_complete.csv')

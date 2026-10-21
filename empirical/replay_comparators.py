@@ -35,6 +35,9 @@ def main():
                 'ball_session_balanced':('14d_session_balanced','student'),
                 'ball_inherited_dynamics_only':('14d_distillation_decomposition','inherited_dynamics_only'),
                 'ball_teacher_matching_only':('14d_distillation_decomposition','teacher_matching_only')})
+        # The equal-weight analysis left the paper on 16 October 2026, so later fits omit its checkpoints.
+        if not (root/'14d_session_balanced').exists():
+            methods.pop('ball_session_balanced',None)
         arrays={};idmaps={}
         for name,(folder,arm) in methods.items():
             files=list((root/folder).glob(f'{arm}_member_*.npz'))
@@ -58,9 +61,11 @@ def main():
                 else:arr=arrays[name][idmaps[name][r.id],:,ch]
                 values.append(r.instrument_intercept+r.instrument_loading*float(arr[new].mean()))
                 previous.append(r.instrument_intercept+r.instrument_loading*float(arr[oldidx].mean()))
-            delta=float(np.max(abs(np.asarray(previous)-rows[name])))
-            assert delta<2e-5,(name,delta)
-            diagnostics[name]=delta
+            # Pre-September fits averaged the calendar recall window, later fits the sessions through the target.
+            errors={'calendar_window':float(np.max(abs(np.asarray(previous)-rows[name]))),
+                    'sessions_through_target':float(np.max(abs(np.asarray(values)-rows[name])))}
+            assert min(errors.values())<2e-5,(name,errors)
+            diagnostics[name]=errors
             rows[name]=values
         newball=pd.read_csv(args.output/f'replayed_events_{cad}d.csv').set_index(['id','session','anchor'])
         keys=pd.MultiIndex.from_frame(rows[['id','session','anchor']])
@@ -77,7 +82,7 @@ def main():
             for suffix in ['_native','_native_clipped','_clipped']:
                 rows['ball_full_decomposition'+suffix]=rows['ball'+suffix]
         rows.to_csv(dest,index=False)
-        print(json.dumps({'cadence':cad,'frozen_old_window_reproduction_max_errors':diagnostics}),flush=True)
+        print(json.dumps({'cadence':cad,'frozen_reproduction_max_errors':diagnostics}),flush=True)
 
 if __name__=='__main__':
     with threadpool_limits(limits=8):main()

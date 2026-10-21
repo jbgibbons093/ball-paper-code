@@ -42,6 +42,8 @@ def main():
     p.add_argument('--replay-output', type=Path, required=True)
     p.add_argument('--device', default='cuda')
     p.add_argument('--fit', action='store_true')
+    p.add_argument('--reuse-checkpoints-from', type=Path, default=None,
+                   help='Earlier temporal refit whose BALL member checkpoints should be restored rather than retrained.')
     args = p.parse_args()
     partition_audit = audit(require_live_fix=True)
     print(json.dumps(partition_audit, indent=2), flush=True)
@@ -89,6 +91,15 @@ def main():
     snapshot.mkdir(exist_ok=True)
     if not (snapshot/'BALL.py').exists():
         shutil.copy2(REPO/'BALL.py', snapshot/'BALL.py')
+    if args.reuse_checkpoints_from is not None:
+        # Checkpoint signatures cover the training source, data, and settings, so matching BALL members restore
+        # unchanged and the new model is paired against the same BALL predictions.
+        source = args.reuse_checkpoints_from/'member_checkpoints'/'14d_generalization_forward_2025'
+        target = output/'member_checkpoints'/'14d_generalization_forward_2025'
+        if not source.is_dir():
+            raise FileNotFoundError(f'No temporal BALL checkpoints in {source}')
+        if not target.exists():
+            shutil.copytree(source, target)
 
     sessions = E._coerce_sessions(pd.read_csv(E.OUT/'sessions.csv'))
     anchors = pd.read_csv(E.OUT/'anchors_sparse_14d.csv')
@@ -111,7 +122,8 @@ def main():
         summary = E._fit_generalization_sensitivities(
             anchors, sessions, sessions[['id', 'day']].drop_duplicates(), features,
             measurement, fit_args, output)
-        if set(summary.method) != {'ball', 's0_direct_lgssm', 'markov_direct_transition'}:
+        required = {'ball', 's0_direct_lgssm', 'markov_direct_transition'}
+        if not required <= set(summary.method) <= required | {'ball_direct_causal'}:
             raise AssertionError('Fresh temporal output must contain BALL and both classical comparators.')
         summary['hyperparameter_selection_scope'] = 'Settings fixed from earlier development selection; no temporal point-model reselection'
         summary.to_csv(summary_path, index=False)

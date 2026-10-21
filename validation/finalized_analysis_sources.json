@@ -1,9 +1,9 @@
 {
-  "analysis_source_freeze": "2026-09-19",
-  "manuscript_finalized": "2026-09-21",
+  "analysis_source_freeze": "2026-10-20",
+  "previous_source_freeze": "2026-09-19",
   "hash_algorithm": "SHA-256",
   "source_sha256": {
-    "BALL.py": "f37386c44874fba6bf9bb6b7eb8e351ce942024df541eafcdb369ce4ea8d20ae",
+    "BALL.py": "96c5c174acd3ad0d55c50c40797f6bcc145f08575a8bbe1e48b9a62106ab21ea",
     "validation/direct_rdoc_benchmark.py": "f72fc4d790f74856ae0f2f66fbf93e04dc54b1bd2229446ea00233bd78631b26",
     "validation/direct_rdoc_fair_comparator.py": "ba351b620d9bdd715474a5b5324f7f8cf46112b19bf54bff1812405a1de27bfa",
     "validation/prospective_simulation_filter.py": "2fd2d101afce34d9fcb714641422bd7e1115591b6cd0384358ba8694129c09d9",
@@ -13,24 +13,56 @@
     "validation/run_focused_parameter_sensitivities.py": "5e7de1958704eacf7b87a92c112bfe37b9564424378d1cfd99f5df5851c58df2",
     "validation/irt_calibration.json": "7da0c4c4c6a2d075fcec2f1553f12e7f3891188da4c30a1eb7b9c0f03242bb3f",
     "validation/gpu_run_lock.py": "94c1caf14db6a7619f8324a16eb50fc8c191d921076b656fe8f3d4e04b365034",
-    "empirical/adaptive_reassessment.py": "2246bbbcb5b4e8608968cebac08cb421910a43e7bcf2a5c4b7fa0451d0ea2e29",
-    "empirical/aggregate_revision.py": "2f4845d66bb1c49fc90442487497d5af340f1dbbb3aeb71459d5107618aa6807",
+    "empirical/adaptive_reassessment.py": "7e848f1acd5cede27f8031346d601f71ba32db071658398dce75b0a0bfbde311",
+    "empirical/aggregate_revision.py": "b856cad720c39f8a1badabcf799aaf96aa7a0e4ed90b5c73aa32c0e78bf63c61",
     "empirical/conditional_intervals.py": "1c31108b5d25ec7841a542f09fc669e6eab52b15ab66863e83c0d1e4d649b280",
     "empirical/crossfit_uncertainty.py": "6e5235d5d342b1878091220073efb115449ab45485d1b74257223179f4bd7bd4",
     "empirical/diagnose_interval_expansion.py": "06e73267d63db2636cafdf90a874b90469ac2767806d11ce0b6b9ddb005427e6",
     "empirical/interval_history.py": "6190e2ae486d4bf9c96b16da63810ff164cc24858f461c3a188df54b623d56e9",
-    "empirical/prospective_classical.py": "0ec8ef602be7c986bba5e5746ce204358cabfa4c16a6a38654871d436b2ea93f",
+    "empirical/prospective_classical.py": "1cc38f62c8a7d57c6743f7d8c94c7d2a1c35fd014cec4b28aff303097e087208",
     "empirical/refine_intervals.py": "6318ff16b0f273891c460b1d1171de2434c38407a934449b4966a09ff7c6402b",
-    "empirical/replay_comparators.py": "c888210588869434750c595eb9f80c9fb9d428d20afdffe15331aa5c4f66ad8d",
-    "empirical/rerun_prospective_classical.py": "3571290e4b081b1517b671998ac18cb242d385ced8b84a39a8a10defe252f190",
-    "empirical/revise_uncertainty.py": "ebc91bf3b7b66a2313527c5151abe3739d00daa6833f4a20e3626840f46c5bd8",
-    "empirical/summarize_interval_refinement.py": "f99d1fe9168f84ae0d3563ad5684fff46d7e38e9b3762819f7ff3289c3f4aa8d",
+    "empirical/replay_comparators.py": "863f806d369001585c5e58df09dcb4fe17ca8e5dd251e29b28677fa44d4c1184",
+    "empirical/rerun_prospective_classical.py": "bd48845151e151d1b1361f51dff173c9eaf7a68e72f1263ee8e7cb21c9cbd2cf",
+    "empirical/revise_uncertainty.py": "087a94e611a7740f3276dbf0d4fcc9a10fdcff23a42b843e19874fc4731f90f0",
+    "empirical/summarize_interval_refinement.py": "a11c1fa7d05aa5a19bc964731e2758b3c2602772c9d61a0bb85972bb3fdc911e",
     "empirical/summarize_reassessment.py": "9164c0c0afc602349377cfc7142fa3392426b74b494bffa0e3f5c023fffbef8e",
     "empirical/uncertainty_math.py": "4d9d228c9cbc06e024cb188fb2a776e1986668558c674eaf04983f78b415f749",
     "empirical/validate_revision_replay.py": "a86fcbf6d08dc3c14009fa85cceafefaee6c6856243d186f0ee4c6886fcde00f",
     "validation/temporal/audit_temporal_partition.py": "4ed2c00fe17e362914a26cbc85274d48a4e3fd49d155417e44c6a59a4102d7a8",
-    "validation/temporal/refit_temporal.py": "fa034562cde2fe96668506db1cf125e3b1248e9761803c863d9576236125afa2",
-    "validation/temporal/summarize_temporal.py": "ba3fe5e5e77fbdac00f6e0d1a3c932c2b31f1ae2e3264a66e3c3eb47bb55be3c"
+    "validation/temporal/refit_temporal.py": "721d29d5400d6017121a35c466274cba466cc96dac22501efc6913a322b6a432",
+    "validation/temporal/summarize_temporal.py": "19a97b734ec010f5a054de67914d7f661603ec426633f64f3ee13cf56a350bfe",
+    "validation/clinical_rerun/check_session_measures.py": "3e34d65e0d03a1426460affcc6324ba4d206ce4b8d8e690b347bc7c3d538580d",
+    "validation/clinical_rerun/fit_rdoc_transition.py": "d12d09178e1adebc5bd26c879deffa5c34a30ab4186190915f9908c8d9d0f7a1",
+    "validation/clinical_rerun/rerun_gp.py": "75705f5845f0d38f99cf0daf63762a4b9fc8f002b8f9b681d238cccec0dec8ef",
+    "validation/clinical_rerun/run_reanalysis.py": "c4a4d8b46b872f24e652aae1539ea9f5ed1ccfa953f5679c801b80a7b5e42a41",
+    "validation/clinical_rerun/run_rerun.py": "52ade2213aa900a995503dfb2fe614bce98154926525e425212161fff01c522a",
+    "validation/clinical_rerun/summarize_rdoc_transition.py": "a93eb0497d513181903aac9a3b970b5d9c76f3ad52e2ed9a94aa3fcadd6045e1",
+    "validation/clinical_rerun/summarize_session_measures.py": "04002d3ab453aa82f1c9c79768d66d3843eed9ca6b8b0810d14b98018d5f57b9"
+  },
+  "clinical_rerun_ball_py_versions": {
+    "primary_rerun_2026-10-17": {
+      "sha256": "cf020f08a9599581c5ade93513c38670c3fe860b0215cf3feb60e8e663e8bfac",
+      "differs_from_published": "lacks the declared continuous-feature list read by _fit_empirical_gp_scaler and the 2025-cohort direct-transformer path of the generalization analysis"
+    },
+    "temporal_direct_transformer_refit_2026-10-18": {
+      "sha256": "ba395fd1a4c763fc3cc66782f9f31e27371b708d8c4dcb268e1dfb0f47e19883",
+      "differs_from_published": "lacks the declared continuous-feature list read by _fit_empirical_gp_scaler"
+    },
+    "gaussian_process_refit_2026-10-19_and_rdoc_transition_refit_2026-10-20": {
+      "sha256": "96c5c174acd3ad0d55c50c40797f6bcc145f08575a8bbe1e48b9a62106ab21ea",
+      "differs_from_published": "identical"
+    }
+  },
+  "protected_root_substitution": {
+    "note": "In the published copies of these scripts, the protected clinical workspace is read from the BALL_PROTECTED_ROOT environment variable in place of a local folder path, adding \"import os\" where needed. No other byte differs from the version that ran.",
+    "run_sha256": {
+      "validation/clinical_rerun/check_session_measures.py": "194fae9972a413c9d53e9b46f1c0d4a5504e57e38666e9874c976c62d8d8de2b",
+      "validation/clinical_rerun/fit_rdoc_transition.py": "ac1faa0a333d250997acff34fbb2c50259ee507ad123a2baa1a83f58fa9cbe16",
+      "validation/clinical_rerun/rerun_gp.py": "0eed8e87693963699573c859c8fb4ea513e834997581a95cfe4390f430948977",
+      "validation/clinical_rerun/run_reanalysis.py": "77cfde08211fe0224ab07521f9c0d346a6b42423a9c3972a70d0dd2623d239eb",
+      "validation/clinical_rerun/run_rerun.py": "77449419b962222927686e189ba43c42ad4f573c90e2db48c247346b3994f901",
+      "validation/clinical_rerun/summarize_rdoc_transition.py": "5479f90fc0ea09e5df4af88cd2a96eda4b66891cf756ff69ee91d15b4fdfe743"
+    }
   },
   "scope": "Source provenance only. No clinical data, model checkpoints, or manuscript artifacts."
 }

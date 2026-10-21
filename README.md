@@ -7,11 +7,17 @@ then reports uncertainty for each estimate.
 This repository contains the model, simulation, empirical analysis, and focused
 validation code.
 
-The September 2026 update matches the analyses finalized on 21 September.
-`validation/finalized_analysis_sources.json` records SHA-256 hashes of the 28
-frozen scientific source files. Those files are published without changes to
-their analysis code. The temporal orchestration scripts are located under
-`validation/temporal/` with their source bytes preserved.
+The October 2026 update matches the clinical analyses rerun from 17 to 20
+October 2026. In that rerun, PHQ-9 totals recorded as 0 without an item-level
+raw score were treated as missing, and five measures from the previous session
+joined the clinical inputs. `validation/finalized_analysis_sources.json`
+records SHA-256 hashes of the 35 published analysis source files and of the
+`BALL.py` version that each clinical run used. The temporal orchestration
+scripts are located under `validation/temporal/`, and the October run scripts
+are located under `validation/clinical_rerun/`, both with their source bytes
+preserved. The published run scripts read the protected clinical workspace from
+the `BALL_PROTECTED_ROOT` environment variable, which is their only change from
+the versions that ran.
 
 ## Layout
 
@@ -52,9 +58,10 @@ Only Python source files are allowed there in this public repository.
 
 RDoC means Research Domain Criteria, the National Institute of Mental Health
 framework used for the simulation example of explicit transition-coefficient
-recovery. The primary clinical model excludes RDoC scores. Empirical RDoC
-note-content associations are a separate analysis, and the scores describe
-attention devoted to each domain, rather than measurements of its functioning.
+recovery. The primary clinical model excludes RDoC scores. A separate clinical
+refit adds note-based RDoC scores to BALL's encoder and transition model and
+reports their transition coefficients. The scores measure how much the clinical
+notes discuss each domain.
 IRT means item response theory, used
 for the graded-response observation model. PHQ-9 means the nine-item Patient
 Health Questionnaire.
@@ -120,6 +127,26 @@ entry points are `empirical/revise_uncertainty.py`, `crossfit_uncertainty.py`,
 restriction to the temporal sensitivity. `empirical/adaptive_reassessment.py`
 evaluates sequential measurement requests and reveals a requested score only
 from the next recorded session.
+
+The October clinical rerun scripts in `validation/clinical_rerun/` record the
+exact order and arguments of each run. They expect the project working layout,
+in which `_working/analysis_alignment_20260919/` holds the scripts published
+under `validation/temporal/` and `_working/review_reanalysis_20261017/` holds
+`run_reanalysis.py`. Set `BALL_PROTECTED_ROOT` to the protected clinical
+workspace before running them.
+
+| File | Purpose |
+| --- | --- |
+| `run_rerun.py` | Runs the primary clinical fit with the frozen arguments, then the uncertainty, interval, 2025-cohort, statistical-comparator, and request analyses |
+| `run_reanalysis.py` | Calibrates and runs random questionnaire requests matched on count, then aggregates the paired patient bootstrap comparisons |
+| `summarize_session_measures.py` and `check_session_measures.py` | Summarize the five previous-session measures for the cohort table and check them against the source records |
+| `rerun_gp.py` | Refits the Gaussian-process filter after standardizing every continuous input |
+| `fit_rdoc_transition.py` and `summarize_rdoc_transition.py` | Refit BALL with note-based RDoC scores in its transition model, then score withheld questionnaires and report the coefficients |
+
+These scripts write aggregate CSV and JSON files and run logs next to
+themselves, and they keep patient-level checkpoints, predictions, and event
+files under `BALL_PROTECTED_ROOT`. Run them from an export outside any Git
+working tree.
 
 The original `paper-*` entry points remain available, but their default
 arguments alone do not reproduce every finalized analysis. Use the frozen

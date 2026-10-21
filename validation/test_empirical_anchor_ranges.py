@@ -26,6 +26,7 @@ def test_out_of_range_questionnaire_totals_are_excluded() -> None:
             "ServiceDate": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03"]),
             "day": [0, 1, 2],
             "phq9": [27.0, 28.0, 10.0],
+            "phq9_raw": [27.0, 28.0, 10.0],
             "phq9_is_imputed": [0, 0, 1],
             "phq9_is_interpolated": [0, 0, 0],
             "gad_filled": [21.0, 23.0, 7.0],
@@ -44,6 +45,23 @@ def test_out_of_range_questionnaire_totals_are_excluded() -> None:
     assert set(anchors["anchor"]) == {"PHQ9", "GAD7", "BDI"}
 
 
+def test_phq9_total_without_raw_score_is_excluded() -> None:
+    # The source stores some missing PHQ-9 totals as 0 with no raw score and no imputation flag.
+    frame = pd.DataFrame(
+        {
+            "phq9": [0.0, 0.0, 14.0],
+            "phq9_raw": [np.nan, 0.0, 14.0],
+            "phq9_is_imputed": [0, 0, 0],
+            "phq9_is_interpolated": [0, 0, 0],
+            "gad_filled": [5.0, 5.0, 5.0],
+            "gad_measured": [1, 1, 1],
+            "bdi_filled": [9.0, 9.0, 9.0],
+            "bdi_measured": [1, 1, 1],
+        }
+    )
+    assert _genuine_masks(frame)["PHQ9"].tolist() == [False, True, True]
+
+
 def test_sparsification_and_event_accounting_are_instrument_specific() -> None:
     frame = pd.DataFrame(
         {
@@ -52,6 +70,7 @@ def test_sparsification_and_event_accounting_are_instrument_specific() -> None:
             "ServiceDate": pd.to_datetime(["2025-01-01", "2025-01-20"]),
             "day": [0, 19],
             "phq9": [12.0, 11.0],
+            "phq9_raw": [12.0, 11.0],
             "phq9_is_imputed": [0, 0],
             "phq9_is_interpolated": [0, 0],
             "gad_filled": [8.0, 7.0],

@@ -25,7 +25,15 @@ def main():
     events = events[events.evaluation_role.eq('test')]
     summary = pd.read_csv(args.frozen_run/'empirical_generalization_complete.csv')
     methods = ['ball', 's0_direct_lgssm', 'markov_direct_transition']
-    if set(summary.method) != set(methods) or len(summary) != 3:
+    if 'ball_direct_causal' in set(summary.method):
+        # The direct transformer's event predictions come from the refit, on the same events as BALL's replay.
+        methods.append('ball_direct_causal')
+        direct = pd.read_csv(args.frozen_run/'generalization_forward_2025_events.csv',
+                             usecols=['id', 'session', 'anchor', 'ball_direct_causal'])
+        events = events.merge(direct, on=['id', 'session', 'anchor'], how='left', validate='one_to_one')
+        if events.ball_direct_causal.isna().any():
+            raise AssertionError('Every temporal test event needs a direct-transformer prediction.')
+    if set(summary.method) != set(methods) or len(summary) != len(methods):
         raise AssertionError('Fresh temporal summary must have exactly one row per model.')
     per_patient = {}
     for method in methods:

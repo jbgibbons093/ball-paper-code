@@ -11841,10 +11841,13 @@ def _load() -> pd.DataFrame:
 def _measured_masks(df: pd.DataFrame) -> dict[str, pd.Series]:
     """Per-session masks where each scale was recorded rather than imputed."""
 
+    # The source fills some missing PHQ-9 totals with 0 without setting either flag, and those rows have no
+    # phq9_raw, so a recorded PHQ-9 also requires a raw total.
     return {
         "PHQ9": (df.get("phq9_is_imputed", 0) == 0)
         & (df.get("phq9_is_interpolated", 0) == 0)
-        & df["phq9"].notna(),
+        & df["phq9"].notna()
+        & pd.to_numeric(df["phq9_raw"], errors="coerce").notna(),
         "GAD7": df.get("gad_measured", 0) == 1,
         "BDI": df.get("bdi_measured", 0) == 1,
     }
@@ -11948,6 +11951,7 @@ def _write_sessions(df: pd.DataFrame) -> None:
             "FacilityName", "facility_id", "split", "Age", "Gender", "age", "gender",
             "phq9_momentum", "phq9_change_from_baseline", "phq9_baseline",
             "global_session", "max_session", "gad_measured", "bdi_measured",
+            "mt_standardized", "taking_meds_current", "si_current", "si_recent", "course_number",
         ] if c in df.columns
     ]
     sessions = df[cov_cols].rename(columns={"PatientFID": "id", "ServiceDate": "date"}).copy()
@@ -11983,6 +11987,14 @@ def main() -> None:
         "measurements_excluded_outside_instrument_range": {
             scale: int((measured_masks[scale] & ~masks[scale]).sum()) for scale in SCALES
         },
+        "phq9_totals_excluded_without_raw_score": int(
+            (
+                (df.get("phq9_is_imputed", 0) == 0)
+                & (df.get("phq9_is_interpolated", 0) == 0)
+                & df["phq9"].notna()
+                & pd.to_numeric(df["phq9_raw"], errors="coerce").isna()
+            ).sum()
+        ),
         "all_anchors_sparsified": True,
         "notes_rdoc_proxy": "McCoy/Perlis-style LLM RDoC 6-dim profile from clinical notes -> direct-transition proxy B(t)",
         "cadences": {},
@@ -12343,24 +12355,37 @@ def pattern_groups(anchors, n, edges):
     return np.searchsorted(edges, prior_counts(anchors, n), side='right')
 
 
-def update_gaussian(mean, covariance, indices, weights, value, variance):
+TRANSITION_SD_BOUNDS = (0.005, 1.0)   # daily SD search range on the -1 to 1 questionnaire scale
+TRANSITION_SD_RELATIVE_TOLERANCE = 1e-3
+MAX_TRANSITION_SD_ROUNDS = 5
+
+
+def update_gaussian(mean, covariance, indices, weights, value, variance, loglik=None):
     cross = covariance[:, indices] @ weights
     residual_variance = float(weights @ cross[indices] + variance)
     if not np.isfinite(residual_variance) or residual_variance <= 0:
         raise ValueError('Invalid Gaussian observation variance.')
-    mean = mean + cross * ((value - weights @ mean[indices]) / residual_variance)
+    residual = value - weights @ mean[indices]
+    if loglik is not None:   # one term of the prediction-error decomposition
+        loglik[0] -= .5 * (np.log(2 * np.pi * residual_variance) + residual**2 / residual_variance)
+    mean = mean + cross * (residual / residual_variance)
     covariance = covariance - np.outer(cross, cross) / residual_variance
     return mean, (covariance + covariance.T) * .5
 
 
 def forward_filter(drift, persistence, innovation_variance, daily, daily_observed,
-                   daily_variance, anchors, prior_variance, observation_update=None):
+                   daily_variance, anchors, prior_variance, observation_update=None, loglik=None):
     """Append states in session order, assimilating each anchor one session late.
 
     The growing covariance retains the correlations needed for recall-window
     measurements. Past internal states can update, but past issued estimates
-    stay fixed. No backward pass is performed on evaluation records.
+    stay fixed. No backward pass is performed on evaluation records. When
+    ``loglik`` is a one-element list, it accumulates the Gaussian log-likelihood
+    of every observation given earlier ones, including questionnaires from the
+    final session, which prediction never needs.
     """
+    if loglik is not None and observation_update is not None:
+        raise ValueError('The likelihood is defined only for Gaussian questionnaire updates.')
     n = len(daily)
     issued = np.empty(n); issued_variance = np.empty(n)
     mean = np.empty(0); covariance = np.empty((0, 0))
@@ -12368,22 +12393,25 @@ def forward_filter(drift, persistence, innovation_variance, daily, daily_observe
     for r in anchors.itertuples(index=False):
         if bool(r.observed):
             by_time.setdefault(int(r.t), []).append(r)
+
+    def assimilate(r, k, mean, covariance):
+        start = max(0, int(r.window_start))
+        end = min(k-1, int(r.window_end), int(r.t))
+        if end < start:
+            raise ValueError('Empty retained questionnaire recall window.')
+        idx = np.arange(start, end+1)
+        weights = np.full(len(idx), float(r.loading)/len(idx))
+        return update_gaussian(mean, covariance, idx, weights,
+                               float(r.value)-float(getattr(r, 'intercept', 0.)),
+                               float(r.observation_sd)**2, loglik)
+
     for k in range(n):
         if k:
             for r in by_time.get(k-1, []):
                 if observation_update is not None:
                     mean, covariance = observation_update(mean, covariance, r)
                     continue
-                start = max(0, int(r.window_start))
-                end = min(k-1, int(r.window_end), int(r.t))
-                if end < start:
-                    raise ValueError('Empty retained questionnaire recall window.')
-                idx = np.arange(start, end+1)
-                weights = np.full(len(idx), float(r.loading)/len(idx))
-                mean, covariance = update_gaussian(
-                    mean, covariance, idx, weights,
-                    float(r.value)-float(getattr(r, 'intercept', 0.)),
-                    float(r.observation_sd)**2)
+                mean, covariance = assimilate(r, k, mean, covariance)
             a = persistence[k-1]
             cross = covariance[:, -1]*a
             new = np.empty((k+1, k+1))
@@ -12396,8 +12424,11 @@ def forward_filter(drift, persistence, innovation_variance, daily, daily_observe
             mean = np.zeros(1); covariance = np.array([[prior_variance]], float)
         if daily_observed[k] and np.isfinite(daily[k]):
             mean, covariance = update_gaussian(mean, covariance, np.array([k]),
-                np.ones(1), float(daily[k]), daily_variance)
+                np.ones(1), float(daily[k]), daily_variance, loglik)
         issued[k] = mean[k]; issued_variance[k] = covariance[k, k]
+    if loglik is not None:
+        for r in by_time.get(n-1, []):
+            mean, covariance = assimilate(r, n, mean, covariance)
     return issued, issued_variance
 
 
@@ -12440,7 +12471,9 @@ def transition_arrays(person, model, args):
     scale = gaps.copy()
     nz = np.abs(phi) >= 1e-8
     scale[nz] = np.expm1(phi[nz]*gaps[nz])/phi[nz]
-    return drift*scale, persistence, args.transition_sd**2*gaps
+    # Models fitted before the variance was estimated carry no transition_sd and use the fixed setting.
+    transition_sd = model.get('transition_sd', args.transition_sd)
+    return drift*scale, persistence, transition_sd**2*gaps
 
 
 def smooth_development(person, model, args):
@@ -12463,7 +12496,35 @@ def smooth_development(person, model, args):
     return np.linalg.lstsq(np.asarray(rows), np.asarray(targets), rcond=None)[0]
 
 
-def fit_models(data, E, args=None):
+def development_loglik(people, model, args, transition_sd):
+    """Gaussian log-likelihood of all development observations under one daily transition SD."""
+    trial = dict(model, transition_sd=transition_sd)
+    total = [0.]
+    for person in people.values():
+        drift, persistence, variance = transition_arrays(person, trial, args)
+        forward_filter(drift, persistence, variance, person['daily'], person['daily_observed'],
+                       person['daily_variance'], person['anchors'], args.prior_sd**2, loglik=total)
+    return total[0]
+
+
+def estimate_transition_sd(people, model, args):
+    """Maximize the development log-likelihood over the daily transition SD, holding drift fixed."""
+    from scipy.optimize import minimize_scalar
+    bounds = np.log(TRANSITION_SD_BOUNDS)
+    result = minimize_scalar(lambda log_sd: -development_loglik(people, model, args, float(np.exp(log_sd))),
+                             bounds=tuple(bounds), method='bounded', options={'xatol': 1e-3})
+    if not result.success:
+        raise RuntimeError(f'Transition SD estimation failed: {result.message}')
+    return float(np.exp(result.x)), -float(result.fun)
+
+
+def fit_models(data, E, args=None, estimate_transition_variance=True):
+    """Fit both comparators per channel; the daily transition SD is estimated by maximum likelihood.
+
+    The drift coefficients and the transition SD are updated in turn. With
+    ``estimate_transition_variance=False`` the SD stays at ``args.transition_sd``,
+    which reproduces the comparators fitted before the variance was estimated.
+    """
     args = E._dc_args('linear') if args is None else args
     if args.s0_basis != 'linear':
         raise ValueError('The finalized prospective empirical comparators use the linear basis.')
@@ -12475,31 +12536,58 @@ def fit_models(data, E, args=None):
         nbase = next(iter(people.values()))['features'].shape[1]
         counts = np.concatenate([prior_counts(p['all_anchors'], len(p['daily'])) for p in people.values()])
         edges = np.quantile(counts, np.arange(1, args.markov_strata)/args.markov_strata)
-        lg = dict(kind='linear_gaussian', theta=np.zeros(nbase), readout=readout, edges=edges)
-        for _ in range(args.iters):
-            xblocks = []; yblocks = []
-            for person in people.values():
-                z = smooth_development(person, lg, args); ok = person['gaps'] > 0
-                if ok.any():
-                    xblocks.append(person['features'][ok]); yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
-            x = np.vstack(xblocks); y = np.concatenate(yblocks)
-            penalty = args.beta_ridge*np.eye(nbase); penalty[0, 0] = 0.
-            lg['theta'] = np.linalg.solve(x.T@x+penalty, x.T@y)
+
+        def fit_lg_drift(lg):
+            for _ in range(args.iters):
+                xblocks = []; yblocks = []
+                for person in people.values():
+                    z = smooth_development(person, lg, args); ok = person['gaps'] > 0
+                    if ok.any():
+                        xblocks.append(person['features'][ok]); yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+                x = np.vstack(xblocks); y = np.concatenate(yblocks)
+                penalty = args.beta_ridge*np.eye(nbase); penalty[0, 0] = 0.
+                lg['theta'] = np.linalg.solve(x.T@x+penalty, x.T@y)
+
+        def fit_markov_drift(markov):
+            for _ in range(args.markov_iters):
+                xblocks = []; yblocks = []
+                for person in people.values():
+                    z = smooth_development(person, markov, args); ok = person['gaps'] > 0
+                    groups = pattern_groups(person['all_anchors'], len(z), edges)[1:]
+                    onehot = np.eye(args.markov_strata)[groups]
+                    xblocks.append(np.column_stack([person['features'], onehot, onehot*z[:-1, None]])[ok])
+                    yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
+                x = np.vstack(xblocks); y = np.concatenate(yblocks)
+                penalty = args.markov_ridge*np.eye(x.shape[1]); penalty[0, 0] = 0.
+                theta = np.linalg.solve(x.T@x+penalty, x.T@y)
+                theta[nbase+args.markov_strata:] = np.clip(theta[nbase+args.markov_strata:], -.95, .05)
+                markov['theta'] = theta
+
+        def alternate(model, fit_drift):
+            fit_drift(model)
+            if not estimate_transition_variance:
+                return
+            model['transition_sd_trace'] = []
+            for _ in range(MAX_TRANSITION_SD_ROUNDS):
+                previous = model['transition_sd']
+                model['transition_sd'], model['development_loglik'] = estimate_transition_sd(people, model, args)
+                model['transition_sd_trace'].append(model['transition_sd'])
+                fit_drift(model)
+                if abs(model['transition_sd'] - previous) / previous < TRANSITION_SD_RELATIVE_TOLERANCE:
+                    break
+            model['development_loglik'] = development_loglik(people, model, args, model['transition_sd'])
+            model['development_loglik_fixed_sd'] = development_loglik(people, model, args, args.transition_sd)
+            model['transition_sd_at_bound'] = bool(np.isclose(model['transition_sd'], TRANSITION_SD_BOUNDS, rtol=1e-2).any())
+
+        lg = dict(kind='linear_gaussian', theta=np.zeros(nbase), readout=readout, edges=edges,
+                  transition_sd=float(args.transition_sd))
+        alternate(lg, fit_lg_drift)
         markov = dict(kind='markov', theta=np.r_[lg['theta'], np.zeros(2*args.markov_strata)],
-                      readout=readout, edges=edges)
-        for _ in range(args.markov_iters):
-            xblocks = []; yblocks = []
-            for person in people.values():
-                z = smooth_development(person, markov, args); ok = person['gaps'] > 0
-                groups = pattern_groups(person['all_anchors'], len(z), edges)[1:]
-                onehot = np.eye(args.markov_strata)[groups]
-                xblocks.append(np.column_stack([person['features'], onehot, onehot*z[:-1, None]])[ok])
-                yblocks.append(np.diff(z)[ok]/person['gaps'][ok])
-            x = np.vstack(xblocks); y = np.concatenate(yblocks)
-            penalty = args.markov_ridge*np.eye(x.shape[1]); penalty[0, 0] = 0.
-            theta = np.linalg.solve(x.T@x+penalty, x.T@y)
-            theta[nbase+args.markov_strata:] = np.clip(theta[nbase+args.markov_strata:], -.95, .05)
-            markov['theta'] = theta
+                      readout=readout, edges=edges, transition_sd=float(lg['transition_sd']))
+        alternate(markov, fit_markov_drift)
+        if not estimate_transition_variance:   # keep the fitted models identical to the earlier fixed-SD fits
+            for model in (lg, markov):
+                del model['transition_sd']
         models[channel] = dict(lg=lg, markov=markov)
     return models, args, train_ids
 
@@ -12509,7 +12597,6 @@ def predict_patient(data, pid, model, channel, args, E):
     drift, persistence, variance = transition_arrays(person, model, args)
     return forward_filter(drift, persistence, variance, person['daily'],
         person['daily_observed'], person['daily_variance'], person['anchors'], args.prior_sd**2)
-
 '''
 
 SRC_EMPIRICAL_FIT_EMPIRICAL = r'''
@@ -12620,7 +12707,31 @@ COMORBIDITY_TABLE_COLS = [
     *COMORBIDITY_CATEGORY_COLS,
 ]
 COMORBIDITY_FEATURE_COLS = ["dx_comorbidity_count", *COMORBIDITY_CATEGORY_COLS]
-EMPIRICAL_FEATURE_NAMES = ["treatment_session_number", *COMORBIDITY_FEATURE_COLS]
+# Session-level measures recorded at each treatment session: stimulation intensity as a percentage of motor
+# threshold, current medication status, the provider's suicidal-ideation notes, and treatment course number.
+# A provider can record them after seeing that session's questionnaires, so each enters from the previous
+# recorded session. The transformers and the recurrent comparator receive raw inputs, so intensity enters as a
+# proportion of motor threshold (typically 1.2) to keep its scale near that of the other session measures.
+SESSION_MEASURE_COLS = ["mt_standardized", "taking_meds_current", "si_current", "si_recent", "course_number"]
+SESSION_MEASURE_DIVISORS = {"mt_standardized": 100.0}
+PREVIOUS_SESSION_FEATURE_NAMES = [
+    "previous_session_stimulation_intensity_proportion_of_motor_threshold",
+    "previous_session_taking_medication",
+    "previous_session_provider_noted_current_suicidal_ideation",
+    "previous_session_provider_noted_recent_suicidal_ideation",
+    "previous_session_course_number",
+]
+assert len(PREVIOUS_SESSION_FEATURE_NAMES) == len(SESSION_MEASURE_COLS)
+EMPIRICAL_FEATURE_NAMES = ["treatment_session_number", *COMORBIDITY_FEATURE_COLS, *PREVIOUS_SESSION_FEATURE_NAMES]
+# Features measured on a numeric scale; the Gaussian-process comparator standardizes these in its fitting patients and
+# keeps the remaining indicators as 0/1.
+EMPIRICAL_CONTINUOUS_FEATURE_NAMES = [
+    "treatment_session_number",
+    "dx_comorbidity_count",
+    "previous_session_stimulation_intensity_proportion_of_motor_threshold",
+    "previous_session_course_number",
+]
+assert set(EMPIRICAL_CONTINUOUS_FEATURE_NAMES) <= set(EMPIRICAL_FEATURE_NAMES)
 GP_RIDGE = 1.0
 GP_SLOW_LENGTH_DAYS = 28.0
 GP_FAST_LENGTH_DAYS = 3.0
@@ -13360,6 +13471,9 @@ def _empirical_neural_dataset(
     """
 
     sessions = _coerce_sessions(sessions_full)
+    missing_measures = [col for col in SESSION_MEASURE_COLS if col not in sessions.columns]
+    if missing_measures:
+        raise ValueError(f"sessions.csv lacks session measures {missing_measures}; rebuild the anchors.")
     if "split" in sessions.columns:
         source_split_by_id = (
             sessions.groupby("id", sort=False)["split"]
@@ -13528,19 +13642,29 @@ def _empirical_neural_dataset(
                 col: float(getattr(dx_row, col)) if dx_row is not None else 0.0
                 for col in COMORBIDITY_TABLE_COLS
             }
+            previous = g.iloc[tpos - 1] if real and tpos > 0 else None
+            previous_measures = [
+                float(previous[col]) / SESSION_MEASURE_DIVISORS.get(col, 1.0)
+                if previous is not None and pd.notna(previous[col]) else np.nan
+                for col in SESSION_MEASURE_COLS
+            ]
             features = np.array([
                 session_number,
                 dx_values["dx_comorbidity_count"],
                 *[dx_values[col] for col in COMORBIDITY_CATEGORY_COLS],
+                *previous_measures,
             ], dtype=float)
             if len(features) != len(EMPIRICAL_FEATURE_NAMES):
                 raise RuntimeError("Empirical feature vector does not match its declared schema.")
+            available = [
+                True,
+                *[bool(dx_values["dx_history_available"])] * len(COMORBIDITY_FEATURE_COLS),
+                *[bool(np.isfinite(value)) for value in previous_measures],
+            ]
             daily = {"id": pid, "t": tpos}
             for j, val in enumerate(features):
-                daily[x_cols[j]] = float(val)
-                daily[f"input_{x_cols[j]}"] = bool(real) and (
-                    j == 0 or bool(dx_values["dx_history_available"])
-                )
+                daily[x_cols[j]] = float(val) if np.isfinite(val) else 0.0
+                daily[f"input_{x_cols[j]}"] = bool(real) and available[j]
                 daily[f"obs_{x_cols[j]}"] = False
             daily_rows.append(daily)
 
@@ -13652,7 +13776,11 @@ def _empirical_neural_dataset(
             "causal_questionnaire_input_timing": "available to the encoder from the next recorded session",
             "same_session_cross_instrument_substitution": False,
             "feature_names": EMPIRICAL_FEATURE_NAMES,
-            "feature_timing": "Diagnosis records and encoder treatment history are strictly earlier than the modeled session.",
+            "feature_timing": (
+                "Diagnosis records, encoder treatment history, and session measures (stimulation intensity relative "
+                "to motor threshold, medication status, provider-noted suicidal ideation, course number) are "
+                "strictly earlier than the modeled session."
+            ),
             "time_encoding": "Raw treatment session number as context; raw inter-session days enter the transition interval dt.",
             "encoder_unscaled_daily_indices": list(range(len(EMPIRICAL_FEATURE_NAMES))),
             "empirical_feature_scaling": "none",
@@ -14880,7 +15008,11 @@ def _fit_empirical_gp_scaler(
         else set(data.individuals.loc[data.individuals["split"] == "train", "id"].astype(int))
     )
     p = int(data.config.p_daily)
-    continuous_indices = np.asarray([index for index in (0, 1) if index < p], dtype=int)
+    if p != len(EMPIRICAL_FEATURE_NAMES):
+        raise ValueError("The Gaussian-process scaler expects the declared empirical feature schema.")
+    continuous_indices = np.asarray(
+        [EMPIRICAL_FEATURE_NAMES.index(name) for name in EMPIRICAL_CONTINUOUS_FEATURE_NAMES], dtype=int
+    )
     rows = data.daily[data.daily["id"].astype(int).isin(train_ids)].copy()
     if "session_observed" in data.components.columns:
         valid_keys = data.components.loc[
@@ -17728,6 +17860,22 @@ def _fit_generalization_sensitivities(
             started_at=validation_started,
             details=_result_training_details(student, "student"),
         )
+        # The same causal transformer trained directly on questionnaires, without the teacher, tests whether
+        # BALL's training strategy also holds for patients treated after the training period.
+        direct_causal = None
+        if getattr(args, "direct_causal_ablation", False):
+            direct_cfg = _empirical_checkpointed_config(
+                cfg,
+                artifact_dir / "member_checkpoints",
+                f"14d_generalization_{validation}_direct_causal",
+                generalization_signature,
+            )
+            direct_causal = fit_ball_ssm_direct_causal(
+                data, direct_cfg, device=args.device, prediction_split="test"
+            )
+            _assert_result_training_valid(
+                direct_causal, f"generalization direct causal transformer {validation}", cfg.ensemble_size
+            )
         classical_args = _dc_args('linear')
         classical_lg, _ = _dc_fit_direct_map(data, classical_args)
         classical_markov = _dc_fit_markov_direct(data, classical_args, basis='linear')
@@ -17741,6 +17889,8 @@ def _fit_generalization_sensitivities(
                 "s0": _dc_predictions(classical_lg, value_col),
                 "markov": _dc_predictions(classical_markov, value_col),
             }
+            if direct_causal is not None:
+                predictions["direct_causal"] = _prediction_lookup(direct_causal.predictions, value_col)
             sub = anchors[
                 anchors["anchor"].isin(scales) & anchors["id"].astype(int).isin(test_ids)
             ].copy()
@@ -17805,7 +17955,14 @@ def _fit_generalization_sensitivities(
             temporal_width_fractions.append(
                 float(test_instrument.groupby("id")["width_fraction"].mean().mean())
             )
-        for method in ("ball", "s0_direct_lgssm", "markov_direct_transition"):
+        methods = ("ball", "s0_direct_lgssm", "markov_direct_transition")
+        if direct_causal is not None:
+            methods += ("ball_direct_causal",)
+            # Event-level rows let the temporal summary pair the two transformers on identical events.
+            ev[["id", "session", "anchor", "temporal_evaluation_role", "ball", "ball_direct_causal"]].to_csv(
+                artifact_dir / f"generalization_{validation}_events.csv", index=False
+            )
+        for method in methods:
             per_patient = _development_scaled_squared_error(ev_test, method).groupby(ev_test["id"]).mean()
             native = (
                 ev_test[method] * ev_test["scale_half_range"] + ev_test["scale_center"]
@@ -17854,7 +18011,7 @@ def _fit_generalization_sensitivities(
                     development_network_sessions["id"].nunique() - len(patient_splits)
                 ),
             })
-        del student, data, session_days
+        del student, direct_causal, data, session_days
         import gc as _gc
         import torch as _torch
         _gc.collect()
@@ -17933,6 +18090,8 @@ def _empirical_leakage_audit_table(
         ("historical questionnaire timing", "causal methods use retained questionnaires only from strictly earlier recorded sessions", "pass"),
         ("treatment timing", "causal encoders receive the previous-session treatment category", "pass"),
         ("diagnosis timing", "each session uses diagnoses dated earlier than that session", "pass"),
+        ("session measure timing", "stimulation intensity relative to motor threshold, medication status, "
+         "provider-noted suicidal ideation, and course number enter from the previous recorded session", "pass"),
         ("structured feature allowlist", ", ".join(EMPIRICAL_FEATURE_NAMES), "pass"),
         ("target-like source columns", ", ".join(target_like_columns) if target_like_columns else "none present", "excluded"),
         ("feature preprocessing", "raw values and explicit availability masks", "pass"),
@@ -18506,7 +18665,7 @@ def main() -> None:
                 sub = sub[sub["id"].astype(int).isin(neural_predictions["student"].keys())].copy()
             channel_ev = _channel_eval(
                 sub,
-                sessions,
+                sessions_full[["id", "session", "day"]],
                 stats,
                 neural_predictions,
                 session_days,

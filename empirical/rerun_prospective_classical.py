@@ -22,6 +22,8 @@ def main():
         questionnaire_availability='strictly earlier session, all instruments distinct',
         markov_groups='prior observed questionnaire counts; tertiles fitted in development sessions',
         fitting='complete development sequences only; original empirical iteration and ridge settings',
+        transition_variance='daily transition SD per channel and model, estimated by maximizing the development '
+            'log-likelihood (prediction-error decomposition), alternating with the drift updates',
         source_sha256={name:hashlib.sha256((Path(__file__).parent/name).read_bytes()).hexdigest()
             for name in ['prospective_classical.py','rerun_prospective_classical.py']})
     sp=args.output/'specification.json'
@@ -38,6 +40,12 @@ def main():
             print(f'{cad}d fitting development parameters',flush=True)
             models,settings,train_ids=fit_models(data,E)
             modelpath.write_bytes(pickle.dumps((models,settings,train_ids)))
+        # Aggregate record of the estimated variances; no patient-level content.
+        estimates={channel:{short:{key:m[key] for key in ['transition_sd','transition_sd_trace','development_loglik',
+                   'development_loglik_fixed_sd','transition_sd_at_bound']} for short,m in pair.items()}
+                   for channel,pair in models.items()}
+        (args.output/f'transition_sd_{cad}d.json').write_text(json.dumps(dict(training_patients=len(train_ids),
+            fixed_transition_sd=settings.transition_sd,estimates=estimates),indent=2))
         assert set(train_ids).isdisjoint(pid for pid,role in roles.items() if role in ['test','calibration'])
         if args.temporal:
             rows=pd.read_csv(args.previous_run/f'replayed_events_{cad}d.csv')

@@ -11,7 +11,7 @@ The October 2026 update matches the clinical analyses rerun from 17 to 20
 October 2026. In that rerun, PHQ-9 totals recorded as 0 without an item-level
 raw score were treated as missing, and five measures from the previous session
 joined the clinical inputs. `validation/finalized_analysis_sources.json`
-records SHA-256 hashes of the 35 published analysis source files and of the
+records SHA-256 hashes of the 37 published analysis source files and of the
 `BALL.py` version that each clinical run used. The temporal orchestration
 scripts are located under `validation/temporal/`, and the October run scripts
 are located under `validation/clinical_rerun/`, both with their source bytes
@@ -49,6 +49,7 @@ Only Python source files are allowed there in this public repository.
 | Files | Purpose |
 | --- | --- |
 | `ball_validation_harness.py` and `anchor_identifiability_check.py` | Check the data-generating process and anchor design |
+| `simulation_state_scale.py` | Report the spread of the simulated true states, the slow-component share, RDoC observation rates, and treatment counts across the 30 primary datasets |
 | `direct_rdoc_*.py` | Compare transition-coefficient recovery across models and controls |
 | `audit_classical_*.py` and `select_classical_persistence.py` | Check classical-model fitting and persistence selection |
 | `build_irt_calibration.py`, `test_irt_calibration.py`, and `irt_calibration.json` | Build and test the frozen questionnaire calibration |
@@ -142,6 +143,7 @@ workspace before running them.
 | `summarize_session_measures.py` and `check_session_measures.py` | Summarize the five previous-session measures for the cohort table and check them against the source records |
 | `rerun_gp.py` | Refits the Gaussian-process filter after standardizing every continuous input |
 | `fit_rdoc_transition.py` and `summarize_rdoc_transition.py` | Refit BALL with note-based RDoC scores in its transition model, then score withheld questionnaires and report the coefficients |
+| `rdoc_note_coverage.py` | Count the analytic sessions that precede a patient's first note and so receive RDoC scores of 0 |
 
 These scripts write aggregate CSV and JSON files and run logs next to
 themselves, and they keep patient-level checkpoints, predictions, and event

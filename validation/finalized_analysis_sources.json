@@ -37,7 +37,9 @@
     "validation/clinical_rerun/run_reanalysis.py": "c4a4d8b46b872f24e652aae1539ea9f5ed1ccfa953f5679c801b80a7b5e42a41",
     "validation/clinical_rerun/run_rerun.py": "52ade2213aa900a995503dfb2fe614bce98154926525e425212161fff01c522a",
     "validation/clinical_rerun/summarize_rdoc_transition.py": "a93eb0497d513181903aac9a3b970b5d9c76f3ad52e2ed9a94aa3fcadd6045e1",
-    "validation/clinical_rerun/summarize_session_measures.py": "04002d3ab453aa82f1c9c79768d66d3843eed9ca6b8b0810d14b98018d5f57b9"
+    "validation/clinical_rerun/summarize_session_measures.py": "04002d3ab453aa82f1c9c79768d66d3843eed9ca6b8b0810d14b98018d5f57b9",
+    "validation/simulation_state_scale.py": "5a8bdc251dca9cd549c4bf7ea8d1212a687d40b8032459f002218d7e8624a102",
+    "validation/clinical_rerun/rdoc_note_coverage.py": "a1e83bc14cf125441e7b498026ba65ef99d2f9e6c6e528284ad80b2e4419e2a3"
   },
   "clinical_rerun_ball_py_versions": {
     "primary_rerun_2026-10-17": {
